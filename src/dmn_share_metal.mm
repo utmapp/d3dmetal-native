@@ -578,6 +578,8 @@ void dmn_share_install_swizzles(void) {
 
 size_t dmn_share_page_align(size_t n) { return page_align(n); }
 
+int dmn_share_anon_file(size_t size) { return dmn_anon_file((off_t)size); }
+
 void* dmn_share_map_fd(int fd, size_t size) {
     size_t aligned = page_align(size);
     void* p = mmap(nullptr, aligned, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);

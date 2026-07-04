@@ -66,6 +66,8 @@ struct DmnShareArm {
     uint64_t out_size;
 };
 
+extern "C" {
+
 /* Arm the calling thread for the next Metal texture creation. extra_bytes
  * requests additional shared memory past the page-aligned texture bytes
  * (found by a consumer at page_align(pod.size)); 0 for none. */
@@ -97,3 +99,9 @@ void  dmn_share_unmap(void* ptr, size_t size);
 /* Round up to the page size (the trailer-offset rule shared by producer
  * allocation and consumer lookup). */
 size_t dmn_share_page_align(size_t n);
+
+/* Anonymous shared-memory fd of `size` bytes (shm_open + immediate unlink),
+ * CLOEXEC. -1 on failure. Also used by the exported-swapchain backend. */
+int dmn_share_anon_file(size_t size);
+
+} /* extern "C" */

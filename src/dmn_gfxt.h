@@ -14,7 +14,7 @@
 #include <memory>
 
 #include "d3dmetal_gfxt.h"
-#include "d3dmetal_native.h" /* dmn_window_callbacks */
+#include "d3dmetal_native.h" /* dmn_wait_status, exported-swapchain types */
 
 class DmnGFXTMonitor final : public GFXTMonitorInterface {
 public:
@@ -139,15 +139,14 @@ private:
                               app has already called dmn_window_destroy; holding
                               our own reference lets that late present resolve a
                               drawable instead of failing the hwnd lookup (which
-                              makes D3DMetal abort). nil for the callback
+                              makes D3DMetal abort). nil for the exported
                               backend. */
-    dmn_window_callbacks present_cb_; /* the callback backend's equivalent:
-                              a copy of the embedder callbacks taken at
-                              InitializeForHWND, so late presents skip the hwnd
-                              lookup too. Valid when present_cb_.acquire_texture
-                              is set; the embedder must keep serving callbacks
-                              until the swapchain is destroyed (the public
-                              header's rule: destroy swapchains first). */
+    void* exported_;       /* DmnExportedSwapchain*, retained; the exported
+                              backend's whole state (config copy, image set,
+                              rotation) created at InitializeForHWND. Like
+                              present_layer_, it outlives the app's window
+                              handle so late presents still resolve. nil for
+                              the View/Layer backends. */
 };
 
 class DmnGFXT final : public GFXTOSInterface {

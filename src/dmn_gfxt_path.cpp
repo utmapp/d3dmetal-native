@@ -11,12 +11,32 @@
 #include <mach-o/dyld.h>
 
 #include <cstring>
+#include <mutex>
 #include <string>
 
 #include "dmn_gfxt.h"
 #include "dmn_private.h"
 
 namespace {
+
+/* dmn_set_executable_path override; D3DMetal's per-app profile matcher keys
+ * on what getExecutablePath reports, and embedders acting on behalf of
+ * another program (VM display servers, remoting hosts) want that program's
+ * path, not their own. */
+std::mutex g_exe_path_mutex;
+std::string g_exe_path_override;
+
+bool exe_path_override(char* out, uint32_t bytes) {
+    std::lock_guard<std::mutex> lock(g_exe_path_mutex);
+    if (g_exe_path_override.empty())
+        return false;
+    size_t n = g_exe_path_override.size();
+    if (n >= bytes)
+        n = bytes - 1;
+    memcpy(out, g_exe_path_override.c_str(), n);
+    out[n] = '\0';
+    return true;
+}
 
 /* Minimal UTF-16 <-> UTF-8 conversion (with surrogate pairs). */
 
@@ -166,10 +186,22 @@ bool DmnGFXTPath::windowsSystemDirectoryPath(char16_t* out,
 void DmnGFXTPath::getExecutablePath(char* out, uint32_t bytes) {
     if (!out || bytes == 0)
         return;
+    if (exe_path_override(out, bytes)) {
+        DMN_TRACE("path: getExecutablePath (override) -> %s", out);
+        return;
+    }
     uint32_t want = bytes;
     if (_NSGetExecutablePath(out, &want) != 0)
         out[0] = '\0';
     DMN_TRACE("path: getExecutablePath -> %s", out);
+}
+
+extern "C" dmn_result dmn_set_executable_path(const char* path) {
+    std::lock_guard<std::mutex> lock(g_exe_path_mutex);
+    g_exe_path_override = path ? path : "";
+    DMN_INFO("path: executable path override %s%s",
+             path ? "= " : "cleared", path ? path : "");
+    return DMN_SUCCESS;
 }
 
 void DmnGFXTPath::getModulePath(void* module, char* out, uint32_t bytes) {

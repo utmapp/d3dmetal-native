@@ -11,12 +11,17 @@
  *     in the mix, ALL and ANY flavors, against the native multi-wait.
  *  4. Cross-API in-process: the same producer opened as an ID3D11Fence via
  *     OpenSharedFence, waited with SetEventOnCompletion.
+ *  5. dmn_event_dup_fd: a pollable fd dup'd before the GPU signal becomes
+ *     readable when D3DMetal's internal SetEvent fires on fence completion.
  *
  * Prints "FEVENTS: PASS" and exits 0 on success.
  */
 
 #include <cstdint>
 #include <cstdio>
+
+#include <poll.h>
+#include <unistd.h>
 
 #include <d3d11_4.h>
 #include <d3d12.h>
@@ -29,11 +34,6 @@
 #include "common/check.h"
 #include "common/dx11.h"
 #include "common/dx12.h"
-
-/* Internal-but-exported event helpers (the HANDLEs SetEventOnCompletion
- * accepts are these; apps normally receive them from D3D APIs). */
-extern "C" void* dmn_event_create(int manual_reset, int initial_state);
-extern "C" void  dmn_event_close(void* handle);
 
 static const uint64_t kLongNs  = 10ull * 1000 * 1000 * 1000; /* 10 s */
 
@@ -162,6 +162,30 @@ int main() {
                "D3D11 import event did not fire");
         dmn_event_close(ev11);
         printf("FEVENTS: cross-API import event ok (value %llu)\n",
+               (unsigned long long)v);
+    }
+
+    /* 5) Pollable event fd released by D3DMetal's SetEvent on completion.
+     *    Manual-reset, so the fd stays readable regardless of who looks
+     *    first. */
+    {
+        void* ev = dmn_event_create(1, 0);
+        EXPECT(ev, "event create failed");
+        int fd = dmn_event_dup_fd(ev);
+        EXPECT(fd >= 0, "dmn_event_dup_fd failed");
+        v++;
+        CK(prod->SetEventOnCompletion(v, ev), "SetEventOnCompletion");
+        struct pollfd pfd = {fd, POLLIN, 0};
+        EXPECT(poll(&pfd, 1, 0) == 0, "event fd readable before the signal");
+        CK(queue->Signal(prod.ptr(), v), "queue Signal");
+        pfd = {fd, POLLIN, 0};
+        EXPECT(poll(&pfd, 1, 10000) == 1 && (pfd.revents & POLLIN),
+               "event fd never became readable on fence completion");
+        EXPECT(dmn_event_wait(ev, 0) == DMN_WAIT_SIGNALED,
+               "event not signaled alongside the readable fd");
+        close(fd);
+        dmn_event_close(ev);
+        printf("FEVENTS: pollable event fd ok (value %llu)\n",
                (unsigned long long)v);
     }
 

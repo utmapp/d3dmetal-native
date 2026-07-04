@@ -120,41 +120,76 @@ dmn_window_t dmn_window_create_for_view(dmn_nsview_t view);
  * the caller manages the layer hierarchy itself. Callable from any thread. */
 dmn_window_t dmn_window_create_for_layer(dmn_metal_layer_t layer);
 
-/* Embedder presentation callbacks, for environments without a CAMetalLayer
- * (compositors, remoting). The library wraps each acquired texture in a
- * private CAMetalDrawable-conforming object handed to D3DMetal; when
- * D3DMetal presents it, `present` fires. All callbacks may be invoked from
- * D3DMetal worker threads and must be thread-safe; they must not call back
- * into dmn_window_* for the same window. */
-typedef struct dmn_window_callbacks {
-    /* Must be set to sizeof(dmn_window_callbacks). */
+/* Exported swapchains, for embedders that ship frames to another process
+ * (VM display servers, compositors, remoting) instead of a CAMetalLayer.
+ * The library owns the image set: it allocates shared-memory-backed
+ * MTLTextures on the device D3DMetal renders with, rotates through them,
+ * and drives the three callbacks below.  The embedder never touches a
+ * Metal object — it sees fds, strides, and slot indices.
+ *
+ * All callbacks are invoked from D3DMetal worker threads, must be
+ * thread-safe, and must not call dmn_window_* for the same window.
+ * They keep firing until the D3D swapchain bound to the window is
+ * destroyed — destroy swapchains before tearing down callback state. */
+
+#define DMN_EXPORTED_MAX_IMAGES 4
+
+typedef struct dmn_exported_image {
+    /* Anonymous shared memory backing the image bytes (linear layout).
+     * Owned by the library and guaranteed valid only during
+     * on_images_changed — dup(2) it for anything longer-lived. */
+    int      fd;
+    uint32_t stride;   /* bytesPerRow */
+    uint64_t size;     /* logical stride * height (NOT page-padded) */
+} dmn_exported_image;
+
+typedef struct dmn_exported_image_set {
+    uint32_t width;
+    uint32_t height;
+    /* DXGI_FORMAT the images were actually allocated with — the surface's
+     * physical layout, which may differ from the swapchain desc when that
+     * format is not presentable (D3DMetal converts during its blit).
+     * One of: B8G8R8A8_UNORM, R8G8B8A8_UNORM, B8G8R8X8_UNORM. */
+    uint32_t dxgi_format;
+    uint32_t num_images;
+    dmn_exported_image images[DMN_EXPORTED_MAX_IMAGES];
+} dmn_exported_image_set;
+
+typedef struct dmn_exported_swapchain_config {
+    /* Must be set to sizeof(dmn_exported_swapchain_config). */
     size_t struct_size;
     void* ctx;
 
-    /* Swapchain backing was (re)configured (InitializeForHWND /
-     * ResizeBacking). dxgi_format is a DXGI_FORMAT value. Re/allocate
-     * backing textures here. Return false to fail swapchain creation. */
-    bool (*configure)(void* ctx, uint32_t width, uint32_t height,
-                      uint32_t dxgi_format, uint32_t buffer_count);
+    /* Allocation preferences, both optional (0 = derive from the D3D
+     * swapchain desc).  preferred_dxgi_format is consulted when the desc
+     * format is not presentable; preferred_image_count overrides the
+     * desc's BufferCount (clamped to DMN_EXPORTED_MAX_IMAGES). */
+    uint32_t preferred_dxgi_format;
+    uint32_t preferred_image_count;
 
-    /* D3DMetal needs a backbuffer to render into. Return an id<MTLTexture>
-     * (borrowed; the library retains it for the drawable's lifetime) and
-     * set *out_image_index to the slot it belongs to, or return NULL to
-     * skip the frame. The texture must have been created on the device
-     * D3DMetal is rendering with and include render-target usage. */
-    void* (*acquire_texture)(void* ctx, uint32_t* out_image_index);
+    /* A new image set was allocated (swapchain creation and every resize).
+     * Fires synchronously inside CreateSwapChainForHwnd / ResizeBuffers,
+     * before they return. */
+    void (*on_images_changed)(void* ctx, const dmn_exported_image_set* set);
 
-    /* The drawable wrapping slot image_index was presented. GPU completion
-     * tracking is the embedder's responsibility (e.g. via its own command
-     * buffer completion handlers). */
-    void (*present)(void* ctx, uint32_t image_index);
-} dmn_window_callbacks;
+    /* D3DMetal is about to render into slot image_index.  Block here until
+     * the consumer has released the slot (backpressure). */
+    void (*on_acquire)(void* ctx, uint32_t image_index);
 
-/* Create a window object backed by embedder callbacks. width/height seed the
- * swapchain size reported before the first configure(). Callable from any
- * thread. The callbacks struct is copied. */
-dmn_window_t dmn_window_create_with_callbacks(const dmn_window_callbacks* callbacks,
-                                              uint32_t width, uint32_t height);
+    /* A frame targeting slot image_index was presented.  frame_id is a
+     * per-swapchain monotonic counter.  gpu_done_fd (ownership transfers
+     * to the callee; -1 if unavailable) polls readable once the GPU has
+     * drained a tracking command buffer committed at present time. */
+    void (*on_present)(void* ctx, uint32_t image_index, uint64_t frame_id,
+                       int gpu_done_fd);
+} dmn_exported_swapchain_config;
+
+/* Create a window object backed by an exported swapchain.  All three
+ * callbacks are required.  width/height seed the swapchain size reported
+ * before the first on_images_changed.  Callable from any thread.  The
+ * config struct is copied. */
+dmn_window_t dmn_window_create_exported(const dmn_exported_swapchain_config* config,
+                                        uint32_t width, uint32_t height);
 
 /* The value to pass anywhere a HWND is expected. Stable for the lifetime of
  * the window. Always a small (< 2^32) non-NULL pseudo-handle, never a raw
@@ -196,6 +231,48 @@ typedef enum dmn_wait_status {
 } dmn_wait_status;
 
 dmn_wait_status dmn_event_wait(void* handle, uint64_t timeout_ns);
+
+/* Events are kqueue-backed: each event owns a kqueue whose single
+ * EVFILT_USER registration IS the signaled state, so one event is
+ * simultaneously waitable (dmn_event_wait, a blocking kevent) and
+ * pollable (dmn_event_dup_fd).  Cost: one fd per live event — raise
+ * RLIMIT_NOFILE if you host very many (macOS's default soft limit is
+ * low).  Semaphores are libdispatch objects, fd-free. */
+
+/* Create a standalone event HANDLE of the same kind D3DMetal's GFXT event
+ * interface vends, so it is accepted anywhere a D3D API takes a Win32 event
+ * HANDLE (ID3D11Fence/ID3D12Fence::SetEventOnCompletion, ...) and D3DMetal's
+ * own SetEvent will signal it. manual_reset/initial_state follow Win32
+ * CreateEvent semantics (non-zero = true). Waitable with dmn_event_wait();
+ * release with dmn_event_close(). NULL on failure (fd exhaustion). */
+void* dmn_event_create(int manual_reset, int initial_state);
+
+/* Win32 SetEvent / ResetEvent analogs for handles from dmn_event_create (or
+ * any event HANDLE surfaced through the D3D APIs). No-ops with a warning on
+ * non-event handles. */
+void dmn_event_signal(void* handle);
+void dmn_event_clear(void* handle);
+
+/* Destroy the handle. Waiters must not be blocked on it, and D3DMetal must
+ * no longer hold it (Duplicate'd handles inside D3DMetal are independent).
+ * fds returned by dmn_event_dup_fd survive the close. */
+void dmn_event_close(void* handle);
+
+/* Pollable view of an event: returns a NEW fd (caller owns; close(2) it)
+ * that polls readable (POLLIN) while the event is signaled and unreadable
+ * while it is clear — it is a dup(2) of the event's kqueue, so every fd
+ * returned for a handle tracks later signal/clear transitions, including
+ * D3DMetal's internal SetEvent on fence completion. Returns -1 on failure
+ * or if handle is not an event. Auto-reset caveat: a dmn_event_wait
+ * consumer that wins the race clears readability too (Win32 semantics). */
+int dmn_event_dup_fd(void* handle);
+
+/* Override what D3DMetal sees as the running executable's path (its per-app
+ * profile matcher keys on the basename). Must be set before the first D3D
+ * device/factory creation to be effective. NULL restores the real process
+ * path. The string is copied. Useful for embedders hosting another
+ * program's D3D workload (VM display servers, remoting hosts). */
+dmn_result dmn_set_executable_path(const char* path);
 
 /* == Configuration ======================================================= */
 /* D3DMetal reads settings through the GFXT registry interface, backed here

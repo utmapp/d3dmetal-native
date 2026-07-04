@@ -20,9 +20,9 @@
 #include "dmn_private.h"
 
 enum class DmnWindowBackend {
-    View,      /* NSView + library-owned CAMetalLayer */
-    Layer,     /* caller-owned CAMetalLayer */
-    Callbacks, /* embedder-provided textures */
+    View,     /* NSView + library-owned CAMetalLayer */
+    Layer,    /* caller-owned CAMetalLayer */
+    Exported, /* library-allocated shared-memory image set */
 };
 
 struct DmnWindow {
@@ -30,7 +30,7 @@ struct DmnWindow {
     DmnWindowBackend  backend;
     NSView*           view;   /* retained; View backend only */
     CAMetalLayer*     layer;  /* retained; View + Layer backends */
-    dmn_window_callbacks cb;  /* Callbacks backend; copied */
+    dmn_exported_swapchain_config cfg; /* Exported backend; copied */
 
     std::atomic<uint32_t> width{0};   /* pixels */
     std::atomic<uint32_t> height{0};

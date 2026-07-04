@@ -66,16 +66,17 @@ void cocoa_window_destroy(cocoa_window_t* w);
  * (the CAMetalLayer path).
  *
  * callback_backed = true: the window hosts an MTKView presenter instead —
- * the library renders into embedder-supplied MTLTextures
- * (dmn_window_create_with_callbacks) and a render thread blits the latest
- * presented texture into the MTKView's drawable each vsync. Frame pacing
- * comes from an in-flight budget in acquire_texture plus the MTKView
- * drawable pool, mirroring CAMetalLayer's nextDrawable backpressure.
- * BGRA8-format swapchains only (what all the demos use). */
+ * the library renders into its exported shared-memory image set
+ * (dmn_window_create_exported), the presenter wraps the received fds in
+ * MTLTextures (playing the remote-consumer role), and a render thread
+ * blits the latest presented image into the MTKView's drawable each
+ * vsync. Frame pacing comes from an in-flight budget in on_acquire plus
+ * the MTKView drawable pool, mirroring CAMetalLayer's nextDrawable
+ * backpressure. BGRA8-family swapchains only (what all the demos use). */
 dmn_window_t cocoa_window_create_dmn(cocoa_window_t* w, bool callback_backed);
 
 /* True when --callback appears in argv (the windowed demos' runtime switch
- * for the callback-backed swapchain). */
+ * for the exported swapchain). */
 bool cocoa_arg_callback(int argc, char** argv);
 
 /* Standalone offscreen CAMetalLayer (for windowless swapchain tests).

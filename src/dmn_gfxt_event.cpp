@@ -2,19 +2,37 @@
  * Copyright 2026 Turing Software LLC
  * SPDX-License-Identifier: MIT
  *
- * DmnGFXTEvent — Win32-style events and semaphores as magic-tagged,
- * refcounted heap handles. Events use pthread mutex+cond (manual/auto
- * reset semantics map directly); semaphores use libdispatch. Handles
- * stay in-process, so no fds are needed (games create many events).
+ * DmnGFXTEvent — Win32-style events and semaphores.
  *
- * The same handles back the public dmn_event_wait(), which lets apps
- * wait on HANDLEs surfaced through D3D APIs (frame-latency objects).
+ * Events are kqueue-backed: the handle is a tiny tagged box around a
+ * kqueue fd whose single EVFILT_USER registration IS the signaled
+ * state.  Signal = NOTE_TRIGGER.  Manual-reset events register without
+ * EV_CLEAR (the trigger stays pending, so every waiter and poller sees
+ * it until an explicit clear); auto-reset events register with
+ * EV_CLEAR (retrieval consumes the trigger, and the kernel wakes
+ * exactly one blocked waiter) — kqueue provides Win32 semantics
+ * directly, with no userspace lock: the kqueue is the serializer.
+ * Waiting is one blocking kevent(2) call; the pollable view handed out
+ * by dmn_event_dup_fd() is a plain dup(2) of the same kqueue.  The one
+ * cost is an fd per live event.
+ *
+ * Clearing deletes and re-adds the registration — the only way to
+ * un-trigger EVFILT_USER.
+ *
+ * Semaphores use libdispatch, fd-free, unchanged.  The magic word at
+ * the front of both boxes dispatches the public dmn_event_wait()
+ * (D3DMetal implements frame-latency waitables as GFXT semaphores, so
+ * app-facing waits must accept both).
  */
 
 #include <dispatch/dispatch.h>
-#include <pthread.h>
+#include <fcntl.h>
+#include <sys/event.h>
+#include <time.h>
+#include <unistd.h>
 
 #include <atomic>
+#include <cerrno>
 #include <cstdlib>
 
 #include "dmn_gfxt.h"
@@ -25,19 +43,15 @@ namespace {
 constexpr uint32_t kEventMagic     = 0x544E5645; /* 'EVNT' */
 constexpr uint32_t kSemaphoreMagic = 0x414D4553; /* 'SEMA' */
 
-struct DmnHandleHeader {
+struct DmnEvent {
+    uint32_t magic;
+    bool     manual_reset;
+    int      kq;
+};
+
+struct DmnSemaphore {
     uint32_t magic;
     std::atomic<uint32_t> refs;
-};
-
-struct DmnEvent : DmnHandleHeader {
-    pthread_mutex_t mutex;
-    pthread_cond_t  cond;
-    bool manual_reset;
-    bool signaled;
-};
-
-struct DmnSemaphore : DmnHandleHeader {
     dispatch_semaphore_t sem;
 };
 
@@ -61,10 +75,86 @@ DmnSemaphore* as_semaphore(void* h) {
     return s;
 }
 
-void destroy_event(DmnEvent* e) {
-    pthread_mutex_destroy(&e->mutex);
-    pthread_cond_destroy(&e->cond);
-    ::free(e);
+bool event_register(int kq, bool manual_reset) {
+    struct kevent ev;
+    uint16_t flags = EV_ADD | EV_ENABLE;
+    if (!manual_reset)
+        flags |= EV_CLEAR;
+    EV_SET(&ev, 1, EVFILT_USER, flags, 0, 0, nullptr);
+    return kevent(kq, &ev, 1, nullptr, 0, nullptr) == 0;
+}
+
+void event_signal(DmnEvent* e) {
+    struct kevent ev;
+    EV_SET(&ev, 1, EVFILT_USER, 0, NOTE_TRIGGER, 0, nullptr);
+    kevent(e->kq, &ev, 1, nullptr, 0, nullptr);
+}
+
+void event_clear(DmnEvent* e) {
+    struct kevent ev;
+    EV_SET(&ev, 1, EVFILT_USER, EV_DELETE, 0, 0, nullptr);
+    kevent(e->kq, &ev, 1, nullptr, 0, nullptr);
+    event_register(e->kq, e->manual_reset);
+}
+
+DmnEvent* event_alloc(bool manual_reset, bool initial_state) {
+    int kq = kqueue();
+    if (kq < 0) {
+        DMN_ERROR("event: kqueue() failed (fd exhaustion? raise "
+                  "RLIMIT_NOFILE)");
+        return nullptr;
+    }
+    int fdflags = fcntl(kq, F_GETFD);
+    if (fdflags >= 0)
+        fcntl(kq, F_SETFD, fdflags | FD_CLOEXEC);
+    if (!event_register(kq, manual_reset)) {
+        close(kq);
+        return nullptr;
+    }
+
+    auto* e = static_cast<DmnEvent*>(::malloc(sizeof(DmnEvent)));
+    if (!e) {
+        close(kq);
+        return nullptr;
+    }
+    e->magic = kEventMagic;
+    e->manual_reset = manual_reset;
+    e->kq = kq;
+    if (initial_state)
+        event_signal(e);
+    return e;
+}
+
+/* One blocking kevent, EINTR-safe.  For manual-reset events the
+ * registration has no EV_CLEAR, so retrieval leaves the trigger pending
+ * (all waiters wake, later waits return immediately); for auto-reset
+ * EV_CLEAR makes the retrieval the consumption. */
+dmn_wait_status event_wait(DmnEvent* e, uint64_t timeout_ns) {
+    uint64_t deadline = 0;
+    if (timeout_ns != UINT64_MAX)
+        deadline = clock_gettime_nsec_np(CLOCK_MONOTONIC) + timeout_ns;
+
+    for (;;) {
+        struct timespec ts;
+        struct timespec* tsp = nullptr;
+        if (timeout_ns != UINT64_MAX) {
+            uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+            uint64_t left = deadline > now ? deadline - now : 0;
+            ts.tv_sec  = (time_t)(left / 1000000000ull);
+            ts.tv_nsec = (long)(left % 1000000000ull);
+            tsp = &ts;
+        }
+        struct kevent out;
+        int n = kevent(e->kq, nullptr, 0, &out, 1, tsp);
+        if (n > 0)
+            return DMN_WAIT_SIGNALED;
+        if (n == 0)
+            return DMN_WAIT_TIMEOUT;
+        if (errno != EINTR) {
+            DMN_WARN("event: kevent wait failed: %d", errno);
+            return DMN_WAIT_FAILED;
+        }
+    }
 }
 
 void destroy_semaphore(DmnSemaphore* s) {
@@ -72,48 +162,12 @@ void destroy_semaphore(DmnSemaphore* s) {
     ::free(s);
 }
 
-/* Returns DMN_WAIT_SIGNALED or DMN_WAIT_TIMEOUT. */
-dmn_wait_status event_wait(DmnEvent* e, uint64_t timeout_ns) {
-    dmn_wait_status status = DMN_WAIT_SIGNALED;
-    pthread_mutex_lock(&e->mutex);
-    if (timeout_ns == UINT64_MAX) {
-        while (!e->signaled)
-            pthread_cond_wait(&e->cond, &e->mutex);
-    } else {
-        struct timespec rel;
-        rel.tv_sec  = (time_t)(timeout_ns / 1000000000ull);
-        rel.tv_nsec = (long)(timeout_ns % 1000000000ull);
-        while (!e->signaled) {
-            if (pthread_cond_timedwait_relative_np(&e->cond, &e->mutex, &rel)
-                    != 0) {
-                /* macOS recomputes nothing for us; treat any wake past the
-                 * relative deadline as a timeout check point. */
-                if (!e->signaled)
-                    status = DMN_WAIT_TIMEOUT;
-                break;
-            }
-        }
-    }
-    if (status == DMN_WAIT_SIGNALED && !e->manual_reset)
-        e->signaled = false; /* auto-reset consumes the signal */
-    pthread_mutex_unlock(&e->mutex);
-    return status;
-}
-
 } // namespace
 
 DmnGFXTEvent::~DmnGFXTEvent() = default;
 
 void* DmnGFXTEvent::CreateEvent(uint32_t manualReset, bool initialState) {
-    auto* e = static_cast<DmnEvent*>(::calloc(1, sizeof(DmnEvent)));
-    if (!e)
-        return nullptr;
-    e->magic = kEventMagic;
-    e->refs.store(1, std::memory_order_relaxed);
-    pthread_mutex_init(&e->mutex, nullptr);
-    pthread_cond_init(&e->cond, nullptr);
-    e->manual_reset = manualReset != 0;
-    e->signaled = initialState;
+    DmnEvent* e = event_alloc(manualReset != 0, initialState);
     DMN_TRACE("CreateEvent(manualReset=%u, initial=%d) = %p",
               manualReset, initialState, (void*)e);
     return e;
@@ -121,46 +175,34 @@ void* DmnGFXTEvent::CreateEvent(uint32_t manualReset, bool initialState) {
 
 void DmnGFXTEvent::SetEvent(void* handle) {
     DmnEvent* e = as_event(handle);
-    if (!e)
-        return;
-    pthread_mutex_lock(&e->mutex);
-    e->signaled = true;
-    if (e->manual_reset)
-        pthread_cond_broadcast(&e->cond);
-    else
-        pthread_cond_signal(&e->cond);
-    pthread_mutex_unlock(&e->mutex);
+    if (e)
+        event_signal(e);
 }
 
 void DmnGFXTEvent::ClearEvent(void* handle) {
     DmnEvent* e = as_event(handle);
-    if (!e)
-        return;
-    pthread_mutex_lock(&e->mutex);
-    e->signaled = false;
-    pthread_mutex_unlock(&e->mutex);
+    if (e)
+        event_clear(e);
 }
 
 void DmnGFXTEvent::PulseEvent(void* handle) {
+    /* Trigger-then-clear releases pollers and any waiter the kernel
+     * schedules in between, ending non-signaled.  (Win32 PulseEvent is
+     * documented-unreliable; this matches its spirit, not its letter.) */
     DmnEvent* e = as_event(handle);
     if (!e)
         return;
-    pthread_mutex_lock(&e->mutex);
-    /* Release current waiters, end up non-signaled (Win32 PulseEvent). */
-    if (e->manual_reset)
-        pthread_cond_broadcast(&e->cond);
-    else
-        pthread_cond_signal(&e->cond);
-    e->signaled = false;
-    pthread_mutex_unlock(&e->mutex);
+    event_signal(e);
+    event_clear(e);
 }
 
 void DmnGFXTEvent::CloseEvent(void* handle) {
     DmnEvent* e = as_event(handle);
     if (!e)
         return;
-    if (e->refs.fetch_sub(1, std::memory_order_acq_rel) == 1)
-        destroy_event(e);
+    close(e->kq);
+    e->magic = 0;
+    ::free(e);
 }
 
 void* DmnGFXTEvent::CreateSemaphore(uint32_t initialCount,
@@ -208,11 +250,23 @@ void DmnGFXTEvent::CloseSemaphore(void* handle) {
 }
 
 void* DmnGFXTEvent::DuplicateEvent(void* handle) {
+    /* A new box with its own dup of the kqueue: the kernel refcounts the
+     * kqueue object, so either handle may be closed independently while
+     * trigger state stays shared. */
     DmnEvent* e = as_event(handle);
     if (!e)
         return nullptr;
-    e->refs.fetch_add(1, std::memory_order_relaxed);
-    return e;
+    int kq = dup(e->kq);
+    if (kq < 0)
+        return nullptr;
+    auto* d = static_cast<DmnEvent*>(::malloc(sizeof(DmnEvent)));
+    if (!d) {
+        close(kq);
+        return nullptr;
+    }
+    *d = *e;
+    d->kq = kq;
+    return d;
 }
 
 void* DmnGFXTEvent::DuplicateSemaphore(void* handle) {
@@ -239,54 +293,45 @@ void DmnGFXTEvent::_DispatchFunctionInternal(void (*fn)(const void*),
     }
 }
 
-/* Internal: create/destroy a bare DmnEvent (kEventMagic, so D3DMetal's GFXT
- * event interface will SetEvent it) for dmn_fence_d3d.cpp to hand to
- * ID3D11Fence/ID3D12Fence::SetEventOnCompletion. */
+/* == Public C API (also used by dmn_fence_d3d.cpp internally) ============= */
+
 extern "C" void* dmn_event_create(int manual_reset, int initial_state) {
-    auto* e = static_cast<DmnEvent*>(::calloc(1, sizeof(DmnEvent)));
-    if (!e)
-        return nullptr;
-    e->magic = kEventMagic;
-    e->refs.store(1, std::memory_order_relaxed);
-    pthread_mutex_init(&e->mutex, nullptr);
-    pthread_cond_init(&e->cond, nullptr);
-    e->manual_reset = manual_reset != 0;
-    e->signaled = initial_state != 0;
-    return e;
+    return event_alloc(manual_reset != 0, initial_state != 0);
+}
+
+extern "C" void dmn_event_signal(void* handle) {
+    DmnEvent* e = as_event(handle);
+    if (e)
+        event_signal(e);
+}
+
+extern "C" void dmn_event_clear(void* handle) {
+    DmnEvent* e = as_event(handle);
+    if (e)
+        event_clear(e);
 }
 
 extern "C" void dmn_event_close(void* handle) {
     DmnEvent* e = as_event(handle);
     if (!e)
         return;
-    if (e->refs.fetch_sub(1, std::memory_order_acq_rel) == 1)
-        destroy_event(e);
+    close(e->kq);
+    e->magic = 0;
+    ::free(e);
 }
 
-/* Internal: signal a DmnEvent handle (used by the shared-fence watchers in
- * dmn_fence_d3d.cpp). Same semantics as SetEvent. */
-extern "C" void dmn_event_signal(void* handle) {
+extern "C" int dmn_event_dup_fd(void* handle) {
     DmnEvent* e = as_event(handle);
-    if (!e)
-        return;
-    pthread_mutex_lock(&e->mutex);
-    e->signaled = true;
-    if (e->manual_reset)
-        pthread_cond_broadcast(&e->cond);
-    else
-        pthread_cond_signal(&e->cond);
-    pthread_mutex_unlock(&e->mutex);
+    return e ? dup(e->kq) : -1;
 }
-
-/* == Public wait API ====================================================== */
 
 extern "C" dmn_wait_status dmn_event_wait(void* handle, uint64_t timeout_ns) {
     if (!handle)
         return DMN_WAIT_FAILED;
-    auto* hdr = static_cast<DmnHandleHeader*>(handle);
-    if (hdr->magic == kEventMagic)
+    uint32_t magic = *static_cast<uint32_t*>(handle);
+    if (magic == kEventMagic)
         return event_wait(static_cast<DmnEvent*>(handle), timeout_ns);
-    if (hdr->magic == kSemaphoreMagic) {
+    if (magic == kSemaphoreMagic) {
         auto* s = static_cast<DmnSemaphore*>(handle);
         dispatch_time_t deadline = timeout_ns == UINT64_MAX
             ? DISPATCH_TIME_FOREVER

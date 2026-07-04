@@ -25,8 +25,12 @@ your app ──> libd3dmetal-native.dylib ──> D3DMetal.framework ──> Met
 - **D3D11 and D3D12 devices** with swapchains on:
   - an `NSView` (the library installs a `CAMetalLayer`),
   - a caller-owned `CAMetalLayer` (offscreen or custom layer hierarchies), or
-  - **embedder callbacks** — you supply `MTLTexture`s and receive
-    configure/acquire/present callbacks; for compositors and remoting.
+  - an **exported swapchain** (`dmn_window_create_exported`) — for
+    compositors, VM display servers, and remoting: the library allocates
+    shared-memory-backed images and drives three callbacks
+    (images-changed with the fds/strides, acquire for backpressure,
+    present with a pollable GPU-done fence fd). The embedder never
+    touches a Metal object.
 - **Pseudo-HWNDs**: `dmn_window_get_hwnd()` returns a small stable handle to
   pass anywhere a `HWND` is expected (`CreateSwapChainForHwnd`, ...).
 - **Cross-process resource sharing**, entirely through the standard D3D APIs
@@ -43,9 +47,14 @@ your app ──> libd3dmetal-native.dylib ──> D3DMetal.framework ──> Met
     `IDXGIKeyedMutex` via `QueryInterface`).
 - **Win32-style events**: HANDLEs surfaced through D3D APIs (frame-latency
   waitable objects, `SetEventOnCompletion`) are waitable with
-  `dmn_event_wait()`.
+  `dmn_event_wait()`. `dmn_event_create()` mints HANDLEs to pass into those
+  APIs yourself, and `dmn_event_dup_fd()` vends a `poll(2)`-compatible fd
+  mirroring an event's signaled state (for fd-driven event loops).
 - **Registry pre-seeding** (`dmn_registry_set_*`) and per-value environment
   overrides for the settings D3DMetal reads.
+- **Executable-path override** (`dmn_set_executable_path`) so D3DMetal's
+  per-app profile matcher keys on the program you are hosting rather than
+  your own process.
 
 ## Requirements
 
@@ -95,8 +104,8 @@ HWND hwnd = (HWND)dmn_window_get_hwnd(win);
 
 `dmn_init()` is optional — the first D3D entry point performs lazy default
 initialization. See `include/d3dmetal_native.h` for the full API, including
-the callback-backed swapchain (`dmn_window_create_with_callbacks`) and the
-shared-handle lifetime rules.
+the exported swapchain (`dmn_window_create_exported`) and the shared-handle
+lifetime rules.
 
 ### Cross-process sharing model
 
@@ -127,7 +136,7 @@ over a Unix socket) and write back into the received copy before
 `meson test -C build` runs the suite: device bring-up, on-screen triangle and
 cube demos, cross-process shared textures/buffers/fences/keyed mutexes in
 both API directions, GPU waits on imported fences, event-driven waits,
-shared heaps with placed resources, the callback swapchain backend,
+shared heaps with placed resources, the exported swapchain backend,
 lifecycle/fd-leak churn, and a multi-threaded stress test. The windowed demos
 (`d3d11-triangle`, `d3d11-cube`, `d3d12-triangle --shared`,
 `shared-compute-triangle` without `DMN_HEADLESS`) can also be run directly as

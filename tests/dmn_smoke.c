@@ -14,12 +14,25 @@
 #include "d3dmetal_native.h"
 
 int main(void) {
+    /* Set the executable-path override before init so D3DMetal's handshake
+     * (which reads the path for its per-app profile matcher) goes through
+     * the override; the name matches no profile, like any test binary. */
+    if (dmn_set_executable_path("/smoke/dmn-smoke.exe") != DMN_SUCCESS) {
+        fprintf(stderr, "SMOKE: dmn_set_executable_path FAILED\n");
+        return 1;
+    }
+
     dmn_result res = dmn_init(NULL);
     if (res != DMN_SUCCESS) {
         fprintf(stderr, "SMOKE: dmn_init FAILED (%d)\n", (int)res);
         return 1;
     }
     printf("SMOKE: dmn_init: OK\n");
+
+    if (dmn_set_executable_path(NULL) != DMN_SUCCESS) {
+        fprintf(stderr, "SMOKE: dmn_set_executable_path(NULL) FAILED\n");
+        return 1;
+    }
 
     if (!dmn_is_initialized()) {
         fprintf(stderr, "SMOKE: dmn_is_initialized FAILED\n");

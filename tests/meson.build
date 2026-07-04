@@ -145,9 +145,17 @@ mt_stress = executable('mt-stress-test',
   link_with: dmn_lib)
 test('mt-stress', mt_stress, env: ['DMN_LOG=warn'], timeout: 600)
 
+# Windowless, no init: public event API semantics — manual/auto reset,
+# initial state, wake-one auto-reset, and the pollable dup_fd view.
+event_api = executable('event-api-test', 'event_api_test.cpp',
+  include_directories: test_native_inc,
+  link_with: dmn_lib)
+test('event-api', event_api, env: ['DMN_LOG=info'], timeout: 120)
+
 # Windowless: event-driven fence paths — SetEventOnCompletion + dmn_event_wait
-# on producer/imported fences, CPU-signal visibility both directions, and
-# SetEventOnMultipleFenceCompletion (ALL/ANY) with an imported fence.
+# on producer/imported fences, CPU-signal visibility both directions,
+# SetEventOnMultipleFenceCompletion (ALL/ANY) with an imported fence, and a
+# dup_fd polled readable on fence completion.
 fence_events = executable('fence-events-test',
   'fence_events_test.cpp',
   include_directories: test_native_inc,
@@ -170,11 +178,10 @@ d3d11_variants = executable('d3d11-variants-test',
   link_with: dmn_lib)
 test('d3d11-variants', d3d11_variants, env: ['DMN_LOG=info'], timeout: 300)
 
-# Callback-backed swapchain: embedder MTLTextures, configure/acquire/present
-# round trip, final clear color verified in the embedder texture.
-callback_swapchain = executable('callback-swapchain-test',
-  ['callback_swapchain_test.cpp', 'callback_embedder.mm'],
+# Exported swapchain: library-allocated shared-memory images, images-changed/
+# acquire/present round trip, final clear color read from the mmap'd fds.
+exported_swapchain = executable('exported-swapchain-test',
+  'exported_swapchain_test.cpp',
   include_directories: test_native_inc,
-  link_with: dmn_lib,
-  dependencies: [cocoa_deps])
-test('callback-swapchain', callback_swapchain, env: ['DMN_LOG=info'], timeout: 300)
+  link_with: dmn_lib)
+test('exported-swapchain', exported_swapchain, env: ['DMN_LOG=info'], timeout: 300)
