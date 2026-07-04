@@ -1,0 +1,252 @@
+/*
+ * Copyright 2026 Turing Software LLC
+ * SPDX-License-Identifier: MIT
+ *
+ * Private, self-contained DXGI/D3D12 type definitions for the GFXT
+ * implementation. Layout-compatible with the Windows SDK; values copied
+ * from the vendored mingw-directx-headers (include/native/directx).
+ *
+ * This header exists so the library's Objective-C++ translation units never
+ * include the full vendored Windows headers (whose BOOL/interface macros
+ * conflict with Cocoa). It deliberately avoids BOOL (uses int32_t), the
+ * `interface` macro, and any wide-char type other than char16_t.
+ */
+
+#pragma once
+
+#if defined(__dxgiformat_h__) || defined(__d3d12_h__) || defined(__dxgicommon_h__)
+#error "dmn_directx_types.h must not be mixed with the vendored DirectX headers in one TU"
+#endif
+
+#include <cstddef>
+#include <cstdint>
+
+typedef struct LUID {
+    uint32_t LowPart;
+    int32_t  HighPart;
+} LUID;
+
+typedef enum DXGI_FORMAT {
+    DXGI_FORMAT_UNKNOWN = 0x0,
+    DXGI_FORMAT_R32G32B32A32_TYPELESS = 0x1,
+    DXGI_FORMAT_R32G32B32A32_FLOAT = 0x2,
+    DXGI_FORMAT_R32G32B32A32_UINT = 0x3,
+    DXGI_FORMAT_R32G32B32A32_SINT = 0x4,
+    DXGI_FORMAT_R32G32B32_TYPELESS = 0x5,
+    DXGI_FORMAT_R32G32B32_FLOAT = 0x6,
+    DXGI_FORMAT_R32G32B32_UINT = 0x7,
+    DXGI_FORMAT_R32G32B32_SINT = 0x8,
+    DXGI_FORMAT_R16G16B16A16_TYPELESS = 0x9,
+    DXGI_FORMAT_R16G16B16A16_FLOAT = 0xa,
+    DXGI_FORMAT_R16G16B16A16_UNORM = 0xb,
+    DXGI_FORMAT_R16G16B16A16_UINT = 0xc,
+    DXGI_FORMAT_R16G16B16A16_SNORM = 0xd,
+    DXGI_FORMAT_R16G16B16A16_SINT = 0xe,
+    DXGI_FORMAT_R32G32_TYPELESS = 0xf,
+    DXGI_FORMAT_R32G32_FLOAT = 0x10,
+    DXGI_FORMAT_R32G32_UINT = 0x11,
+    DXGI_FORMAT_R32G32_SINT = 0x12,
+    DXGI_FORMAT_R32G8X24_TYPELESS = 0x13,
+    DXGI_FORMAT_D32_FLOAT_S8X24_UINT = 0x14,
+    DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS = 0x15,
+    DXGI_FORMAT_X32_TYPELESS_G8X24_UINT = 0x16,
+    DXGI_FORMAT_R10G10B10A2_TYPELESS = 0x17,
+    DXGI_FORMAT_R10G10B10A2_UNORM = 0x18,
+    DXGI_FORMAT_R10G10B10A2_UINT = 0x19,
+    DXGI_FORMAT_R11G11B10_FLOAT = 0x1a,
+    DXGI_FORMAT_R8G8B8A8_TYPELESS = 0x1b,
+    DXGI_FORMAT_R8G8B8A8_UNORM = 0x1c,
+    DXGI_FORMAT_R8G8B8A8_UNORM_SRGB = 0x1d,
+    DXGI_FORMAT_R8G8B8A8_UINT = 0x1e,
+    DXGI_FORMAT_R8G8B8A8_SNORM = 0x1f,
+    DXGI_FORMAT_R8G8B8A8_SINT = 0x20,
+    DXGI_FORMAT_R16G16_TYPELESS = 0x21,
+    DXGI_FORMAT_R16G16_FLOAT = 0x22,
+    DXGI_FORMAT_R16G16_UNORM = 0x23,
+    DXGI_FORMAT_R16G16_UINT = 0x24,
+    DXGI_FORMAT_R16G16_SNORM = 0x25,
+    DXGI_FORMAT_R16G16_SINT = 0x26,
+    DXGI_FORMAT_R32_TYPELESS = 0x27,
+    DXGI_FORMAT_D32_FLOAT = 0x28,
+    DXGI_FORMAT_R32_FLOAT = 0x29,
+    DXGI_FORMAT_R32_UINT = 0x2a,
+    DXGI_FORMAT_R32_SINT = 0x2b,
+    DXGI_FORMAT_R24G8_TYPELESS = 0x2c,
+    DXGI_FORMAT_D24_UNORM_S8_UINT = 0x2d,
+    DXGI_FORMAT_R24_UNORM_X8_TYPELESS = 0x2e,
+    DXGI_FORMAT_X24_TYPELESS_G8_UINT = 0x2f,
+    DXGI_FORMAT_R8G8_TYPELESS = 0x30,
+    DXGI_FORMAT_R8G8_UNORM = 0x31,
+    DXGI_FORMAT_R8G8_UINT = 0x32,
+    DXGI_FORMAT_R8G8_SNORM = 0x33,
+    DXGI_FORMAT_R8G8_SINT = 0x34,
+    DXGI_FORMAT_R16_TYPELESS = 0x35,
+    DXGI_FORMAT_R16_FLOAT = 0x36,
+    DXGI_FORMAT_D16_UNORM = 0x37,
+    DXGI_FORMAT_R16_UNORM = 0x38,
+    DXGI_FORMAT_R16_UINT = 0x39,
+    DXGI_FORMAT_R16_SNORM = 0x3a,
+    DXGI_FORMAT_R16_SINT = 0x3b,
+    DXGI_FORMAT_R8_TYPELESS = 0x3c,
+    DXGI_FORMAT_R8_UNORM = 0x3d,
+    DXGI_FORMAT_R8_UINT = 0x3e,
+    DXGI_FORMAT_R8_SNORM = 0x3f,
+    DXGI_FORMAT_R8_SINT = 0x40,
+    DXGI_FORMAT_A8_UNORM = 0x41,
+    DXGI_FORMAT_R1_UNORM = 0x42,
+    DXGI_FORMAT_R9G9B9E5_SHAREDEXP = 0x43,
+    DXGI_FORMAT_R8G8_B8G8_UNORM = 0x44,
+    DXGI_FORMAT_G8R8_G8B8_UNORM = 0x45,
+    DXGI_FORMAT_BC1_TYPELESS = 0x46,
+    DXGI_FORMAT_BC1_UNORM = 0x47,
+    DXGI_FORMAT_BC1_UNORM_SRGB = 0x48,
+    DXGI_FORMAT_BC2_TYPELESS = 0x49,
+    DXGI_FORMAT_BC2_UNORM = 0x4a,
+    DXGI_FORMAT_BC2_UNORM_SRGB = 0x4b,
+    DXGI_FORMAT_BC3_TYPELESS = 0x4c,
+    DXGI_FORMAT_BC3_UNORM = 0x4d,
+    DXGI_FORMAT_BC3_UNORM_SRGB = 0x4e,
+    DXGI_FORMAT_BC4_TYPELESS = 0x4f,
+    DXGI_FORMAT_BC4_UNORM = 0x50,
+    DXGI_FORMAT_BC4_SNORM = 0x51,
+    DXGI_FORMAT_BC5_TYPELESS = 0x52,
+    DXGI_FORMAT_BC5_UNORM = 0x53,
+    DXGI_FORMAT_BC5_SNORM = 0x54,
+    DXGI_FORMAT_B5G6R5_UNORM = 0x55,
+    DXGI_FORMAT_B5G5R5A1_UNORM = 0x56,
+    DXGI_FORMAT_B8G8R8A8_UNORM = 0x57,
+    DXGI_FORMAT_B8G8R8X8_UNORM = 0x58,
+    DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM = 0x59,
+    DXGI_FORMAT_B8G8R8A8_TYPELESS = 0x5a,
+    DXGI_FORMAT_B8G8R8A8_UNORM_SRGB = 0x5b,
+    DXGI_FORMAT_B8G8R8X8_TYPELESS = 0x5c,
+    DXGI_FORMAT_B8G8R8X8_UNORM_SRGB = 0x5d,
+    DXGI_FORMAT_BC6H_TYPELESS = 0x5e,
+    DXGI_FORMAT_BC6H_UF16 = 0x5f,
+    DXGI_FORMAT_BC6H_SF16 = 0x60,
+    DXGI_FORMAT_BC7_TYPELESS = 0x61,
+    DXGI_FORMAT_BC7_UNORM = 0x62,
+    DXGI_FORMAT_BC7_UNORM_SRGB = 0x63,
+    DXGI_FORMAT_AYUV = 0x64,
+    DXGI_FORMAT_Y410 = 0x65,
+    DXGI_FORMAT_Y416 = 0x66,
+    DXGI_FORMAT_NV12 = 0x67,
+    DXGI_FORMAT_P010 = 0x68,
+    DXGI_FORMAT_P016 = 0x69,
+    DXGI_FORMAT_420_OPAQUE = 0x6a,
+    DXGI_FORMAT_YUY2 = 0x6b,
+    DXGI_FORMAT_Y210 = 0x6c,
+    DXGI_FORMAT_Y216 = 0x6d,
+    DXGI_FORMAT_NV11 = 0x6e,
+    DXGI_FORMAT_AI44 = 0x6f,
+    DXGI_FORMAT_IA44 = 0x70,
+    DXGI_FORMAT_P8 = 0x71,
+    DXGI_FORMAT_A8P8 = 0x72,
+    DXGI_FORMAT_B4G4R4A4_UNORM = 0x73,
+    DXGI_FORMAT_P208 = 0x82,
+    DXGI_FORMAT_V208 = 0x83,
+    DXGI_FORMAT_V408 = 0x84,
+    DXGI_FORMAT_FORCE_UINT = 0xffffffff
+} DXGI_FORMAT;
+
+typedef struct DXGI_SAMPLE_DESC {
+    uint32_t Count;
+    uint32_t Quality;
+} DXGI_SAMPLE_DESC;
+
+typedef uint32_t DXGI_USAGE;
+enum : uint32_t {
+    DXGI_USAGE_SHADER_INPUT         = 0x010,
+    DXGI_USAGE_RENDER_TARGET_OUTPUT = 0x020,
+    DXGI_USAGE_BACK_BUFFER          = 0x040,
+    DXGI_USAGE_SHARED               = 0x080,
+    DXGI_USAGE_READ_ONLY            = 0x100,
+    DXGI_USAGE_DISCARD_ON_PRESENT   = 0x200,
+    DXGI_USAGE_UNORDERED_ACCESS     = 0x400,
+};
+
+typedef enum DXGI_SCALING {
+    DXGI_SCALING_STRETCH              = 0,
+    DXGI_SCALING_NONE                 = 1,
+    DXGI_SCALING_ASPECT_RATIO_STRETCH = 2,
+} DXGI_SCALING;
+
+typedef enum DXGI_SWAP_EFFECT {
+    DXGI_SWAP_EFFECT_DISCARD         = 0,
+    DXGI_SWAP_EFFECT_SEQUENTIAL      = 1,
+    DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL = 3,
+    DXGI_SWAP_EFFECT_FLIP_DISCARD    = 4,
+} DXGI_SWAP_EFFECT;
+
+typedef enum DXGI_ALPHA_MODE {
+    DXGI_ALPHA_MODE_UNSPECIFIED   = 0,
+    DXGI_ALPHA_MODE_PREMULTIPLIED = 1,
+    DXGI_ALPHA_MODE_STRAIGHT      = 2,
+    DXGI_ALPHA_MODE_IGNORE        = 3,
+} DXGI_ALPHA_MODE;
+
+enum : uint32_t {
+    DXGI_SWAP_CHAIN_FLAG_NONPREROTATED                  = 0x001,
+    DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH              = 0x002,
+    DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT  = 0x040,
+    DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING                  = 0x800,
+};
+
+typedef struct DXGI_SWAP_CHAIN_DESC1 {
+    uint32_t         Width;        /* +0x00 */
+    uint32_t         Height;       /* +0x04 */
+    DXGI_FORMAT      Format;       /* +0x08 */
+    int32_t          Stereo;       /* +0x0c  BOOL as int32 */
+    DXGI_SAMPLE_DESC SampleDesc;   /* +0x10 */
+    DXGI_USAGE       BufferUsage;  /* +0x18 */
+    uint32_t         BufferCount;  /* +0x1c */
+    DXGI_SCALING     Scaling;      /* +0x20 */
+    DXGI_SWAP_EFFECT SwapEffect;   /* +0x24 */
+    DXGI_ALPHA_MODE  AlphaMode;    /* +0x28 */
+    uint32_t         Flags;        /* +0x2c */
+} DXGI_SWAP_CHAIN_DESC1;
+static_assert(sizeof(DXGI_SWAP_CHAIN_DESC1) == 0x30,
+              "DXGI_SWAP_CHAIN_DESC1 layout mismatch");
+
+typedef enum D3D12_RESOURCE_DIMENSION {
+    D3D12_RESOURCE_DIMENSION_UNKNOWN   = 0,
+    D3D12_RESOURCE_DIMENSION_BUFFER    = 1,
+    D3D12_RESOURCE_DIMENSION_TEXTURE1D = 2,
+    D3D12_RESOURCE_DIMENSION_TEXTURE2D = 3,
+    D3D12_RESOURCE_DIMENSION_TEXTURE3D = 4,
+} D3D12_RESOURCE_DIMENSION;
+
+typedef enum D3D12_TEXTURE_LAYOUT {
+    D3D12_TEXTURE_LAYOUT_UNKNOWN                = 0,
+    D3D12_TEXTURE_LAYOUT_ROW_MAJOR              = 1,
+    D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE = 2,
+    D3D12_TEXTURE_LAYOUT_64KB_STANDARD_SWIZZLE  = 3,
+} D3D12_TEXTURE_LAYOUT;
+
+typedef enum D3D12_RESOURCE_FLAGS {
+    D3D12_RESOURCE_FLAG_NONE                        = 0x00,
+    D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET         = 0x01,
+    D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL         = 0x02,
+    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS      = 0x04,
+    D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE        = 0x08,
+    D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER         = 0x10,
+    D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS   = 0x20,
+    D3D12_RESOURCE_FLAG_VIDEO_DECODE_REFERENCE_ONLY = 0x40,
+} D3D12_RESOURCE_FLAGS;
+
+typedef struct D3D12_RESOURCE_DESC {
+    D3D12_RESOURCE_DIMENSION Dimension;   /* +0x00 (+4 pad) */
+    uint64_t                 Alignment;   /* +0x08 */
+    uint64_t                 Width;       /* +0x10 */
+    uint32_t                 Height;      /* +0x18 */
+    uint16_t                 DepthOrArraySize; /* +0x1c */
+    uint16_t                 MipLevels;   /* +0x1e */
+    DXGI_FORMAT              Format;      /* +0x20 */
+    DXGI_SAMPLE_DESC         SampleDesc;  /* +0x24 */
+    D3D12_TEXTURE_LAYOUT     Layout;      /* +0x2c */
+    D3D12_RESOURCE_FLAGS     Flags;       /* +0x30 (+4 tail pad) */
+} D3D12_RESOURCE_DESC;
+static_assert(sizeof(D3D12_RESOURCE_DESC) == 0x38,
+              "D3D12_RESOURCE_DESC layout mismatch");
+static_assert(offsetof(D3D12_RESOURCE_DESC, Format) == 0x20,
+              "D3D12_RESOURCE_DESC::Format offset mismatch");

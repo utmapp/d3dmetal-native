@@ -1,0 +1,20 @@
+# Exported symbols for libd3dmetal-native.dylib (ld64 -exported_symbols_list).
+# The dmn_* C API plus the D3D entry points consumers link against
+# (apps link this library, not the framework).
+_dmn_*
+_D3D11CreateDevice
+_D3D11CreateDeviceAndSwapChain
+_CreateDXGIFactory
+_CreateDXGIFactory1
+_CreateDXGIFactory2
+_D3D12CreateDevice
+_D3D12GetDebugInterface
+_D3D12SerializeRootSignature
+_D3D12SerializeVersionedRootSignature
+_D3D12CreateRootSignatureDeserializer
+_D3D12CreateVersionedRootSignatureDeserializer
+_D3D12EnableExperimentalFeatures
+_DXGIDeclareAdapterRemovalSupport
+_D3DCompile
+_D3DCompileFromFile
+_D3D10CreateBlob

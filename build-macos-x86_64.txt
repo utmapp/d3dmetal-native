@@ -1,0 +1,35 @@
+# Meson cross file: build x86_64 binaries on any Mac (Apple Silicon hosts
+# run them under Rosetta 2). REQUIRED — D3DMetal.framework is x86_64-only.
+#
+#   meson setup build --cross-file build-macos-x86_64.txt
+
+[properties]
+# Rosetta 2 runs x86_64 binaries transparently; tests can execute directly.
+needs_exe_wrapper = false
+
+[binaries]
+c = ['clang', '-arch', 'x86_64']
+cpp = ['clang++', '-arch', 'x86_64']
+objc = ['clang', '-arch', 'x86_64']
+objcpp = ['clang++', '-arch', 'x86_64']
+ar = 'ar'
+strip = 'strip'
+pkg-config = 'pkg-config'
+
+[built-in options]
+c_args = ['-mmacosx-version-min=14.0']
+cpp_args = ['-mmacosx-version-min=14.0']
+objc_args = ['-mmacosx-version-min=14.0']
+objcpp_args = ['-mmacosx-version-min=14.0']
+c_link_args = ['-mmacosx-version-min=14.0']
+cpp_link_args = ['-mmacosx-version-min=14.0']
+objc_link_args = ['-mmacosx-version-min=14.0']
+objcpp_link_args = ['-mmacosx-version-min=14.0']
+
+[host_machine]
+system = 'darwin'
+subsystem = 'macos'
+kernel = 'xnu'
+cpu_family = 'x86_64'
+cpu = 'x86_64'
+endian = 'little'

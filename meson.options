@@ -1,0 +1,5 @@
+option('tests', type: 'feature', value: 'enabled',
+       description: 'Build the smoke/device/triangle test programs')
+option('dev_framework_path', type: 'string', value: '',
+       description: 'Compiled-in fallback path to the D3DMetal binary ' +
+                    '(defaults to <source root>/D3DMetal.framework/Versions/A/D3DMetal)')
