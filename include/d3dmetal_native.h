@@ -120,77 +120,6 @@ dmn_window_t dmn_window_create_for_view(dmn_nsview_t view);
  * the caller manages the layer hierarchy itself. Callable from any thread. */
 dmn_window_t dmn_window_create_for_layer(dmn_metal_layer_t layer);
 
-/* Exported swapchains, for embedders that ship frames to another process
- * (VM display servers, compositors, remoting) instead of a CAMetalLayer.
- * The library owns the image set: it allocates shared-memory-backed
- * MTLTextures on the device D3DMetal renders with, rotates through them,
- * and drives the three callbacks below.  The embedder never touches a
- * Metal object — it sees fds, strides, and slot indices.
- *
- * All callbacks are invoked from D3DMetal worker threads, must be
- * thread-safe, and must not call dmn_window_* for the same window.
- * They keep firing until the D3D swapchain bound to the window is
- * destroyed — destroy swapchains before tearing down callback state. */
-
-#define DMN_EXPORTED_MAX_IMAGES 4
-
-typedef struct dmn_exported_image {
-    /* Anonymous shared memory backing the image bytes (linear layout).
-     * Owned by the library and guaranteed valid only during
-     * on_images_changed — dup(2) it for anything longer-lived. */
-    int      fd;
-    uint32_t stride;   /* bytesPerRow */
-    uint64_t size;     /* logical stride * height (NOT page-padded) */
-} dmn_exported_image;
-
-typedef struct dmn_exported_image_set {
-    uint32_t width;
-    uint32_t height;
-    /* DXGI_FORMAT the images were actually allocated with — the surface's
-     * physical layout, which may differ from the swapchain desc when that
-     * format is not presentable (D3DMetal converts during its blit).
-     * One of: B8G8R8A8_UNORM, R8G8B8A8_UNORM, B8G8R8X8_UNORM. */
-    uint32_t dxgi_format;
-    uint32_t num_images;
-    dmn_exported_image images[DMN_EXPORTED_MAX_IMAGES];
-} dmn_exported_image_set;
-
-typedef struct dmn_exported_swapchain_config {
-    /* Must be set to sizeof(dmn_exported_swapchain_config). */
-    size_t struct_size;
-    void* ctx;
-
-    /* Allocation preferences, both optional (0 = derive from the D3D
-     * swapchain desc).  preferred_dxgi_format is consulted when the desc
-     * format is not presentable; preferred_image_count overrides the
-     * desc's BufferCount (clamped to DMN_EXPORTED_MAX_IMAGES). */
-    uint32_t preferred_dxgi_format;
-    uint32_t preferred_image_count;
-
-    /* A new image set was allocated (swapchain creation and every resize).
-     * Fires synchronously inside CreateSwapChainForHwnd / ResizeBuffers,
-     * before they return. */
-    void (*on_images_changed)(void* ctx, const dmn_exported_image_set* set);
-
-    /* D3DMetal is about to render into slot image_index.  Block here until
-     * the consumer has released the slot (backpressure). */
-    void (*on_acquire)(void* ctx, uint32_t image_index);
-
-    /* A frame targeting slot image_index was presented.  frame_id is a
-     * per-swapchain monotonic counter.  gpu_done_fd (ownership transfers
-     * to the callee; -1 if unavailable) polls readable once the GPU has
-     * drained a tracking command buffer committed at present time. */
-    void (*on_present)(void* ctx, uint32_t image_index, uint64_t frame_id,
-                       int gpu_done_fd);
-} dmn_exported_swapchain_config;
-
-/* Create a window object backed by an exported swapchain.  All three
- * callbacks are required.  width/height seed the swapchain size reported
- * before the first on_images_changed.  Callable from any thread.  The
- * config struct is copied. */
-dmn_window_t dmn_window_create_exported(const dmn_exported_swapchain_config* config,
-                                        uint32_t width, uint32_t height);
-
 /* The value to pass anywhere a HWND is expected. Stable for the lifetime of
  * the window. Always a small (< 2^32) non-NULL pseudo-handle, never a raw
  * pointer — safe against 32-bit handle truncation inside D3DMetal. */
@@ -199,8 +128,7 @@ void* dmn_window_get_hwnd(dmn_window_t window);
 /* Reverse lookup; NULL if hwnd is not a live dmn pseudo-handle. */
 dmn_window_t dmn_window_from_hwnd(void* hwnd);
 
-/* The CAMetalLayer in use (borrowed reference); NULL for callback-backed
- * windows. */
+/* The CAMetalLayer in use (borrowed reference). */
 dmn_metal_layer_t dmn_window_get_metal_layer(dmn_window_t window);
 
 /* Inform d3dmetal-native of the desired backing size in PIXELS and the

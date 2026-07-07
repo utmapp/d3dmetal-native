@@ -6,21 +6,14 @@
  */
 
 #import <AppKit/AppKit.h>
-#import <MetalKit/MetalKit.h>
 #import <QuartzCore/CAMetalLayer.h>
 
 #include <algorithm>
-#include <atomic>
 #include <cstdlib>
 #include <cstring>
-#include <thread>
 #include <vector>
 
-#include <sys/mman.h>
 #include <time.h>
-#include <unistd.h>
-
-#import <objc/runtime.h>
 
 #include "cocoa_window.h"
 
@@ -94,15 +87,10 @@ static void ft_report(void) {
 }
 @end
 
-@class DmnCbPresenter;
-
 struct cocoa_window {
     NSWindow* window;                  /* retained */
     NSView* view;                      /* retained */
     CocoaTestWindowDelegate* delegate; /* retained */
-    DmnCbPresenter* presenter;         /* exported-swapchain mode only; leaked
-                                          at destroy (late async presents may
-                                          still call into it) */
 };
 
 static CocoaTestAppDelegate* g_app_delegate = nil;
@@ -187,7 +175,6 @@ extern "C" cocoa_window_t* cocoa_window_create(const char* utf8_title,
         w->window = window;
         w->view = view;
         w->delegate = delegate;
-        w->presenter = nil;
         return w;
     }
 }
@@ -249,13 +236,9 @@ extern "C" void cocoa_window_get_capture_rect(cocoa_window_t* w, int32_t* x,
     }
 }
 
-void dmn_cb_presenter_stop(DmnCbPresenter* p); /* defined below */
-
 extern "C" void cocoa_window_destroy(cocoa_window_t* w) {
     if (!w)
         return;
-    if (w->presenter)
-        dmn_cb_presenter_stop(w->presenter);
     @autoreleasepool {
         w->window.delegate = nil;
         [w->window close];
@@ -278,254 +261,6 @@ extern "C" void cocoa_release_layer(void* layer) {
     [(CAMetalLayer*)layer release];
 }
 
-/* == Exported-swapchain presenter ========================================= */
-/* Consumer for dmn_window_create_exported plus an MTKView that shows the
- * frames. The library allocates the shared-memory image set and rotates
- * through it; this presenter plays the remote-consumer role: it maps each
- * image fd and wraps it in an MTLTexture (the same wrapping a compositor in
- * another process would do), and a dedicated render thread calls
- * [MTKView draw], whose delegate blits the latest presented image into the
- * view's drawable. Pacing: on_acquire blocks on an in-flight budget that is
- * refunded when a frame is drawn (or replaced unshown), and the render
- * thread itself is throttled by the MTKView drawable pool -- together the
- * same backpressure shape as CAMetalLayer's nextDrawable. */
-
-@interface DmnCbPresenter : NSObject <MTKViewDelegate> {
-@public
-    id<MTLDevice> dev;             /* retained */
-    id<MTLCommandQueue> queue;     /* retained */
-    MTKView* view;                 /* retained */
-    id<MTLTexture> tex[DMN_EXPORTED_MAX_IMAGES]; /* retained; fd-backed */
-    uint32_t texCount;
-    NSLock* lock;                  /* guards tex/texCount (reconfigure) */
-    dispatch_semaphore_t budget;   /* in-flight frame budget */
-    std::atomic<int> pending;      /* latest presented, undrawn slot; -1 none */
-    std::atomic<bool> drew;        /* set when drawInMTKView presented */
-    std::atomic<bool> stop;
-    std::thread renderThread;
-}
-@end
-
-@implementation DmnCbPresenter
-
-- (void)mtkView:(MTKView*)v drawableSizeWillChange:(CGSize)size {
-    (void)v; (void)size;
-}
-
-- (void)drawInMTKView:(MTKView*)v {
-    int slot = self->pending.exchange(-1, std::memory_order_acq_rel);
-    if (slot < 0)
-        return;
-    id<MTLTexture> src = nil;
-    [self->lock lock];
-    if ((uint32_t)slot < self->texCount)
-        src = [self->tex[slot] retain];
-    [self->lock unlock];
-    id<CAMetalDrawable> drawable = v.currentDrawable;
-    if (!src || !drawable) {
-        [src release];
-        dispatch_semaphore_signal(self->budget); /* refund the undrawn frame */
-        return;
-    }
-    id<MTLCommandBuffer> cb = [self->queue commandBuffer];
-    id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
-    MTLSize sz = MTLSizeMake(MIN(src.width, drawable.texture.width),
-                             MIN(src.height, drawable.texture.height), 1);
-    [blit copyFromTexture:src
-              sourceSlice:0
-              sourceLevel:0
-             sourceOrigin:MTLOriginMake(0, 0, 0)
-               sourceSize:sz
-                toTexture:drawable.texture
-         destinationSlice:0
-         destinationLevel:0
-        destinationOrigin:MTLOriginMake(0, 0, 0)];
-    [blit endEncoding];
-    [cb presentDrawable:drawable];
-    dispatch_semaphore_t sem = self->budget;
-    [cb addCompletedHandler:^(id<MTLCommandBuffer> b) {
-        (void)b;
-        dispatch_semaphore_signal(sem);
-    }];
-    [cb commit];
-    [src release];
-    self->drew.store(true, std::memory_order_release);
-}
-
-- (void)dealloc {
-    for (uint32_t i = 0; i < DMN_EXPORTED_MAX_IMAGES; i++)
-        [tex[i] release];
-    [view release];
-    [queue release];
-    [lock release];
-    [dev release];
-    [super dealloc];
-}
-
-@end
-
-namespace {
-
-/* Wrap one exported image (its fd is only valid during on_images_changed)
- * in an MTLTexture over the mapped shared memory -- the consumer-side
- * counterpart of the library's allocation. Returns +1 or nil. */
-id<MTLTexture> exp_wrap_image(id<MTLDevice> dev, const dmn_exported_image* img,
-                              uint32_t w, uint32_t h, uint32_t dxgi_format) {
-    size_t pg = (size_t)getpagesize();
-    size_t sz = ((size_t)img->size + pg - 1) & ~(pg - 1);
-    void* p = mmap(nullptr, sz, PROT_READ | PROT_WRITE, MAP_SHARED,
-                   img->fd, 0);
-    if (p == MAP_FAILED)
-        return nil;
-    id<MTLBuffer> buf =
-        [dev newBufferWithBytesNoCopy:p
-                               length:sz
-                              options:MTLResourceStorageModeShared
-                          deallocator:^(void* q, NSUInteger len) {
-                              munmap(q, len);
-                          }];
-    if (!buf) {
-        munmap(p, sz);
-        return nil;
-    }
-    /* The demos run BGRA8-family swapchains (matching the MTKView's
-     * colorPixelFormat); RGBA8 sets blit fine too since the view is
-     * framebufferOnly = NO. */
-    MTLPixelFormat fmt = dxgi_format == 28 /* DXGI_FORMAT_R8G8B8A8_UNORM */
-        ? MTLPixelFormatRGBA8Unorm : MTLPixelFormatBGRA8Unorm;
-    MTLTextureDescriptor* td = [MTLTextureDescriptor
-        texture2DDescriptorWithPixelFormat:fmt
-                                     width:w
-                                    height:h
-                                 mipmapped:NO];
-    td.usage = MTLTextureUsageShaderRead;
-    td.storageMode = MTLStorageModeShared;
-    id<MTLTexture> t = [buf newTextureWithDescriptor:td
-                                              offset:0
-                                         bytesPerRow:img->stride];
-    if (t) {
-        static const void* kBackingKey = &kBackingKey;
-        objc_setAssociatedObject(t, kBackingKey, buf,
-                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    }
-    [buf release];
-    return t;
-}
-
-void exp_images_changed(void* ctx, const dmn_exported_image_set* set) {
-    auto* p = (DmnCbPresenter*)ctx;
-    id<MTLTexture> fresh[DMN_EXPORTED_MAX_IMAGES] = {};
-    for (uint32_t i = 0; i < set->num_images; i++)
-        fresh[i] = exp_wrap_image(p->dev, &set->images[i], set->width,
-                                  set->height, set->dxgi_format);
-    [p->lock lock];
-    for (uint32_t i = 0; i < DMN_EXPORTED_MAX_IMAGES; i++) {
-        [p->tex[i] release];
-        p->tex[i] = fresh[i];
-    }
-    p->texCount = set->num_images;
-    [p->lock unlock];
-}
-
-void exp_acquire(void* ctx, uint32_t slot) {
-    (void)slot;
-    auto* p = (DmnCbPresenter*)ctx;
-    dispatch_semaphore_wait(p->budget, DISPATCH_TIME_FOREVER);
-}
-
-void exp_present(void* ctx, uint32_t slot, uint64_t frame_id,
-                 int gpu_done_fd) {
-    (void)frame_id;
-    auto* p = (DmnCbPresenter*)ctx;
-    /* The blit reads through the shared mapping; a demo does not gate on
-     * the fence fd (a real consumer would poll it before sampling). */
-    if (gpu_done_fd >= 0)
-        close(gpu_done_fd);
-    int prev = p->pending.exchange((int)slot, std::memory_order_acq_rel);
-    if (prev >= 0)
-        dispatch_semaphore_signal(p->budget); /* replaced unshown: refund */
-}
-
-void cb_render_loop(DmnCbPresenter* p) {
-    while (!p->stop.load(std::memory_order_acquire)) {
-        @autoreleasepool {
-            p->drew.store(false, std::memory_order_relaxed);
-            [p->view draw]; /* blocks in currentDrawable at display rate */
-            if (!p->drew.load(std::memory_order_acquire)) {
-                struct timespec ns = {0, 2 * 1000 * 1000};
-                nanosleep(&ns, nullptr); /* idle: no presented frame yet */
-            }
-        }
-    }
-}
-
-} // namespace
-
-/* Stop the render thread. The presenter object itself is leaked: in-flight
- * D3DMetal presents can still invoke the embedder callbacks after the window
- * is gone, and a test process is about to exit anyway. */
-void dmn_cb_presenter_stop(DmnCbPresenter* p) {
-    p->stop.store(true, std::memory_order_release);
-    if (p->renderThread.joinable())
-        p->renderThread.join();
-    /* Refund the in-flight budget so a late present draining out of D3DMetal
-     * can still acquire without blocking its worker. */
-    for (uint32_t i = 0; i < 2 * DMN_EXPORTED_MAX_IMAGES; i++)
-        dispatch_semaphore_signal(p->budget);
-}
-
-extern "C" dmn_window_t cocoa_window_create_dmn(cocoa_window_t* w,
-                                                bool callback_backed) {
-    if (!w)
-        return nullptr;
-    if (!callback_backed)
-        return dmn_window_create_for_view(w->view);
-
-    @autoreleasepool {
-        id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
-        if (!dev)
-            return nullptr;
-        uint32_t cw = 0, ch = 0;
-        cocoa_window_get_content_size(w, &cw, &ch);
-
-        DmnCbPresenter* p = [[DmnCbPresenter alloc] init];
-        p->dev = dev; /* +1 from create */
-        p->queue = [dev newCommandQueue];
-        p->lock = [[NSLock alloc] init];
-        p->budget = dispatch_semaphore_create(2);
-        p->pending.store(-1);
-        p->stop.store(false);
-
-        MTKView* view = [[MTKView alloc] initWithFrame:w->view.bounds
-                                                device:dev];
-        view.colorPixelFormat = MTLPixelFormatBGRA8Unorm;
-        view.framebufferOnly = NO;        /* blit destination */
-        view.paused = YES;                /* driven by the render thread */
-        view.enableSetNeedsDisplay = NO;
-        view.autoResizeDrawable = NO;     /* 1x point==pixel policy */
-        view.drawableSize = CGSizeMake(cw, ch);
-        view.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-        view.delegate = p;
-        [w->view addSubview:view];
-        p->view = view; /* +1 from alloc */
-
-        w->presenter = p;
-        p->renderThread = std::thread(cb_render_loop, p);
-
-        dmn_exported_swapchain_config cfg = {};
-        cfg.struct_size = sizeof(cfg);
-        cfg.ctx = (void*)p;
-        cfg.on_images_changed = exp_images_changed;
-        cfg.on_acquire = exp_acquire;
-        cfg.on_present = exp_present;
-        return dmn_window_create_exported(&cfg, cw, ch);
-    }
-}
-
-
-extern "C" bool cocoa_arg_callback(int argc, char** argv) {
-    for (int i = 1; i < argc; i++)
-        if (strcmp(argv[i], "--callback") == 0)
-            return true;
-    return false;
+extern "C" dmn_window_t cocoa_window_create_dmn(cocoa_window_t* w) {
+    return w ? dmn_window_create_for_view(w->view) : nullptr;
 }

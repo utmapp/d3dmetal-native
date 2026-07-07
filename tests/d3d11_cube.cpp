@@ -11,8 +11,6 @@
  * Environment knobs:
  *   DMN_FRAMES=N    auto-exit after N frames (CI).
  *
- * Pass --callback to use the callback-backed swapchain (embedder textures
- * presented through an MTKView) instead of the CAMetalLayer view backend.
  *   DMN_VALIDATE=1  read back the center pixel at frames 100 and 160:
  *                   both must show a saturated face color over the dark
  *                   clear, and the two colors must differ (the cube
@@ -586,7 +584,7 @@ int main(int argc, char** argv) {
   }
 
   dmn_window_t dmnWindow =
-      cocoa_window_create_dmn(window, cocoa_arg_callback(argc, argv));
+      cocoa_window_create_dmn(window);
   if (!dmnWindow) {
     std::cerr << "Failed to create dmn window" << std::endl;
     return 1;

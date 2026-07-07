@@ -17,8 +17,6 @@
  * Environment knobs:
  *   DMN_FRAMES=N   auto-exit after N frames (CI; safety cap in --shared).
  *
- * Pass --callback to use the callback-backed swapchain (embedder textures
- * presented through an MTKView) instead of the CAMetalLayer view backend.
  *   DMN_VALIDATE=1 read back the backbuffer and assert the triangle rendered
  *                  ("D3D12: PASS"); in --shared also assert the color changed
  *                  ("D3D12 SHARED: PASS").
@@ -828,7 +826,7 @@ int main(int argc, char** argv) {
         cocoa_window_create(shared ? "D3D12 shared" : "D3D12 triangle", 1024,
                             600, true);
     dmn_window_t dmnWindow =
-        window ? cocoa_window_create_dmn(window, cocoa_arg_callback(argc, argv))
+        window ? cocoa_window_create_dmn(window)
                : nullptr;
     if (!dmnWindow) {
         fprintf(stderr, "Failed to create window\n");

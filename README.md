@@ -23,14 +23,8 @@ your app ──> libd3dmetal-native.dylib ──> D3DMetal.framework ──> Met
 ## Features
 
 - **D3D11 and D3D12 devices** with swapchains on:
-  - an `NSView` (the library installs a `CAMetalLayer`),
-  - a caller-owned `CAMetalLayer` (offscreen or custom layer hierarchies), or
-  - an **exported swapchain** (`dmn_window_create_exported`) — for
-    compositors, VM display servers, and remoting: the library allocates
-    shared-memory-backed images and drives three callbacks
-    (images-changed with the fds/strides, acquire for backpressure,
-    present with a pollable GPU-done fence fd). The embedder never
-    touches a Metal object.
+  - an `NSView` (the library installs a `CAMetalLayer`), or
+  - a caller-owned `CAMetalLayer` (offscreen or custom layer hierarchies).
 - **Pseudo-HWNDs**: `dmn_window_get_hwnd()` returns a small stable handle to
   pass anywhere a `HWND` is expected (`CreateSwapChainForHwnd`, ...).
 - **Cross-process resource sharing**, entirely through the standard D3D APIs
@@ -104,8 +98,7 @@ HWND hwnd = (HWND)dmn_window_get_hwnd(win);
 
 `dmn_init()` is optional — the first D3D entry point performs lazy default
 initialization. See `include/d3dmetal_native.h` for the full API, including
-the exported swapchain (`dmn_window_create_exported`) and the shared-handle
-lifetime rules.
+the shared-handle lifetime rules.
 
 ### Cross-process sharing model
 
@@ -136,8 +129,8 @@ over a Unix socket) and write back into the received copy before
 `meson test -C build` runs the suite: device bring-up, on-screen triangle and
 cube demos, cross-process shared textures/buffers/fences/keyed mutexes in
 both API directions, GPU waits on imported fences, event-driven waits,
-shared heaps with placed resources, the exported swapchain backend,
-lifecycle/fd-leak churn, and a multi-threaded stress test. The windowed demos
+shared heaps with placed resources, lifecycle/fd-leak churn, and a
+multi-threaded stress test. The windowed demos
 (`d3d11-triangle`, `d3d11-cube`, `d3d12-triangle --shared`,
 `shared-compute-triangle` without `DMN_HEADLESS`) can also be run directly as
 on-screen examples.

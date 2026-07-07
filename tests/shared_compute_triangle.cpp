@@ -14,9 +14,6 @@
  * asserts the color actually cycles ("VERIFY: PASS"), so the data path is
  * checkable headlessly even where on-screen Present is unavailable.
  *
- * Pass --callback to use the callback-backed swapchain (embedder textures
- * presented through an MTKView) instead of the CAMetalLayer view backend.
- *
  * Env: DMN_INTERVAL_MS (producer color period, default 1000),
  *      DMN_FRAMES=N (consumer auto-exit after N frames).
  */
@@ -492,8 +489,6 @@ private:
     bool m_verified = false;
 };
 
-bool g_callback_swapchain = false; /* --callback: MTKView presenter */
-
 int consumer(int sock) {
     if (!cocoa_app_init()) {
         fprintf(stderr, "CONS: cocoa_app_init FAILED\n");
@@ -517,8 +512,7 @@ int consumer(int sock) {
     const bool headless = getenv("DMN_HEADLESS") != nullptr;
     cocoa_window_t* win = headless ? nullptr
         : cocoa_window_create("D3D12 compute -> D3D11 triangle", 640, 480, true);
-    dmn_window_t dmnWin =
-        win ? cocoa_window_create_dmn(win, g_callback_swapchain) : nullptr;
+    dmn_window_t dmnWin = win ? cocoa_window_create_dmn(win) : nullptr;
     HWND hwnd = dmnWin ? (HWND)dmn_window_get_hwnd(dmnWin) : nullptr;
     fprintf(stderr, "CONS: window=%p dmnWin=%p hwnd=%p headless=%d\n", (void*)win,
             (void*)dmnWin, (void*)hwnd, headless);
@@ -559,7 +553,6 @@ int consumer(int sock) {
 } // namespace
 
 int main(int argc, char** argv) {
-    g_callback_swapchain = cocoa_arg_callback(argc, argv);
     setvbuf(stdout, nullptr, _IONBF, 0);
     setvbuf(stderr, nullptr, _IONBF, 0);
 

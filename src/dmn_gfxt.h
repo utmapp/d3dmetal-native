@@ -14,7 +14,7 @@
 #include <memory>
 
 #include "d3dmetal_gfxt.h"
-#include "d3dmetal_native.h" /* dmn_wait_status, exported-swapchain types */
+#include "d3dmetal_native.h" /* dmn_wait_status */
 
 class DmnGFXTMonitor final : public GFXTMonitorInterface {
 public:
@@ -133,20 +133,13 @@ private:
     void* mtl_device_;     /* id<MTLDevice>, retained */
     void* last_drawable_;  /* id<CAMetalDrawable>, retained; only when the
                               DMN_PRESENT_FALLBACK env toggle is active */
-    void* present_layer_;  /* id<CAMetalLayer>, retained at InitializeForHWND
-                              for the View/Layer backends. D3DMetal owns this
-                              swapchain and may fire an async present after the
-                              app has already called dmn_window_destroy; holding
-                              our own reference lets that late present resolve a
-                              drawable instead of failing the hwnd lookup (which
-                              makes D3DMetal abort). nil for the exported
-                              backend. */
-    void* exported_;       /* DmnExportedSwapchain*, retained; the exported
-                              backend's whole state (config copy, image set,
-                              rotation) created at InitializeForHWND. Like
-                              present_layer_, it outlives the app's window
-                              handle so late presents still resolve. nil for
-                              the View/Layer backends. */
+    void* present_layer_;  /* id<CAMetalLayer>, retained at InitializeForHWND.
+                              D3DMetal owns this swapchain and may fire an
+                              async present after the app has already called
+                              dmn_window_destroy; holding our own reference
+                              lets that late present resolve a drawable
+                              instead of failing the hwnd lookup (which makes
+                              D3DMetal abort). */
 };
 
 class DmnGFXT final : public GFXTOSInterface {

@@ -22,15 +22,13 @@
 enum class DmnWindowBackend {
     View,     /* NSView + library-owned CAMetalLayer */
     Layer,    /* caller-owned CAMetalLayer */
-    Exported, /* library-allocated shared-memory image set */
 };
 
 struct DmnWindow {
     uint32_t          slot;
     DmnWindowBackend  backend;
     NSView*           view;   /* retained; View backend only */
-    CAMetalLayer*     layer;  /* retained; View + Layer backends */
-    dmn_exported_swapchain_config cfg; /* Exported backend; copied */
+    CAMetalLayer*     layer;  /* retained */
 
     std::atomic<uint32_t> width{0};   /* pixels */
     std::atomic<uint32_t> height{0};

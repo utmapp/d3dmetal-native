@@ -137,27 +137,6 @@ extern "C" dmn_window_t dmn_window_create_for_layer(dmn_metal_layer_t layer) {
     return (dmn_window_t)w;
 }
 
-extern "C" dmn_window_t
-dmn_window_create_exported(const dmn_exported_swapchain_config* config,
-                           uint32_t width, uint32_t height) {
-    if (!config || config->struct_size < sizeof(dmn_exported_swapchain_config) ||
-        !config->on_images_changed || !config->on_acquire ||
-        !config->on_present) {
-        DMN_ERROR("dmn_window_create_exported: invalid config");
-        return nullptr;
-    }
-    auto* w = new DmnWindow();
-    w->backend = DmnWindowBackend::Exported;
-    w->cfg = *config;
-    w->width.store(width, std::memory_order_relaxed);
-    w->height.store(height, std::memory_order_relaxed);
-
-    register_window(w);
-    DMN_INFO("window: created exported (hwnd=%p, %ux%u px)",
-             encode_hwnd(w->slot), width, height);
-    return (dmn_window_t)w;
-}
-
 extern "C" void* dmn_window_get_hwnd(dmn_window_t window) {
     auto* w = (DmnWindow*)window;
     return w ? encode_hwnd(w->slot) : nullptr;

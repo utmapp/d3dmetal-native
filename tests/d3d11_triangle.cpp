@@ -11,8 +11,6 @@
  *                         configuration (BGRA8, no flags).
  *   DMN_FRAMES=N          auto-exit after N frames (CI).
  *
- * Pass --callback to use the callback-backed swapchain (embedder textures
- * presented through an MTKView) instead of the CAMetalLayer view backend.
  *   DMN_VALIDATE=1        read back a pixel at frame 120 and verify the
  *                         triangle actually rendered ("VALIDATE: PASS").
  */
@@ -702,7 +700,7 @@ int main(int argc, char** argv) {
   }
 
   dmn_window_t dmnWindow =
-      cocoa_window_create_dmn(window, cocoa_arg_callback(argc, argv));
+      cocoa_window_create_dmn(window);
   if (!dmnWindow) {
     std::cerr << "Failed to create dmn window" << std::endl;
     return 1;
