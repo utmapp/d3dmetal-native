@@ -47,6 +47,14 @@ struct DmnEvent {
     uint32_t magic;
     bool     manual_reset;
     int      kq;
+    /* Exported pollable view.  dmn_event_dup_fd() must hand out an fd that
+     * survives SCM_RIGHTS to another process, and macOS refuses to pass
+     * kqueue fds across processes (sendmsg -> EINVAL).  So the cross-process
+     * view is a pipe, created lazily on first dup, whose readable state
+     * mirrors the kqueue trigger: signal writes a token, clear drains it.
+     * The kqueue stays the source of truth for in-process waits. */
+    int      pipe_r; /* read end handed out (dup'd) by dmn_event_dup_fd */
+    int      pipe_w; /* write end poked alongside the kqueue trigger */
 };
 
 struct DmnSemaphore {
@@ -84,10 +92,69 @@ bool event_register(int kq, bool manual_reset) {
     return kevent(kq, &ev, 1, nullptr, 0, nullptr) == 0;
 }
 
+/* Mark an fd close-on-exec and non-blocking (macOS has no pipe2). */
+void set_cloexec_nonblock(int fd) {
+    int fdflags = fcntl(fd, F_GETFD);
+    if (fdflags >= 0)
+        fcntl(fd, F_SETFD, fdflags | FD_CLOEXEC);
+    int stflags = fcntl(fd, F_GETFL);
+    if (stflags >= 0)
+        fcntl(fd, F_SETFL, stflags | O_NONBLOCK);
+}
+
+/* Non-consuming peek for whether the trigger is pending.  Only valid for
+ * manual-reset events: their registration has no EV_CLEAR, so a zero-timeout
+ * kevent read does not consume the trigger.  Auto-reset would be consumed. */
+bool event_peek_signaled(DmnEvent* e) {
+    if (!e->manual_reset)
+        return false;
+    struct kevent out;
+    struct timespec zero = {0, 0};
+    return kevent(e->kq, nullptr, 0, &out, 1, &zero) > 0;
+}
+
+void pipe_write_token(int w) {
+    if (w < 0)
+        return;
+    const uint8_t b = 1;
+    ssize_t n;
+    do { n = ::write(w, &b, 1); } while (n < 0 && errno == EINTR);
+    /* EAGAIN: the pipe already holds a token and is still readable — the
+     * "signaled" edge is preserved, which is all a poller needs. */
+}
+
+void pipe_drain(int r) {
+    if (r < 0)
+        return;
+    uint8_t buf[64];
+    ssize_t n;
+    do { n = ::read(r, buf, sizeof(buf)); } while (n > 0 || (n < 0 && errno == EINTR));
+}
+
+/* Lazily create the exported pipe, priming it if the event is already
+ * signaled so a dup taken after the signal still reports readable. */
+bool event_ensure_pipe(DmnEvent* e) {
+    if (e->pipe_r >= 0)
+        return true;
+    int fds[2];
+    if (::pipe(fds) != 0) {
+        DMN_ERROR("event: pipe() failed for exported fd (fd exhaustion?)");
+        return false;
+    }
+    set_cloexec_nonblock(fds[0]);
+    set_cloexec_nonblock(fds[1]);
+    e->pipe_r = fds[0];
+    e->pipe_w = fds[1];
+    if (event_peek_signaled(e))
+        pipe_write_token(e->pipe_w);
+    return true;
+}
+
 void event_signal(DmnEvent* e) {
     struct kevent ev;
     EV_SET(&ev, 1, EVFILT_USER, 0, NOTE_TRIGGER, 0, nullptr);
     kevent(e->kq, &ev, 1, nullptr, 0, nullptr);
+    pipe_write_token(e->pipe_w);
 }
 
 void event_clear(DmnEvent* e) {
@@ -95,6 +162,13 @@ void event_clear(DmnEvent* e) {
     EV_SET(&ev, 1, EVFILT_USER, EV_DELETE, 0, 0, nullptr);
     kevent(e->kq, &ev, 1, nullptr, 0, nullptr);
     event_register(e->kq, e->manual_reset);
+    pipe_drain(e->pipe_r);
+}
+
+/* Release the exported pipe fds, if any were created. */
+void event_close_pipe(DmnEvent* e) {
+    if (e->pipe_r >= 0) { close(e->pipe_r); e->pipe_r = -1; }
+    if (e->pipe_w >= 0) { close(e->pipe_w); e->pipe_w = -1; }
 }
 
 DmnEvent* event_alloc(bool manual_reset, bool initial_state) {
@@ -120,6 +194,8 @@ DmnEvent* event_alloc(bool manual_reset, bool initial_state) {
     e->magic = kEventMagic;
     e->manual_reset = manual_reset;
     e->kq = kq;
+    e->pipe_r = -1;
+    e->pipe_w = -1;
     if (initial_state)
         event_signal(e);
     return e;
@@ -200,6 +276,7 @@ void DmnGFXTEvent::CloseEvent(void* handle) {
     DmnEvent* e = as_event(handle);
     if (!e)
         return;
+    event_close_pipe(e);
     close(e->kq);
     e->magic = 0;
     ::free(e);
@@ -266,6 +343,10 @@ void* DmnGFXTEvent::DuplicateEvent(void* handle) {
     }
     *d = *e;
     d->kq = kq;
+    /* The exported pipe is per-box (fds are not shareable by struct copy);
+     * the duplicate lazily makes its own on first dmn_event_dup_fd. */
+    d->pipe_r = -1;
+    d->pipe_w = -1;
     return d;
 }
 
@@ -315,6 +396,7 @@ extern "C" void dmn_event_close(void* handle) {
     DmnEvent* e = as_event(handle);
     if (!e)
         return;
+    event_close_pipe(e);
     close(e->kq);
     e->magic = 0;
     ::free(e);
@@ -322,7 +404,14 @@ extern "C" void dmn_event_close(void* handle) {
 
 extern "C" int dmn_event_dup_fd(void* handle) {
     DmnEvent* e = as_event(handle);
-    return e ? dup(e->kq) : -1;
+    if (!e)
+        return -1;
+    /* Hand out a dup of the pipe read end, not the kqueue: the caller
+     * passes this fd to another process via SCM_RIGHTS, which macOS
+     * permits for pipes but rejects (EINVAL) for kqueues. */
+    if (!event_ensure_pipe(e))
+        return -1;
+    return dup(e->pipe_r);
 }
 
 extern "C" dmn_wait_status dmn_event_wait(void* handle, uint64_t timeout_ns) {
