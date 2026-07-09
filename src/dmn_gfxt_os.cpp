@@ -24,50 +24,50 @@ DmnGFXT::~DmnGFXT() = default;
 
 GFXTMonitorInterface*
 DmnGFXT::CreateMonitorInterface(const GFXTInterfaceVersion& v) {
-    DMN_INFO("CreateMonitorInterface(version=%u) -> v2", v.version);
+    DMN_INFO("CreateMonitorInterface(version=%u)", v.version);
     return monitor_.get();
 }
 
 GFXTRegistryInterface*
 DmnGFXT::CreateRegistryInterface(const GFXTInterfaceVersion& v) {
-    DMN_INFO("CreateRegistryInterface(version=%u) -> v1", v.version);
+    DMN_INFO("CreateRegistryInterface(version=%u)", v.version);
     return registry_.get();
 }
 
 GFXTEventInterface*
 DmnGFXT::CreateEventInterface(const GFXTInterfaceVersion& v) {
-    DMN_INFO("CreateEventInterface(version=%u) -> v2", v.version);
+    DMN_INFO("CreateEventInterface(version=%u)", v.version);
     return events_.get();
 }
 
 GFXTSwapchainInterface*
 DmnGFXT::CreateSwapchainInterface(const GFXTInterfaceVersion& v,
                                   void* mtlDevice) {
-    DMN_INFO("CreateSwapchainInterface(version=%u, mtlDevice=%p) -> v3",
+    DMN_INFO("CreateSwapchainInterface(version=%u, mtlDevice=%p)",
              v.version, mtlDevice);
     return new DmnGFXTSwapchain(mtlDevice);
 }
 
 GFXTAdapterInterface*
 DmnGFXT::CreateAdapterInterface(const GFXTInterfaceVersion& v) {
-    DMN_INFO("CreateAdapterInterface(version=%u) -> v1", v.version);
+    DMN_INFO("CreateAdapterInterface(version=%u)", v.version);
     return adapters_.get();
 }
 
 GFXTPathInterface*
 DmnGFXT::CreatePathInterface(const GFXTInterfaceVersion& v) {
-    DMN_INFO("CreatePathInterface(version=%u) -> v3", v.version);
+    DMN_INFO("CreatePathInterface(version=%u)", v.version);
     return paths_.get();
 }
 
 GFXTAllocationInterface*
 DmnGFXT::CreateAllocationInterface(const GFXTInterfaceVersion& v) {
-    DMN_INFO("CreateAllocationInterface(version=%u) -> v2", v.version);
+    DMN_INFO("CreateAllocationInterface(version=%u)", v.version);
     return allocations_.get();
 }
 
 GFXTLibraryInterface*
 DmnGFXT::CreateLibraryInterface(const GFXTInterfaceVersion& v) {
-    DMN_INFO("CreateLibraryInterface(version=%u) -> v2", v.version);
+    DMN_INFO("CreateLibraryInterface(version=%u)", v.version);
     return libraries_.get();
 }

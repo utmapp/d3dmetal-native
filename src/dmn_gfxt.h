@@ -30,7 +30,7 @@ public:
 
 class DmnGFXTRegistry final : public GFXTRegistryInterface {
 public:
-    GFXTInterfaceVersion Version() const override { return GFXT_INTERFACE_VERSION(1); }
+    GFXTInterfaceVersion Version() const override { return GFXT_INTERFACE_VERSION(2); }
     ~DmnGFXTRegistry() override;
     void* OpenKey(RegistryMainKey root, const char* subkey) override;
     void* CreateKey(RegistryMainKey root, const char* subkey,
