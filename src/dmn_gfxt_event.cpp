@@ -4,9 +4,11 @@
  *
  * DmnGFXTEvent — Win32-style events and semaphores.
  *
- * Events are kqueue-backed: the handle is a tiny tagged box around a
- * kqueue fd whose single EVFILT_USER registration IS the signaled
- * state.  Signal = NOTE_TRIGGER.  Manual-reset events register without
+ * Events are kqueue-backed: a handle is a tiny tagged box referencing a
+ * refcounted DmnEventCore that owns a kqueue fd whose single EVFILT_USER
+ * registration IS the signaled state.  DuplicateEvent shares the core (see
+ * DmnEventCore), so a signal on any handle is seen through all of them.
+ * Signal = NOTE_TRIGGER.  Manual-reset events register without
  * EV_CLEAR (the trigger stays pending, so every waiter and poller sees
  * it until an explicit clear); auto-reset events register with
  * EV_CLEAR (retrieval consumes the trigger, and the kernel wakes
@@ -37,6 +39,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <new>
 #include <thread>
 
 #include "dmn_gfxt.h"
@@ -47,18 +50,40 @@ namespace {
 constexpr uint32_t kEventMagic     = 0x544E5645; /* 'EVNT' */
 constexpr uint32_t kSemaphoreMagic = 0x414D4553; /* 'SEMA' */
 
-struct DmnEvent {
-    uint32_t magic;
-    bool     manual_reset;
-    int      kq;
+/* Shared, refcounted event state.  A Win32 event HANDLE and every
+ * DuplicateEvent of it are separate DmnEvent boxes that all reference one
+ * DmnEventCore, so a SetEvent on any of them is visible through all of them:
+ * both the in-process kqueue wait AND the cross-process pollable pipe.
+ *
+ * Why the sharing matters: at GFXT interface version 3 D3DMetal duplicates
+ * the event it was handed and fires its asynchronous completion SetEvent on
+ * the DUPLICATE.  If the pipe lived on the original box alone, that signal
+ * would reach the shared kqueue (a dup shares the kernel object) but never
+ * the pipe the other process polls -- so a fence waiter across the proxy
+ * would hang.  Keeping kqueue + pipe in one shared core closes that gap. */
+struct DmnEventCore {
+    std::atomic<uint32_t> refs;
+    bool       manual_reset; /* immutable after creation */
+    int        kq;           /* the signaled state; immutable after creation */
     /* Exported pollable view.  dmn_event_dup_fd() must hand out an fd that
      * survives SCM_RIGHTS to another process, and macOS refuses to pass
      * kqueue fds across processes (sendmsg -> EINVAL).  So the cross-process
-     * view is a pipe, created lazily on first dup, whose readable state
-     * mirrors the kqueue trigger: signal writes a token, clear drains it.
-     * The kqueue stays the source of truth for in-process waits. */
-    int      pipe_r; /* read end handed out (dup'd) by dmn_event_dup_fd */
-    int      pipe_w; /* write end poked alongside the kqueue trigger */
+     * view is a pipe, created lazily on first dup (many events are in-process
+     * only and never need one), whose readable state mirrors the kqueue
+     * trigger: signal writes a token, clear drains it.  pipe_mtx guards the
+     * lazy creation and every token write/drain: a signal sets the kqueue
+     * trigger BEFORE taking the lock and creation primes the pipe under the
+     * lock AFTER peeking, so a first-dup racing a signal never loses the edge
+     * (whichever critical section runs second observes the other's effect). */
+    std::mutex pipe_mtx;
+    int        pipe_r; /* read end handed out (dup'd) by dmn_event_dup_fd */
+    int        pipe_w; /* write end poked alongside the kqueue trigger */
+};
+
+/* A HANDLE: a magic tag plus a reference to the shared core. */
+struct DmnEvent {
+    uint32_t      magic;
+    DmnEventCore* core;
 };
 
 struct DmnSemaphore {
@@ -109,12 +134,12 @@ void set_cloexec_nonblock(int fd) {
 /* Non-consuming peek for whether the trigger is pending.  Only valid for
  * manual-reset events: their registration has no EV_CLEAR, so a zero-timeout
  * kevent read does not consume the trigger.  Auto-reset would be consumed. */
-bool event_peek_signaled(DmnEvent* e) {
-    if (!e->manual_reset)
+bool event_peek_signaled(DmnEventCore* c) {
+    if (!c->manual_reset)
         return false;
     struct kevent out;
     struct timespec zero = {0, 0};
-    return kevent(e->kq, nullptr, 0, &out, 1, &zero) > 0;
+    return kevent(c->kq, nullptr, 0, &out, 1, &zero) > 0;
 }
 
 void pipe_write_token(int w) {
@@ -135,10 +160,11 @@ void pipe_drain(int r) {
     do { n = ::read(r, buf, sizeof(buf)); } while (n > 0 || (n < 0 && errno == EINTR));
 }
 
-/* Lazily create the exported pipe, priming it if the event is already
- * signaled so a dup taken after the signal still reports readable. */
-bool event_ensure_pipe(DmnEvent* e) {
-    if (e->pipe_r >= 0)
+/* Lazily create the exported pipe under pipe_mtx, priming it if the event is
+ * already signaled so a dup taken after the signal still reports readable. */
+bool event_ensure_pipe(DmnEventCore* c) {
+    std::lock_guard<std::mutex> lk(c->pipe_mtx);
+    if (c->pipe_r >= 0)
         return true;
     int fds[2];
     if (::pipe(fds) != 0) {
@@ -147,35 +173,36 @@ bool event_ensure_pipe(DmnEvent* e) {
     }
     set_cloexec_nonblock(fds[0]);
     set_cloexec_nonblock(fds[1]);
-    e->pipe_r = fds[0];
-    e->pipe_w = fds[1];
-    if (event_peek_signaled(e))
-        pipe_write_token(e->pipe_w);
+    c->pipe_r = fds[0];
+    c->pipe_w = fds[1];
+    if (event_peek_signaled(c))
+        pipe_write_token(c->pipe_w);
     return true;
 }
 
-void event_signal(DmnEvent* e) {
+void event_signal(DmnEventCore* c) {
     struct kevent ev;
     EV_SET(&ev, 1, EVFILT_USER, 0, NOTE_TRIGGER, 0, nullptr);
-    kevent(e->kq, &ev, 1, nullptr, 0, nullptr);
-    pipe_write_token(e->pipe_w);
+    kevent(c->kq, &ev, 1, nullptr, 0, nullptr);
+    /* The kqueue trigger is now set; take the lock only to poke the pipe.  A
+     * first-dup that publishes the pipe after this trigger will observe it via
+     * its post-creation peek, so the token is never lost. */
+    std::lock_guard<std::mutex> lk(c->pipe_mtx);
+    pipe_write_token(c->pipe_w);
 }
 
-void event_clear(DmnEvent* e) {
+void event_clear(DmnEventCore* c) {
     struct kevent ev;
     EV_SET(&ev, 1, EVFILT_USER, EV_DELETE, 0, 0, nullptr);
-    kevent(e->kq, &ev, 1, nullptr, 0, nullptr);
-    event_register(e->kq, e->manual_reset);
-    pipe_drain(e->pipe_r);
+    kevent(c->kq, &ev, 1, nullptr, 0, nullptr);
+    event_register(c->kq, c->manual_reset);
+    std::lock_guard<std::mutex> lk(c->pipe_mtx);
+    pipe_drain(c->pipe_r);
 }
 
-/* Release the exported pipe fds, if any were created. */
-void event_close_pipe(DmnEvent* e) {
-    if (e->pipe_r >= 0) { close(e->pipe_r); e->pipe_r = -1; }
-    if (e->pipe_w >= 0) { close(e->pipe_w); e->pipe_w = -1; }
-}
-
-DmnEvent* event_alloc(bool manual_reset, bool initial_state) {
+/* Allocate the shared core: a fresh kqueue with its EVFILT_USER registration,
+ * no pipe yet (created on first dmn_event_dup_fd), one reference. */
+DmnEventCore* core_alloc(bool manual_reset, bool initial_state) {
     int kq = kqueue();
     if (kq < 0) {
         DMN_ERROR("event: kqueue() failed (fd exhaustion? raise "
@@ -190,18 +217,55 @@ DmnEvent* event_alloc(bool manual_reset, bool initial_state) {
         return nullptr;
     }
 
-    auto* e = static_cast<DmnEvent*>(::malloc(sizeof(DmnEvent)));
-    if (!e) {
+    auto* c = new (std::nothrow) DmnEventCore();
+    if (!c) {
         close(kq);
         return nullptr;
     }
-    e->magic = kEventMagic;
-    e->manual_reset = manual_reset;
-    e->kq = kq;
-    e->pipe_r = -1;
-    e->pipe_w = -1;
+    c->refs.store(1, std::memory_order_relaxed);
+    c->manual_reset = manual_reset;
+    c->kq     = kq;
+    c->pipe_r = -1;
+    c->pipe_w = -1;
     if (initial_state)
-        event_signal(e);
+        event_signal(c);
+    return c;
+}
+
+void core_ref(DmnEventCore* c) {
+    c->refs.fetch_add(1, std::memory_order_relaxed);
+}
+
+/* Drop a reference; the last one closes the kqueue and pipe and frees it. */
+void core_unref(DmnEventCore* c) {
+    if (c->refs.fetch_sub(1, std::memory_order_acq_rel) != 1)
+        return;
+    if (c->pipe_r >= 0) close(c->pipe_r);
+    if (c->pipe_w >= 0) close(c->pipe_w);
+    close(c->kq);
+    delete c;
+}
+
+/* Hand out a dup of the exported pipe's read end (created on demand). */
+int event_dup_fd_core(DmnEventCore* c) {
+    if (!event_ensure_pipe(c))
+        return -1;
+    std::lock_guard<std::mutex> lk(c->pipe_mtx);
+    return c->pipe_r >= 0 ? dup(c->pipe_r) : -1;
+}
+
+/* Wrap a fresh core in a HANDLE box. */
+DmnEvent* event_alloc(bool manual_reset, bool initial_state) {
+    DmnEventCore* c = core_alloc(manual_reset, initial_state);
+    if (!c)
+        return nullptr;
+    auto* e = static_cast<DmnEvent*>(::malloc(sizeof(DmnEvent)));
+    if (!e) {
+        core_unref(c);
+        return nullptr;
+    }
+    e->magic = kEventMagic;
+    e->core  = c;
     return e;
 }
 
@@ -225,7 +289,7 @@ dmn_wait_status event_wait(DmnEvent* e, uint64_t timeout_ns) {
             tsp = &ts;
         }
         struct kevent out;
-        int n = kevent(e->kq, nullptr, 0, &out, 1, tsp);
+        int n = kevent(e->core->kq, nullptr, 0, &out, 1, tsp);
         if (n > 0)
             return DMN_WAIT_SIGNALED;
         if (n == 0)
@@ -432,13 +496,13 @@ void* DmnGFXTEvent::CreateEvent(uint32_t manualReset, bool initialState) {
 void DmnGFXTEvent::SetEvent(void* handle) {
     DmnEvent* e = as_event(handle);
     if (e)
-        event_signal(e);
+        event_signal(e->core);
 }
 
 void DmnGFXTEvent::ClearEvent(void* handle) {
     DmnEvent* e = as_event(handle);
     if (e)
-        event_clear(e);
+        event_clear(e->core);
 }
 
 void DmnGFXTEvent::PulseEvent(void* handle) {
@@ -448,16 +512,15 @@ void DmnGFXTEvent::PulseEvent(void* handle) {
     DmnEvent* e = as_event(handle);
     if (!e)
         return;
-    event_signal(e);
-    event_clear(e);
+    event_signal(e->core);
+    event_clear(e->core);
 }
 
 void DmnGFXTEvent::CloseEvent(void* handle) {
     DmnEvent* e = as_event(handle);
     if (!e)
         return;
-    event_close_pipe(e);
-    close(e->kq);
+    core_unref(e->core);
     e->magic = 0;
     ::free(e);
 }
@@ -507,26 +570,20 @@ void DmnGFXTEvent::CloseSemaphore(void* handle) {
 }
 
 void* DmnGFXTEvent::DuplicateEvent(void* handle) {
-    /* A new box with its own dup of the kqueue: the kernel refcounts the
-     * kqueue object, so either handle may be closed independently while
-     * trigger state stays shared. */
+    /* A second HANDLE onto the SAME shared core.  SetEvent, ClearEvent and
+     * dmn_event_dup_fd on either box act on one kqueue and one exported pipe,
+     * so a signal on the duplicate is visible both to an in-process waiter and
+     * to a poller that dup'd the original's fd — the property D3DMetal's
+     * version-3 duplicate-then-signal-async completion path relies on. */
     DmnEvent* e = as_event(handle);
     if (!e)
         return nullptr;
-    int kq = dup(e->kq);
-    if (kq < 0)
-        return nullptr;
     auto* d = static_cast<DmnEvent*>(::malloc(sizeof(DmnEvent)));
-    if (!d) {
-        close(kq);
+    if (!d)
         return nullptr;
-    }
-    *d = *e;
-    d->kq = kq;
-    /* The exported pipe is per-box (fds are not shareable by struct copy);
-     * the duplicate lazily makes its own on first dmn_event_dup_fd. */
-    d->pipe_r = -1;
-    d->pipe_w = -1;
+    core_ref(e->core);
+    d->magic = kEventMagic;
+    d->core  = e->core;
     return d;
 }
 
@@ -567,21 +624,20 @@ extern "C" void* dmn_event_create(int manual_reset, int initial_state) {
 extern "C" void dmn_event_signal(void* handle) {
     DmnEvent* e = as_event(handle);
     if (e)
-        event_signal(e);
+        event_signal(e->core);
 }
 
 extern "C" void dmn_event_clear(void* handle) {
     DmnEvent* e = as_event(handle);
     if (e)
-        event_clear(e);
+        event_clear(e->core);
 }
 
 extern "C" void dmn_event_close(void* handle) {
     DmnEvent* e = as_event(handle);
     if (!e)
         return;
-    event_close_pipe(e);
-    close(e->kq);
+    core_unref(e->core);
     e->magic = 0;
     ::free(e);
 }
@@ -593,9 +649,7 @@ extern "C" int dmn_event_dup_fd(void* handle) {
     /* Hand out a dup of the pipe read end, not the kqueue: the caller
      * passes this fd to another process via SCM_RIGHTS, which macOS
      * permits for pipes but rejects (EINVAL) for kqueues. */
-    if (!event_ensure_pipe(e))
-        return -1;
-    return dup(e->pipe_r);
+    return event_dup_fd_core(e->core);
 }
 
 extern "C" dmn_wait_status dmn_event_wait(void* handle, uint64_t timeout_ns) {

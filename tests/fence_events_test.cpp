@@ -13,6 +13,12 @@
  *     OpenSharedFence, waited with SetEventOnCompletion.
  *  5. dmn_event_dup_fd: a pollable fd dup'd before the GPU signal becomes
  *     readable when D3DMetal's internal SetEvent fires on fence completion.
+ *  6. dmn_event_dup_fd through SetEventOnMultipleFenceCompletion: the same
+ *     pollable-fd contract as (5), but via the multi-fence API. At interface
+ *     version 3 D3DMetal DUPLICATES the event and fires its async SetEvent on
+ *     the duplicate; the pollable fd (a cross-process pipe, unlike the in-proc
+ *     kqueue wait of (3)) must still become readable. Regression guard: the
+ *     duplicate has to carry the same exported pipe as the original.
  *
  * Prints "FEVENTS: PASS" and exits 0 on success.
  */
@@ -187,6 +193,46 @@ int main() {
         dmn_event_close(ev);
         printf("FEVENTS: pollable event fd ok (value %llu)\n",
                (unsigned long long)v);
+    }
+
+    /* 6) Pollable event fd armed through SetEventOnMultipleFenceCompletion.
+     *    Same contract as (5), but the multi-fence path (v3) signals a
+     *    DUPLICATE of the event rather than the original. The in-process
+     *    kqueue wait survives that (dup shares the kqueue), so this instead
+     *    watches the exported pollable fd, whose backing pipe must follow the
+     *    event across DuplicateEvent. Manual-reset so the fd latches. */
+    {
+        Com<ID3D12Device1> dev1;
+        if (SUCCEEDED(dev->QueryInterface(__uuidof(ID3D12Device1),
+                                          (void**)&dev1)) && dev1) {
+            Com<ID3D12Fence> mf;
+            CK(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence),
+                                (void**)&mf), "CreateFence(multi)");
+            void* ev = dmn_event_create(1, 0);
+            EXPECT(ev, "event create failed");
+            int fd = dmn_event_dup_fd(ev);
+            EXPECT(fd >= 0, "dmn_event_dup_fd failed");
+            ID3D12Fence* fences[1] = {mf.ptr()};
+            UINT64 values[1] = {1};
+            CK(dev1->SetEventOnMultipleFenceCompletion(
+                   fences, values, 1, D3D12_MULTIPLE_FENCE_WAIT_FLAG_ALL, ev),
+               "SetEventOnMultipleFenceCompletion(pollable)");
+            struct pollfd pfd = {fd, POLLIN, 0};
+            EXPECT(poll(&pfd, 1, 0) == 0, "event fd readable before the signal");
+            CK(queue->Signal(mf.ptr(), 1), "queue Signal(multi)");
+            pfd = {fd, POLLIN, 0};
+            EXPECT(poll(&pfd, 1, 10000) == 1 && (pfd.revents & POLLIN),
+                   "event fd never became readable on multi-fence completion "
+                   "(DuplicateEvent dropped the exported pipe)");
+            EXPECT(dmn_event_wait(ev, 0) == DMN_WAIT_SIGNALED,
+                   "event not signaled alongside the readable fd");
+            close(fd);
+            dmn_event_close(ev);
+            printf("FEVENTS: pollable fd via multi-fence ok\n");
+        } else {
+            printf("FEVENTS: ID3D12Device1 unavailable; pollable multi-wait "
+                   "skipped\n");
+        }
     }
 
     CK(dmn_shared_handle_close(h) == DMN_SUCCESS ? S_OK : E_FAIL,

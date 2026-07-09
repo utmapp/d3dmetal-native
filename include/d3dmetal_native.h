@@ -188,8 +188,10 @@ void dmn_event_close(void* handle);
 
 /* Pollable view of an event: returns a NEW fd (caller owns; close(2) it)
  * that polls readable (POLLIN) while the event is signaled and unreadable
- * while it is clear — it is a dup(2) of the event's kqueue, so every fd
- * returned for a handle tracks later signal/clear transitions, including
+ * while it is clear. Backed by a pipe whose readable state mirrors the
+ * event's kqueue trigger (macOS cannot pass kqueue fds across processes),
+ * shared across DuplicateEvent, so every fd returned for a handle — or any
+ * duplicate of it — tracks later signal/clear transitions, including
  * D3DMetal's internal SetEvent on fence completion. Returns -1 on failure
  * or if handle is not an event. Auto-reset caveat: a dmn_event_wait
  * consumer that wins the race clears readability too (Win32 semantics). */
