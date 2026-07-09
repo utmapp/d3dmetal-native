@@ -290,8 +290,18 @@ dmn_wait_status event_wait(DmnEvent* e, uint64_t timeout_ns) {
         }
         struct kevent out;
         int n = kevent(e->core->kq, nullptr, 0, &out, 1, tsp);
-        if (n > 0)
+        if (n > 0) {
+            /* Auto-reset: the EV_CLEAR read just consumed the single kqueue
+             * trigger, so the pollable pipe must clear too — this waiter is the
+             * consumer that won the race (Win32 semantics; see the header's
+             * dmn_event_dup_fd caveat). Manual-reset events stay signaled until
+             * an explicit clear, so their pipe is left alone. */
+            if (!e->core->manual_reset) {
+                std::lock_guard<std::mutex> lk(e->core->pipe_mtx);
+                pipe_drain(e->core->pipe_r);
+            }
             return DMN_WAIT_SIGNALED;
+        }
         if (n == 0)
             return DMN_WAIT_TIMEOUT;
         if (errno != EINTR) {
