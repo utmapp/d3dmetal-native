@@ -26,6 +26,7 @@
  */
 
 #include <dispatch/dispatch.h>
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <sys/event.h>
 #include <time.h>
@@ -34,6 +35,9 @@
 #include <atomic>
 #include <cerrno>
 #include <cstdlib>
+#include <cstring>
+#include <mutex>
+#include <thread>
 
 #include "dmn_gfxt.h"
 #include "dmn_log.h"
@@ -238,9 +242,185 @@ void destroy_semaphore(DmnSemaphore* s) {
     ::free(s);
 }
 
+/* == os_sync wait-on-address backed dispatch queue ======================== */
+
+/* os_sync_wait_on_address family (macOS 14.4+).  Resolved at runtime so one
+ * build keeps running on older systems.  Signatures per
+ * <os/os_sync_wait_on_address.h>; wait blocks the caller while the 4-byte word
+ * at addr still equals `value`, flags 0 = process-private (NONE). */
+using os_sync_wait_fn = int (*)(void* addr, uint64_t value, size_t size,
+                                uint32_t flags);
+using os_sync_wake_fn = int (*)(void* addr, size_t size, uint32_t flags);
+
+struct OsSync {
+    os_sync_wait_fn wait;
+    os_sync_wake_fn wake_any;
+    os_sync_wake_fn wake_all;
+};
+
+/* The resolved table, or nullptr on macOS < 14.4. */
+const OsSync* os_sync() {
+    static OsSync table;
+    static bool ok = false;
+    static std::once_flag once;
+    std::call_once(once, [] {
+        table.wait =
+            (os_sync_wait_fn)dlsym(RTLD_DEFAULT, "os_sync_wait_on_address");
+        table.wake_any =
+            (os_sync_wake_fn)dlsym(RTLD_DEFAULT, "os_sync_wake_by_address_any");
+        table.wake_all =
+            (os_sync_wake_fn)dlsym(RTLD_DEFAULT, "os_sync_wake_by_address_all");
+        ok = table.wait && table.wake_any && table.wake_all;
+    });
+    return ok ? &table : nullptr;
+}
+
+constexpr uint32_t kSlotCount     = 32; /* one bit per slot in the bitmaps */
+constexpr uint32_t kInlinePayload = 32; /* payloads up to this size copy inline */
+
+enum PayloadKind : uint8_t {
+    kPayloadInline   = 0, /* bytes live in slot.inln                          */
+    kPayloadBorrowed = 1, /* slot.ptr aliases the caller's buffer, or is null */
+    kPayloadHeap     = 2, /* slot.ptr is malloc'd; the worker frees it        */
+};
+
+struct DispatchSlot {
+    void (*fn)(const void*);
+    const void*           ptr;      /* payload for kPayloadBorrowed/kPayloadHeap */
+    std::atomic<uint32_t> done;     /* blocking handshake: 1 pending, 0 complete */
+    PayloadKind           kind;
+    bool                  blocking;
+    alignas(16) uint8_t   inln[kInlinePayload];
+};
+
+/* A bounded lock-free MPSC queue: many producers (_DispatchFunctionInternal
+ * callers), one worker.  `alloc` bit i marks slot i owned by a producer;
+ * `ready` bit i marks it filled and awaiting the worker. */
+struct Dispatcher {
+    std::atomic<uint32_t> alloc; /* bit i: slot i in use            */
+    std::atomic<uint32_t> ready; /* bit i: slot i filled, unclaimed */
+    DispatchSlot          slots[kSlotCount];
+};
+
+void dispatcher_worker(Dispatcher* d) {
+    const OsSync* os = os_sync();
+    for (;;) {
+        uint32_t r = d->ready.load(std::memory_order_acquire);
+        while (r == 0) {
+            os->wait(&d->ready, 0, sizeof(uint32_t), 0);
+            r = d->ready.load(std::memory_order_acquire);
+        }
+        uint32_t i   = (uint32_t)__builtin_ctz(r);
+        uint32_t bit = 1u << i;
+        d->ready.fetch_and(~bit, std::memory_order_acquire); /* claim the slot */
+
+        DispatchSlot& s        = d->slots[i];
+        void (*fn)(const void*) = s.fn;
+        const void* arg =
+            s.kind == kPayloadInline ? (const void*)s.inln : s.ptr;
+        bool blocking = s.blocking;
+
+        if (fn)
+            fn(arg);
+        if (s.kind == kPayloadHeap)
+            ::free(const_cast<void*>(s.ptr));
+
+        if (blocking) {
+            /* The producer is parked on done and owns freeing the slot. */
+            s.done.store(0, std::memory_order_release);
+            os->wake_all(&s.done, sizeof(uint32_t), 0);
+        } else {
+            /* Async slot is ours: release it and wake any full-queue waiter. */
+            d->alloc.fetch_and(~bit, std::memory_order_release);
+            os->wake_all(&d->alloc, sizeof(uint32_t), 0);
+        }
+    }
+}
+
+/* Process-wide singleton; the detached worker lives for the process lifetime,
+ * matching libdispatch's global queues. */
+Dispatcher* dispatcher() {
+    static Dispatcher* d = nullptr;
+    static std::once_flag once;
+    std::call_once(once, [] {
+        d = new Dispatcher();
+        d->alloc.store(0, std::memory_order_relaxed);
+        d->ready.store(0, std::memory_order_relaxed);
+        std::thread(dispatcher_worker, d).detach();
+    });
+    return d;
+}
+
+void dispatcher_submit(void (*fn)(const void*), bool blocking,
+                       const void* payload, uint32_t size) {
+    const OsSync* os = os_sync();
+    Dispatcher*   d  = dispatcher();
+
+    /* 1. Claim a free slot, waiting if all 32 are in flight. */
+    uint32_t i;
+    for (;;) {
+        uint32_t cur = d->alloc.load(std::memory_order_relaxed);
+        if (cur == 0xFFFFFFFFu) {
+            os->wait(&d->alloc, 0xFFFFFFFFu, sizeof(uint32_t), 0);
+            continue;
+        }
+        i = (uint32_t)__builtin_ctz(~cur);
+        if (d->alloc.compare_exchange_weak(cur, cur | (1u << i),
+                                           std::memory_order_acquire,
+                                           std::memory_order_relaxed))
+            break;
+    }
+    uint32_t      bit = 1u << i;
+    DispatchSlot& s   = d->slots[i];
+
+    /* 2. Fill the slot.  Async payloads are copied (the caller's buffer may be
+     *    gone before the worker runs); a blocking call borrows the pointer
+     *    directly, since we do not return until the callback has run. */
+    s.fn       = fn;
+    s.blocking = blocking;
+    if (blocking)
+        s.done.store(1, std::memory_order_relaxed);
+    if (!payload || size == 0) {
+        s.kind = kPayloadBorrowed;
+        s.ptr  = nullptr;
+    } else if (blocking) {
+        s.kind = kPayloadBorrowed;
+        s.ptr  = payload;
+    } else if (size <= kInlinePayload) {
+        s.kind = kPayloadInline;
+        ::memcpy(s.inln, payload, size);
+    } else {
+        void* heap = ::malloc(size);
+        s.kind     = kPayloadHeap;
+        s.ptr      = heap;
+        if (heap)
+            ::memcpy(heap, payload, size);
+    }
+
+    /* 3. Publish; wake the worker only if it may be parked (queue was empty). */
+    uint32_t prev = d->ready.fetch_or(bit, std::memory_order_release);
+    if (prev == 0)
+        os->wake_any(&d->ready, sizeof(uint32_t), 0);
+
+    /* 4. Blocking: park until the worker completes, then release the slot. */
+    if (blocking) {
+        while (s.done.load(std::memory_order_acquire) == 1)
+            os->wait(&s.done, 1, sizeof(uint32_t), 0);
+        d->alloc.fetch_and(~bit, std::memory_order_release);
+        os->wake_all(&d->alloc, sizeof(uint32_t), 0);
+    }
+}
+
 } // namespace
 
 DmnGFXTEvent::~DmnGFXTEvent() = default;
+
+GFXTInterfaceVersion DmnGFXTEvent::Version() const {
+    /* Version 3 advertises the os_sync-backed _DispatchFunctionInternal, which
+     * exists only on macOS 14.4+; older systems keep the libdispatch path and
+     * report 2. */
+    return GFXT_INTERFACE_VERSION(os_sync() ? 3u : 2u);
+}
 
 void* DmnGFXTEvent::CreateEvent(uint32_t manualReset, bool initialState) {
     DmnEvent* e = event_alloc(manualReset != 0, initialState);
@@ -362,16 +542,20 @@ void DmnGFXTEvent::_DispatchFunctionInternal(void (*fn)(const void*),
                                              bool waitForCompletion,
                                              const void* payload,
                                              uint32_t payloadSize) {
-    (void)payloadSize;
     if (!fn)
         return;
-    dispatch_queue_t queue =
-        dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
-    if (waitForCompletion) {
-        dispatch_sync(queue, ^{ fn(payload); });
-    } else {
-        dispatch_async(queue, ^{ fn(payload); });
+
+    /* This entry point exists only on the version-3 interface, which Version()
+     * reports solely when os_sync is available; a version-aware caller must not
+     * reach it otherwise.  Trap rather than silently degrade if that contract
+     * is violated. */
+    if (!os_sync()) {
+        DMN_ERROR("_DispatchFunctionInternal called without os_sync "
+                  "(macOS < 14.4); Version() should have gated this");
+        abort();
     }
+
+    dispatcher_submit(fn, waitForCompletion, payload, payloadSize);
 }
 
 /* == Public C API (also used by dmn_fence_d3d.cpp internally) ============= */

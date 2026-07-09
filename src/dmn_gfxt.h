@@ -51,7 +51,7 @@ public:
 
 class DmnGFXTEvent final : public GFXTEventInterface {
 public:
-    GFXTInterfaceVersion Version() const override { return GFXT_INTERFACE_VERSION(2); }
+    GFXTInterfaceVersion Version() const override;
     ~DmnGFXTEvent() override;
     void* CreateEvent(uint32_t manualReset, bool initialState) override;
     void  SetEvent(void* handle) override;
