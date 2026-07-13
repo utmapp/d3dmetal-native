@@ -92,6 +92,13 @@ shared_texture_test = executable('shared-texture-test',
   link_with: dmn_lib)
 test('shared-texture', shared_texture_test, env: ['DMN_LOG=info'], timeout: 300)
 
+# Regression: shader-sampling a MISC_SHARED texture's SRV (glyph-box bug).
+shared_srv_sample_test = executable('shared-srv-sample-test',
+  'shared_srv_sample_test.cpp',
+  include_directories: test_native_inc,
+  link_with: dmn_lib)
+test('shared-srv-sample', shared_srv_sample_test, env: ['DMN_LOG=info'], timeout: 300)
+
 # Cross-API, cross-process shared fence: forked producer/consumer, one direction
 # per test entry (D3D11 fence -> D3D12 consumer, and D3D12 fence -> D3D11 consumer).
 fence_xapi = executable('fence-xapi-test',

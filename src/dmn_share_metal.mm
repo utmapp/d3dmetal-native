@@ -222,6 +222,34 @@ id<MTLTexture> substitute(id<MTLDevice> device, MTLTextureDescriptor* desc) {
     pin_buffer_to_texture(tex, buf);
     [buf release]; /* the texture holds the only reference now */
 
+    /* D3DMetal reconstructs an opened MISC_SHARED surface as MTLTextureType2DArray
+     * and emits texture2d_array sample code for its SRV, but a buffer-backed
+     * linear texture is forced to plain MTLTextureType2D (Metal asserts on a
+     * 2DArray linear texture). Sampling the 2D impostor through the array-typed
+     * binding reads a garbage array dimension and returns zero for the colour
+     * channels — a solid box over every composited XAML glyph, while a
+     * CopyResource of the same surface reads correctly. A 2DArray view over the
+     * same buffer-backed storage samples correctly, so hand back an array view
+     * whenever an array texture was requested. */
+    if (desc.textureType == MTLTextureType2DArray && desc.arrayLength <= 1) {
+        id<MTLTexture> arrview =
+            [tex newTextureViewWithPixelFormat:fmt
+                                   textureType:MTLTextureType2DArray
+                                        levels:NSMakeRange(0, 1)
+                                        slices:NSMakeRange(0, 1)];
+        if (arrview) {
+            /* the view retains tex, which holds buf; keep the chain explicit
+             * (a view need not retain its base across all Metal versions) and
+             * hand the caller the view +1 in tex's place. */
+            objc_setAssociatedObject(arrview, kDmnBackingKey, tex,
+                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            [tex release];
+            tex = arrview;
+        } else {
+            DMN_WARN("share: 2DArray view of impostor failed; sampling may box");
+        }
+    }
+
     t_arm.captured   = true;
     t_arm.out_fd     = fd;
     t_arm.out_stride = stride;
