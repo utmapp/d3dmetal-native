@@ -131,6 +131,10 @@ void pin_buffer_to_texture(id<MTLTexture> tex, id<MTLBuffer> buf) {
 /* == Thread-local arm ===================================================== */
 thread_local DmnShareArm t_arm = {};
 
+/* Register a substituted impostor so it is made GPU-resident on every encoder
+ * (defined with the swizzle plumbing below). */
+void sub_resource_track(id res);
+
 /* == The substitution ===================================================== */
 /* Build a shared-memory-backed linear texture matching `desc`, honoring the
  * armed allocate-vs-reuse mode, and record what we built into t_arm. Returns a
@@ -250,6 +254,8 @@ id<MTLTexture> substitute(id<MTLDevice> device, MTLTextureDescriptor* desc) {
         }
     }
 
+    sub_resource_track(tex); /* keep resident when bound bindlessly */
+
     t_arm.captured   = true;
     t_arm.out_fd     = fd;
     t_arm.out_stride = stride;
@@ -309,6 +315,8 @@ id<MTLBuffer> substitute_buffer(id<MTLDevice> device, NSUInteger length) {
         if (t_arm.alloc_new) close(fd);
         return nil;
     }
+
+    sub_resource_track(buf); /* keep resident when bound bindlessly */
 
     t_arm.captured = true;
     t_arm.out_fd   = fd;
@@ -468,6 +476,212 @@ id swz_dev_newheap(id self, SEL _cmd, MTLHeapDescriptor* desc) {
     return heap;
 }
 
+/* == Residency for substituted resources =================================
+ * A substituted impostor is a shared-memory MTLBuffer-backed texture/buffer,
+ * not placed on one of D3DMetal's heaps. D3DMetal establishes per-encoder GPU
+ * residency with useHeap:/useResource: for its OWN heap allocations, so an
+ * impostor bound bindlessly through an argument buffer (a D3D descriptor table)
+ * never gets a useResource: — the GPU address-faults on the first sample
+ * (kIOGPUCommandBufferCallbackErrorPageFault -> SubmissionsIgnored -> the guest
+ * device renders permanently black even as flips keep succeeding). Track every
+ * substituted resource weakly and useResource: it on every render/compute
+ * encoder. */
+NSHashTable* g_sub_resources; /* weak MTLResource refs; guarded by g_swz_mutex */
+
+void sub_resource_track(id res) {
+    if (!res)
+        return;
+    std::lock_guard<std::mutex> lk(g_swz_mutex);
+    if (!g_sub_resources)
+        g_sub_resources = [[NSHashTable weakObjectsHashTable] retain];
+    [g_sub_resources addObject:res];
+}
+
+/* Snapshot under the lock, useResource: outside it. */
+void sub_resources_make_resident(id enc, bool compute) {
+    NSArray* snapshot = nil;
+    {
+        std::lock_guard<std::mutex> lk(g_swz_mutex);
+        if (!g_sub_resources || g_sub_resources.count == 0)
+            return;
+        snapshot = [[g_sub_resources allObjects] retain];
+    }
+    for (id<MTLResource> r in snapshot) {
+        if (compute) {
+            [(id<MTLComputeCommandEncoder>)enc
+                useResource:r
+                      usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+        } else {
+            [(id<MTLRenderCommandEncoder>)enc
+                useResource:r
+                      usage:MTLResourceUsageRead | MTLResourceUsageWrite
+                     stages:MTLRenderStageVertex | MTLRenderStageFragment];
+        }
+    }
+    [snapshot release];
+}
+
+/* Encoder creators on the private MTLCommandBuffer class. */
+std::unordered_map<Class, IMP> g_cb_rce_orig;  /* renderCommandEncoderWithDescriptor: */
+std::unordered_map<Class, IMP> g_cb_cce_orig;  /* computeCommandEncoder */
+std::unordered_map<Class, IMP> g_cb_cced_orig; /* computeCommandEncoderWithDispatchType: */
+std::unordered_map<Class, IMP> g_cb_cceD_orig; /* computeCommandEncoderWithDescriptor: */
+
+id swz_cb_cceD(id self, SEL _cmd, id desc) {
+    IMP orig = lookup_orig(g_cb_cceD_orig, object_getClass(self));
+    if (!orig)
+        return nil;
+    id enc = ((id (*)(id, SEL, id))orig)(self, _cmd, desc);
+    if (enc)
+        sub_resources_make_resident(enc, true);
+    return enc;
+}
+
+id swz_cb_rce(id self, SEL _cmd, MTLRenderPassDescriptor* desc) {
+    IMP orig = lookup_orig(g_cb_rce_orig, object_getClass(self));
+    if (!orig)
+        return nil;
+    id enc = ((id (*)(id, SEL, MTLRenderPassDescriptor*))orig)(self, _cmd, desc);
+    if (enc)
+        sub_resources_make_resident(enc, false);
+    return enc;
+}
+
+id swz_cb_cce(id self, SEL _cmd) {
+    IMP orig = lookup_orig(g_cb_cce_orig, object_getClass(self));
+    if (!orig)
+        return nil;
+    id enc = ((id (*)(id, SEL))orig)(self, _cmd);
+    if (enc)
+        sub_resources_make_resident(enc, true);
+    return enc;
+}
+
+id swz_cb_cced(id self, SEL _cmd, NSUInteger dispatchType) {
+    IMP orig = lookup_orig(g_cb_cced_orig, object_getClass(self));
+    if (!orig)
+        return nil;
+    id enc = ((id (*)(id, SEL, NSUInteger))orig)(self, _cmd, dispatchType);
+    if (enc)
+        sub_resources_make_resident(enc, true);
+    return enc;
+}
+
+void ensure_cmdbuf_class_swizzled(Class cbc) {
+    if (!cbc)
+        return;
+    struct { SEL sel; IMP repl; std::unordered_map<Class, IMP>* store; } jobs[] = {
+        { @selector(renderCommandEncoderWithDescriptor:), (IMP)swz_cb_rce,
+          &g_cb_rce_orig },
+        { @selector(computeCommandEncoder), (IMP)swz_cb_cce, &g_cb_cce_orig },
+        { @selector(computeCommandEncoderWithDispatchType:), (IMP)swz_cb_cced,
+          &g_cb_cced_orig },
+        { @selector(computeCommandEncoderWithDescriptor:), (IMP)swz_cb_cceD,
+          &g_cb_cceD_orig },
+    };
+    std::lock_guard<std::mutex> lk(g_swz_mutex);
+    if (g_cb_rce_orig.count(cbc))
+        return;
+    for (auto& j : jobs) {
+        Method m = class_getInstanceMethod(cbc, j.sel);
+        if (!m) {
+            DMN_WARN("share: cmdbuf class %s missing %s", class_getName(cbc),
+                     sel_getName(j.sel));
+            continue;
+        }
+        (*j.store)[cbc] = method_setImplementation(m, j.repl);
+    }
+    DMN_INFO("share: swizzled encoder creators on %s", class_getName(cbc));
+}
+
+/* Command-buffer creators on the queue class -> swizzle each cmdbuf class the
+ * first time it appears, before D3DMetal encodes anything on it. */
+std::unordered_map<Class, IMP> g_q_cb_orig;      /* commandBuffer */
+std::unordered_map<Class, IMP> g_q_cbunret_orig; /* commandBufferWithUnretainedReferences */
+std::unordered_map<Class, IMP> g_q_cbdesc_orig;  /* commandBufferWithDescriptor: */
+
+id swz_q_cmdbuf(id self, SEL _cmd) {
+    IMP orig = lookup_orig(g_q_cb_orig, object_getClass(self));
+    id cb = orig ? ((id (*)(id, SEL))orig)(self, _cmd) : nil;
+    if (cb)
+        ensure_cmdbuf_class_swizzled(object_getClass(cb));
+    return cb;
+}
+
+id swz_q_cmdbuf_unret(id self, SEL _cmd) {
+    IMP orig = lookup_orig(g_q_cbunret_orig, object_getClass(self));
+    id cb = orig ? ((id (*)(id, SEL))orig)(self, _cmd) : nil;
+    if (cb)
+        ensure_cmdbuf_class_swizzled(object_getClass(cb));
+    return cb;
+}
+
+id swz_q_cbdesc(id self, SEL _cmd, MTLCommandBufferDescriptor* desc) {
+    IMP orig = lookup_orig(g_q_cbdesc_orig, object_getClass(self));
+    id cb = orig ? ((id (*)(id, SEL, MTLCommandBufferDescriptor*))orig)(self, _cmd,
+                                                                        desc)
+                 : nil;
+    if (cb)
+        ensure_cmdbuf_class_swizzled(object_getClass(cb));
+    return cb;
+}
+
+void ensure_queue_class_swizzled(Class qc) {
+    if (!qc)
+        return;
+    struct { SEL sel; IMP repl; std::unordered_map<Class, IMP>* store; } jobs[] = {
+        { @selector(commandBuffer), (IMP)swz_q_cmdbuf, &g_q_cb_orig },
+        { @selector(commandBufferWithUnretainedReferences), (IMP)swz_q_cmdbuf_unret,
+          &g_q_cbunret_orig },
+        { @selector(commandBufferWithDescriptor:), (IMP)swz_q_cbdesc,
+          &g_q_cbdesc_orig },
+    };
+    std::lock_guard<std::mutex> lk(g_swz_mutex);
+    if (g_q_cb_orig.count(qc))
+        return;
+    for (auto& j : jobs) {
+        Method m = class_getInstanceMethod(qc, j.sel);
+        if (!m) {
+            DMN_WARN("share: queue class %s missing %s", class_getName(qc),
+                     sel_getName(j.sel));
+            continue;
+        }
+        (*j.store)[qc] = method_setImplementation(m, j.repl);
+    }
+    DMN_INFO("share: swizzled command-buffer creators on %s", class_getName(qc));
+}
+
+std::unordered_map<Class, IMP> g_dev_newq_orig;    /* newCommandQueue */
+std::unordered_map<Class, IMP> g_dev_newqmax_orig; /* newCommandQueueWithMaxCommandBufferCount: */
+std::unordered_map<Class, IMP> g_dev_newqdesc_orig; /* newCommandQueueWithDescriptor: */
+
+id swz_dev_newq(id self, SEL _cmd) {
+    IMP orig = lookup_orig(g_dev_newq_orig, object_getClass(self));
+    id q = orig ? ((id (*)(id, SEL))orig)(self, _cmd) : nil;
+    if (q)
+        ensure_queue_class_swizzled(object_getClass(q));
+    return q;
+}
+
+id swz_dev_newqmax(id self, SEL _cmd, NSUInteger maxCount) {
+    IMP orig = lookup_orig(g_dev_newqmax_orig, object_getClass(self));
+    id q = orig ? ((id (*)(id, SEL, NSUInteger))orig)(self, _cmd, maxCount) : nil;
+    if (q)
+        ensure_queue_class_swizzled(object_getClass(q));
+    return q;
+}
+
+/* newCommandQueueWithDescriptor: (macOS 13+). Every queue-creation variant must
+ * be hooked or a queue made through the one we miss escapes residency entirely
+ * — the impostor-not-resident fault returns for its command buffers. */
+id swz_dev_newqdesc(id self, SEL _cmd, id desc) {
+    IMP orig = lookup_orig(g_dev_newqdesc_orig, object_getClass(self));
+    id q = orig ? ((id (*)(id, SEL, id))orig)(self, _cmd, desc) : nil;
+    if (q)
+        ensure_queue_class_swizzled(object_getClass(q));
+    return q;
+}
+
 /* Same locking discipline as ensure_heap_class_swizzled. */
 void swizzle_device_class(Class cls) {
     if (!cls)
@@ -479,6 +693,11 @@ void swizzle_device_class(Class cls) {
           &g_dev_newbuf_orig },
         { @selector(newHeapWithDescriptor:), (IMP)swz_dev_newheap,
           &g_dev_newheap_orig },
+        { @selector(newCommandQueue), (IMP)swz_dev_newq, &g_dev_newq_orig },
+        { @selector(newCommandQueueWithMaxCommandBufferCount:),
+          (IMP)swz_dev_newqmax, &g_dev_newqmax_orig },
+        { @selector(newCommandQueueWithDescriptor:), (IMP)swz_dev_newqdesc,
+          &g_dev_newqdesc_orig },
     };
     std::lock_guard<std::mutex> lk(g_swz_mutex);
     if (g_dev_newtex_orig.count(cls))
