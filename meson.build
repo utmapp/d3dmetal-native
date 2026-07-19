@@ -62,6 +62,7 @@ dmn_sources = files(
   'src/dmn_window.mm',
   'src/dmn_gfxt_swapchain.mm',
   'src/dmn_share_metal.mm',
+  'src/dmn_formats.mm',
   'src/dmn_fence.cpp',
   'src/dmn_fence_d3d.cpp',
   'src/dmn_kmtx.cpp',

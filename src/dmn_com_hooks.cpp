@@ -42,10 +42,63 @@
 #include "d3dmetal_native.h"
 #include "dmn_d3d12_up.h"
 #include "dmn_fence_d3d.h"
+#include "dmn_formats.h"
 #include "dmn_hook.h"
 #include "dmn_kmtx.h"
 #include "dmn_log.h"
 #include "dmn_share.h"
+
+/* == Format-support bit mirrors ============================================ */
+/* dmn_formats.h re-declares the D3D11_FORMAT_SUPPORT bits because its
+ * implementation TU is ObjC++ and cannot include d3d11.h. This is the only TU
+ * that sees both, so it is the only place the mirror can be checked. */
+#define DMN_FMT_ASSERT(name) \
+    static_assert((uint32_t)DMN_FMT_SUPPORT_##name == \
+                  (uint32_t)D3D11_FORMAT_SUPPORT_##name, \
+                  "DMN_FMT_SUPPORT_" #name " drifted from d3d11.h")
+DMN_FMT_ASSERT(BUFFER);
+DMN_FMT_ASSERT(IA_VERTEX_BUFFER);
+DMN_FMT_ASSERT(IA_INDEX_BUFFER);
+DMN_FMT_ASSERT(SO_BUFFER);
+DMN_FMT_ASSERT(TEXTURE1D);
+DMN_FMT_ASSERT(TEXTURE2D);
+DMN_FMT_ASSERT(TEXTURE3D);
+DMN_FMT_ASSERT(TEXTURECUBE);
+DMN_FMT_ASSERT(SHADER_LOAD);
+DMN_FMT_ASSERT(SHADER_SAMPLE);
+DMN_FMT_ASSERT(SHADER_SAMPLE_COMPARISON);
+DMN_FMT_ASSERT(MIP);
+DMN_FMT_ASSERT(MIP_AUTOGEN);
+DMN_FMT_ASSERT(RENDER_TARGET);
+DMN_FMT_ASSERT(BLENDABLE);
+DMN_FMT_ASSERT(DEPTH_STENCIL);
+DMN_FMT_ASSERT(CPU_LOCKABLE);
+DMN_FMT_ASSERT(MULTISAMPLE_RESOLVE);
+DMN_FMT_ASSERT(DISPLAY);
+DMN_FMT_ASSERT(CAST_WITHIN_BIT_LAYOUT);
+DMN_FMT_ASSERT(MULTISAMPLE_RENDERTARGET);
+DMN_FMT_ASSERT(MULTISAMPLE_LOAD);
+DMN_FMT_ASSERT(SHADER_GATHER);
+DMN_FMT_ASSERT(TYPED_UNORDERED_ACCESS_VIEW);
+DMN_FMT_ASSERT(SHADER_GATHER_COMPARISON);
+#undef DMN_FMT_ASSERT
+
+#define DMN_FMT2_ASSERT(name) \
+    static_assert((uint32_t)DMN_FMT_SUPPORT2_##name == \
+                  (uint32_t)D3D11_FORMAT_SUPPORT2_##name, \
+                  "DMN_FMT_SUPPORT2_" #name " drifted from d3d11.h")
+DMN_FMT2_ASSERT(UAV_ATOMIC_ADD);
+DMN_FMT2_ASSERT(UAV_ATOMIC_BITWISE_OPS);
+DMN_FMT2_ASSERT(UAV_ATOMIC_COMPARE_STORE_OR_COMPARE_EXCHANGE);
+DMN_FMT2_ASSERT(UAV_ATOMIC_EXCHANGE);
+DMN_FMT2_ASSERT(UAV_ATOMIC_SIGNED_MIN_OR_MAX);
+DMN_FMT2_ASSERT(UAV_ATOMIC_UNSIGNED_MIN_OR_MAX);
+DMN_FMT2_ASSERT(UAV_TYPED_LOAD);
+DMN_FMT2_ASSERT(UAV_TYPED_STORE);
+DMN_FMT2_ASSERT(OUTPUT_MERGER_LOGIC_OP);
+DMN_FMT2_ASSERT(TILED);
+DMN_FMT2_ASSERT(SHAREABLE);
+#undef DMN_FMT2_ASSERT
 
 namespace {
 
@@ -313,6 +366,9 @@ HRESULT STDMETHODCALLTYPE hook_d3d11_CreateTexture3D(ID3D11Device*, const D3D11_
     const D3D11_SUBRESOURCE_DATA*, ID3D11Texture3D**);
 HRESULT STDMETHODCALLTYPE hook_d3d11_CreateBuffer(ID3D11Device*, const D3D11_BUFFER_DESC*,
     const D3D11_SUBRESOURCE_DATA*, ID3D11Buffer**);
+HRESULT STDMETHODCALLTYPE hook_d3d11_CheckFormatSupport(ID3D11Device*, DXGI_FORMAT, UINT*);
+HRESULT STDMETHODCALLTYPE hook_d3d11_CheckFeatureSupport(ID3D11Device*, D3D11_FEATURE, void*,
+    UINT);
 HRESULT STDMETHODCALLTYPE hook_d3d11_OpenSharedResource(ID3D11Device*, HANDLE, REFIID, void**);
 HRESULT STDMETHODCALLTYPE hook_d3d11_OpenSharedResource1(ID3D11Device1*, HANDLE, REFIID, void**);
 HRESULT STDMETHODCALLTYPE hook_d3d11_OpenSharedResourceByName(ID3D11Device1*, LPCWSTR, DWORD,
@@ -391,6 +447,8 @@ DMN_HOOK_STATE(d3d11_CreateTexture2D1);
 DMN_HOOK_STATE(d3d11_CreateTexture1D);
 DMN_HOOK_STATE(d3d11_CreateTexture3D);
 DMN_HOOK_STATE(d3d11_CreateBuffer);
+DMN_HOOK_STATE(d3d11_CheckFormatSupport);
+DMN_HOOK_STATE(d3d11_CheckFeatureSupport);
 DMN_HOOK_STATE(d3d11_OpenSharedResource);
 DMN_HOOK_STATE(d3d11_OpenSharedResource1);
 DMN_HOOK_STATE(d3d11_OpenSharedResourceByName);
@@ -861,6 +919,60 @@ HRESULT STDMETHODCALLTYPE hook_d3d11_CreateBuffer(
         record_buffer(reinterpret_cast<IUnknown*>(*out), desc->ByteWidth,
                       desc->BindFlags, desc->MiscFlags, desc->CPUAccessFlags, arm);
     return hr;
+}
+
+/* == D3D11 format-capability thunks ======================================== */
+/* D3DMetal answers CheckFormatSupport with 0xffffffff for anything it knows
+ * and 0 otherwise — those are the only two values it returns, always with
+ * S_OK. We replace the answer outright rather than filtering one; there is
+ * nothing in its reply worth preserving. dmn_formats.mm has the tables.
+ *
+ * One deliberate behavioural difference: for a valid-but-unrepresentable
+ * DXGI_FORMAT (NV12, P8, R1_UNORM, ...) D3DMetal returns S_OK with 0, whereas
+ * we follow dxmt and return E_INVALIDARG. MSDN reserves E_INVALIDARG for
+ * values that are not valid DXGI_FORMATs at all, so S_OK-with-0 is arguably
+ * the more conformant answer; this is the first thing to try if an app trips
+ * over a video-format query. */
+HRESULT STDMETHODCALLTYPE hook_d3d11_CheckFormatSupport(
+        ID3D11Device* This, DXGI_FORMAT format, UINT* out) {
+    (void)This;
+    if (!out)
+        return E_INVALIDARG;
+    uint32_t support = 0;
+    if (!dmn_format_support((uint32_t)format, &support)) {
+        *out = 0;
+        return E_INVALIDARG;
+    }
+    *out = support;
+    return S_OK;
+}
+
+/* FORMAT_SUPPORT and FORMAT_SUPPORT2 must agree with CheckFormatSupport, so
+ * they come from the same tables. Every other feature is D3DMetal's to answer
+ * — forward it untouched. */
+HRESULT STDMETHODCALLTYPE hook_d3d11_CheckFeatureSupport(
+        ID3D11Device* This, D3D11_FEATURE feature, void* data, UINT size) {
+    if (feature == D3D11_FEATURE_FORMAT_SUPPORT) {
+        auto* info = static_cast<D3D11_FEATURE_DATA_FORMAT_SUPPORT*>(data);
+        if (!info || size != sizeof(*info))
+            return E_INVALIDARG;
+        return hook_d3d11_CheckFormatSupport(This, info->InFormat,
+                                             &info->OutFormatSupport);
+    }
+    if (feature == D3D11_FEATURE_FORMAT_SUPPORT2) {
+        auto* info = static_cast<D3D11_FEATURE_DATA_FORMAT_SUPPORT2*>(data);
+        if (!info || size != sizeof(*info))
+            return E_INVALIDARG;
+        uint32_t support2 = 0;
+        if (!dmn_format_support2((uint32_t)info->InFormat, &support2)) {
+            info->OutFormatSupport2 = 0;
+            return E_INVALIDARG;
+        }
+        info->OutFormatSupport2 = support2;
+        return S_OK;
+    }
+    auto orig = DMN_ORIG(d3d11_CheckFeatureSupport, This);
+    return orig ? orig(This, feature, data, size) : E_FAIL;
 }
 
 /* == D3D11 consumer thunks ================================================= */
@@ -1446,6 +1558,10 @@ extern "C" void dmn_hooks_after_d3d11_device(void* device) {
         DMN_PATCH(d0, ID3D11Device, CreateTexture3D, d3d11_CreateTexture3D);
         DMN_PATCH(d0, ID3D11Device, CreateBuffer, d3d11_CreateBuffer);
         DMN_PATCH(d0, ID3D11Device, OpenSharedResource, d3d11_OpenSharedResource);
+        /* Format capability reporting (dmn_formats.mm) — replaces D3DMetal's
+         * all-bits-or-nothing answer. */
+        DMN_PATCH(d0, ID3D11Device, CheckFormatSupport, d3d11_CheckFormatSupport);
+        DMN_PATCH(d0, ID3D11Device, CheckFeatureSupport, d3d11_CheckFeatureSupport);
         /* The context Wait hook must exist before a consumer waits on an
          * imported fence, so patch at device creation (per-class vtable). */
         ID3D11DeviceContext* ctx = nullptr;

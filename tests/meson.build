@@ -31,6 +31,12 @@ dmn_device_test = executable('dmn-device-test',
   dependencies: [cocoa_deps])
 test('device', dmn_device_test, env: ['DMN_LOG=info'], timeout: 300)
 
+format_caps_test = executable('format-caps-test',
+  'format_caps_test.cpp',
+  include_directories: test_native_inc,
+  link_with: dmn_lib)
+test('format-caps', format_caps_test, env: ['DMN_LOG=info'], timeout: 300)
+
 d3d11_triangle = executable('d3d11-triangle',
   ['d3d11_triangle.cpp', 'cocoa_window.mm'],
   include_directories: test_native_inc,
