@@ -148,6 +148,82 @@ thread_local DmnShareArm t_arm = {};
  * declaring exactly `usage` (defined with the residency plumbing below). */
 void sub_resource_track(id res, MTLResourceUsage usage);
 
+/* The swizzle registry's reader, defined with the rest of the plumbing below. */
+IMP lookup_orig(Class c, SEL sel);
+
+/* == Initial-data sentinel ================================================
+ * See dmn_share_init_data_sentinel() in dmn_share.h for why a consumer
+ * reconstruct passes initial data at all. This is the pointer it passes, and
+ * the interception that keeps the data from ever being written.
+ *
+ * The pointer is a large, lazily-backed read-only zero mapping rather than a
+ * made-up address. It has to be recognisable, and it has to be safe to read:
+ * if the copy is ever not intercepted, the worst case is an upload of zeros
+ * that the import then refuses, instead of a fault inside D3DMetal on a
+ * pointer we handed it. MAP_NORESERVE means the reservation costs address
+ * space and nothing else.
+ *
+ * Recognition is a range test, not an equality test: D3DMetal advances the
+ * pointer per slice and per mip level before handing it to Metal. */
+constexpr size_t kInitSentinelBytes = (size_t)256 << 20; /* 256 MiB */
+
+void* init_sentinel_base() {
+    static void* base = [] {
+        void* m = mmap(nullptr, kInitSentinelBytes, PROT_READ,
+                       MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
+        if (m == MAP_FAILED) {
+            DMN_WARN("share: could not reserve the initial-data sentinel: %s",
+                     strerror(errno));
+            return (void*)nullptr;
+        }
+        return m;
+    }();
+    return base;
+}
+
+bool is_init_sentinel(const void* bytes) {
+    const uint8_t* base = (const uint8_t*)init_sentinel_base();
+    const uint8_t* p = (const uint8_t*)bytes;
+    return base && p >= base && p < base + kInitSentinelBytes;
+}
+
+/* -[MTLTexture replaceRegion:mipmapLevel:slice:withBytes:bytesPerRow:bytesPerImage:]
+ * and its 4-argument convenience. Both drop a write whose source is the
+ * sentinel and pass everything else through untouched. */
+void swz_tex_replace6(id self, SEL _cmd, MTLRegion region, NSUInteger level,
+                      NSUInteger slice, const void* bytes, NSUInteger bytesPerRow,
+                      NSUInteger bytesPerImage) {
+    if (is_init_sentinel(bytes)) {
+        t_arm.init_dropped = true;
+        return;
+    }
+    IMP orig = lookup_orig(object_getClass(self), _cmd);
+    if (orig)
+        ((void (*)(id, SEL, MTLRegion, NSUInteger, NSUInteger, const void*,
+                   NSUInteger, NSUInteger))orig)(self, _cmd, region, level, slice,
+                                                 bytes, bytesPerRow, bytesPerImage);
+}
+
+void swz_tex_replace4(id self, SEL _cmd, MTLRegion region, NSUInteger level,
+                      const void* bytes, NSUInteger bytesPerRow) {
+    if (is_init_sentinel(bytes)) {
+        t_arm.init_dropped = true;
+        return;
+    }
+    IMP orig = lookup_orig(object_getClass(self), _cmd);
+    if (orig)
+        ((void (*)(id, SEL, MTLRegion, NSUInteger, const void*, NSUInteger))orig)(
+            self, _cmd, region, level, bytes, bytesPerRow);
+}
+
+/* Installed on the impostor's own class the first time one is built, which is
+ * the only point at which the concrete buffer-backed texture class is known.
+ * That class is shared with every other Metal texture in the process, so this
+ * sits on all texture uploads D3DMetal performs, not just ours — hence the
+ * sentinel test being a pointer range compare ahead of any other work, and the
+ * pass-through being the only other thing either hook does. */
+void ensure_texture_class_swizzled(id tex);
+
 /* == The substitution =====================================================
  * Producer and consumer are separate functions on purpose. They agree on the
  * final object but on almost nothing else: who owns the fd, whether the mapped
@@ -287,6 +363,7 @@ id<MTLTexture> make_linear_texture(id<MTLBuffer> buf, MTLTextureDescriptor* desc
     /* Keep resident when bound bindlessly, with the access the descriptor
      * actually declared. */
     sub_resource_track(tex, residency_usage_for(desc));
+    ensure_texture_class_swizzled(tex);
     return tex; /* +1, caller owns */
 }
 
@@ -914,6 +991,18 @@ id swz_cb_cced(id self, SEL _cmd, NSUInteger dispatchType) {
     return enc;
 }
 
+void ensure_texture_class_swizzled(id tex) {
+    static const SwizzleJob jobs[] = {
+        { @selector(replaceRegion:mipmapLevel:slice:withBytes:bytesPerRow:
+                    bytesPerImage:), (IMP)swz_tex_replace6 },
+        { @selector(replaceRegion:mipmapLevel:withBytes:bytesPerRow:),
+          (IMP)swz_tex_replace4 },
+    };
+    static std::atomic<Class> memo{nullptr};
+    install_swizzles(tex ? object_getClass(tex) : nil, jobs,
+                     sizeof(jobs) / sizeof(jobs[0]), "texture-upload", &memo);
+}
+
 /* Runs for every command buffer, so the memo fast path matters here. */
 void ensure_cmdbuf_class_swizzled(Class cbc) {
     static const SwizzleJob jobs[] = {
@@ -1049,6 +1138,8 @@ void dmn_share_arm_consumer_buffer(int fd, uint64_t size) {
 }
 
 bool dmn_share_is_armed(void) { return t_arm.armed; }
+
+const void* dmn_share_init_data_sentinel(void) { return init_sentinel_base(); }
 
 bool dmn_share_disarm(DmnShareArm* out) {
     bool captured = t_arm.captured;

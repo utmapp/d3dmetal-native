@@ -108,6 +108,16 @@ shared_contract_test = executable('shared-contract-test',
   link_with: dmn_lib)
 test('shared-contract', shared_contract_test, env: ['DMN_LOG=info'], timeout: 300)
 
+# Regression: rendering to an opened shared surface must not discard the
+# contents it already had (create-with-no-initial-data marks it undefined, so
+# the first attach loads with a clear).
+shared_open_preserve = executable('shared-open-preserve-test',
+  'shared_open_preserve_test.cpp',
+  include_directories: test_native_inc,
+  link_with: dmn_lib)
+test('shared-open-preserve', shared_open_preserve,
+     env: ['DMN_LOG=info'], timeout: 300)
+
 # Regression: shader-sampling a MISC_SHARED texture's SRV (glyph-box bug).
 shared_srv_sample_test = executable('shared-srv-sample-test',
   'shared_srv_sample_test.cpp',

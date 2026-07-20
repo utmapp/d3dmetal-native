@@ -32,6 +32,7 @@
 #include <cstring>
 #include <mutex>
 #include <unordered_map>
+#include <vector>
 #include <unordered_set>
 
 #include <windows.h>
@@ -716,9 +717,28 @@ HRESULT import_texture_d3d11(ID3D11Device* dev, const dmn_shared_texture_handle*
     td.CPUAccessFlags = pod->cpu_access;
     td.MiscFlags = pod->misc_flags;
 
+    /* Initial data, pointing at the sentinel. Creating the texture with none
+     * leaves D3DMetal treating it as undefined, and the first render pass that
+     * attaches it loads with a clear — discarding everything the producer put
+     * in the surface we are aliasing. The copy itself is intercepted and
+     * dropped in the Metal half, so this marks the texture defined without
+     * writing anything. */
+    const void* sentinel = dmn_share_init_data_sentinel();
+    const UINT subresources = td.MipLevels * td.ArraySize;
+    std::vector<D3D11_SUBRESOURCE_DATA> init;
+    if (sentinel && subresources) {
+        init.resize(subresources);
+        for (auto& s : init) {
+            s.pSysMem = sentinel;
+            s.SysMemPitch = (UINT)pod->stride;
+            s.SysMemSlicePitch = (UINT)pod->size;
+        }
+    }
+
     ID3D11Texture2D* tex = nullptr;
     dmn_share_arm_consumer(pod->fd, pod->stride, pod->size);
-    HRESULT hr = dev->CreateTexture2D(&td, nullptr, &tex);
+    HRESULT hr = dev->CreateTexture2D(&td, init.empty() ? nullptr : init.data(),
+                                      &tex);
     DmnShareArm arm{};
     bool captured = dmn_share_disarm(&arm);
     if (FAILED(hr) || !tex) {
@@ -727,6 +747,13 @@ HRESULT import_texture_d3d11(ID3D11Device* dev, const dmn_shared_texture_handle*
     }
     if (!captured)
         return fail_unshared("D3D11 texture import",
+                             reinterpret_cast<void**>(&tex));
+    /* If the sentinel upload was not intercepted, D3DMetal took a path that
+     * copies it, and the surface now holds the sentinel's zeros instead of the
+     * producer's pixels. */
+    if (!init.empty() && !arm.init_dropped)
+        return fail_unshared("D3D11 texture import (sentinel initial data was "
+                             "not intercepted)",
                              reinterpret_cast<void**>(&tex));
     /* Register the imported view so re-export (GetSharedHandle on an opened
      * resource — valid on Windows) and keyed-mutex QI work here too. */

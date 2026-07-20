@@ -70,6 +70,9 @@ struct DmnShareArm {
     uint64_t existing_size;
 
     /* Filled by the swizzle on capture. */
+    bool     init_dropped;  /* consumer: the sentinel initial-data upload was
+                               intercepted and discarded (see
+                               dmn_share_init_data_sentinel) */
     bool     captured;
     int      out_fd;        /* the fd backing the substitution. Producer: newly
                                created, and OWNED by the substituted resource's
@@ -103,6 +106,19 @@ bool dmn_share_is_armed(void);
 /* Install the device/heap ObjC swizzles. Idempotent, must run before D3DMetal
  * loads. No-op-safe to call repeatedly. */
 void dmn_share_install_swizzles(void);
+
+/* pSysMem for the D3D11_SUBRESOURCE_DATA a consumer reconstruct must pass.
+ *
+ * A texture created with no initial data is undefined as far as D3DMetal is
+ * concerned, and the first render pass that attaches it loads with a clear
+ * rather than with its contents — which for an imported shared surface throws
+ * away everything the producer put there. Passing initial data marks it
+ * defined; the copy of that data is then intercepted and dropped, so nothing
+ * is actually written over the producer's pixels.
+ *
+ * Returns NULL if the sentinel region could not be reserved, in which case the
+ * caller must pass no initial data rather than an unrecognisable pointer. */
+const void* dmn_share_init_data_sentinel(void);
 
 /* == Shared-memory helpers used by the C-API + fence (no Metal needed) ==== */
 
