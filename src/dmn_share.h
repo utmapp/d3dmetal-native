@@ -53,15 +53,29 @@ struct DmnShareArm {
     int      kind;          /* DmnShareKind; texture and buffer swizzles ignore
                                an arm whose kind isn't theirs */
     bool     alloc_new;     /* true: producer allocates; false: consumer reuses fd */
-    uint64_t extra_bytes;   /* producer: extra shm past the page-aligned payload
-                               (e.g. the keyed-mutex page), page-aligned itself */
-    int      existing_fd;   /* consumer: fd to mmap (byte-exact layout) */
+
+    /* Producer inputs (alloc_new == true). */
+    uint64_t extra_bytes;   /* extra shm past the page-aligned payload (e.g. the
+                               keyed-mutex page), page-aligned itself */
+    uint64_t request_bytes; /* DMN_SHARE_BUFFER only: the byte length to back.
+                               Kept separate from existing_size, which it used
+                               to share — one field meaning "how big to make it"
+                               on one path and "how big it already is" on the
+                               other made every read of it ambiguous. */
+
+    /* Consumer inputs (alloc_new == false). */
+    int      existing_fd;   /* fd to mmap. BORROWED: owned by the caller, never
+                               closed here and never handed to a deallocator */
     uint64_t existing_stride;
     uint64_t existing_size;
 
     /* Filled by the swizzle on capture. */
     bool     captured;
-    int      out_fd;
+    int      out_fd;        /* the fd backing the substitution. Producer: newly
+                               created, and OWNED by the substituted resource's
+                               MTLBuffer deallocator — the caller must dup it to
+                               keep it. Consumer: existing_fd echoed back, still
+                               owned by the caller. */
     uint64_t out_stride;
     uint64_t out_size;
 };
