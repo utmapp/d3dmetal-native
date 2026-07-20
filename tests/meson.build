@@ -98,6 +98,16 @@ shared_texture_test = executable('shared-texture-test',
   link_with: dmn_lib)
 test('shared-texture', shared_texture_test, env: ['DMN_LOG=info'], timeout: 300)
 
+# Windowless, no pixels: MISC_SHARED create/open contract — unshareable
+# formats fail the create instead of silently unsharing, imports validate the
+# wire geometry they are handed, and a rejected import reports its own failure
+# rather than falling through to D3DMetal as "not one of our handles".
+shared_contract_test = executable('shared-contract-test',
+  'shared_contract_test.cpp',
+  include_directories: test_native_inc,
+  link_with: dmn_lib)
+test('shared-contract', shared_contract_test, env: ['DMN_LOG=info'], timeout: 300)
+
 # Regression: shader-sampling a MISC_SHARED texture's SRV (glyph-box bug).
 shared_srv_sample_test = executable('shared-srv-sample-test',
   'shared_srv_sample_test.cpp',

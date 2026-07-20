@@ -681,6 +681,24 @@ HRESULT return_fence_pod(IUnknown* fenceObj, HANDLE* out) {
     return hr;
 }
 
+/* A shared create that did not route through the Metal swizzle produced an
+ * ordinary, process-private resource. Returning it with a success HRESULT
+ * hands the app a valid-looking handle whose peer can never see anything, and
+ * the mistake surfaces much later as a blank surface with no failing call to
+ * point at. Fail the create instead and drop the resource nobody may use.
+ *
+ * `out` is optional throughout D3D: a create with a null out-pointer is a
+ * parameter-validation call that allocates nothing, so callers must only reach
+ * here when a resource was actually produced. */
+HRESULT fail_unshared(const char* what, void** out) {
+    DMN_ERROR("hooks: %s did not route through the Metal swizzle", what);
+    if (out && *out) {
+        reinterpret_cast<IUnknown*>(*out)->Release();
+        *out = nullptr;
+    }
+    return E_FAIL;
+}
+
 /* == Import (consumer reconstruction) ===================================== */
 HRESULT import_texture_d3d11(ID3D11Device* dev, const dmn_shared_texture_handle* pod,
                              REFIID iid, void** out) {
@@ -708,7 +726,8 @@ HRESULT import_texture_d3d11(ID3D11Device* dev, const dmn_shared_texture_handle*
         return FAILED(hr) ? hr : E_FAIL;
     }
     if (!captured)
-        DMN_WARN("hooks: D3D11 texture import did not route through the swizzle");
+        return fail_unshared("D3D11 texture import",
+                             reinterpret_cast<void**>(&tex));
     /* Register the imported view so re-export (GetSharedHandle on an opened
      * resource — valid on Windows) and keyed-mutex QI work here too. */
     record_texture_pod(tex, *pod, /*init_kmtx=*/false);
@@ -737,7 +756,8 @@ HRESULT import_buffer_d3d11(ID3D11Device* dev, const dmn_shared_buffer_handle* p
         return FAILED(hr) ? hr : E_FAIL;
     }
     if (!captured)
-        DMN_WARN("hooks: D3D11 buffer import did not route through the swizzle");
+        return fail_unshared("D3D11 buffer import",
+                             reinterpret_cast<void**>(&buf));
     register_buffer_pod(buf, *pod);
     hr = buf->QueryInterface(iid, out);
     buf->Release();
@@ -766,8 +786,8 @@ HRESULT import_texture_d3d12(ID3D12Device* dev, const dmn_shared_texture_handle*
                                               nullptr, riid, out);
     DmnShareArm arm{};
     bool captured = dmn_share_disarm(&arm);
-    if (!captured)
-        DMN_WARN("hooks: D3D12 import did not route through the Metal swizzle");
+    if (SUCCEEDED(hr) && out && *out && !captured)
+        return fail_unshared("D3D12 texture import", out);
     if (SUCCEEDED(hr) && out && *out) {
         /* Register for re-export via ID3D12Device::CreateSharedHandle. */
         auto* res = reinterpret_cast<IUnknown*>(*out);
@@ -805,23 +825,36 @@ HRESULT import_buffer_d3d12(ID3D12Device* dev, const dmn_shared_buffer_handle* p
                                               nullptr, riid, out);
     DmnShareArm arm{};
     bool captured = dmn_share_disarm(&arm);
-    if (!captured)
-        DMN_WARN("hooks: D3D12 buffer import did not route through the swizzle");
+    if (SUCCEEDED(hr) && out && *out && !captured)
+        return fail_unshared("D3D12 buffer import", out);
     if (SUCCEEDED(hr) && out && *out)
         register_buffer_pod(reinterpret_cast<IUnknown*>(*out), *pod);
     return hr;
 }
 
-/* Shared import dispatch for the D3D11 OpenSharedResource variants. */
-HRESULT open_shared_d3d11(ID3D11Device* dev, HANDLE handle, REFIID iid, void** out) {
+/* Shared import dispatch for the D3D11 OpenSharedResource variants.
+ *
+ * Returns false when `handle` is not one of ours, which is the caller's cue to
+ * fall through to D3DMetal. Otherwise *out_hr holds the import's own result —
+ * including a failure, which must be reported as-is. The two cases have to
+ * stay distinguishable: falling through on a failed import would hand D3DMetal
+ * a pointer that is not a Windows HANDLE at all, and would turn a precise
+ * "this handle's geometry is invalid" into whatever D3DMetal says about a
+ * handle it cannot parse. */
+bool open_shared_d3d11(ID3D11Device* dev, HANDLE handle, REFIID iid, void** out,
+                       HRESULT* out_hr) {
     uint32_t magic = *reinterpret_cast<uint32_t*>(handle);
-    if (magic == DMN_SHARED_BUFFER_MAGIC)
-        return import_buffer_d3d11(
+    if (magic == DMN_SHARED_BUFFER_MAGIC) {
+        *out_hr = import_buffer_d3d11(
             dev, reinterpret_cast<dmn_shared_buffer_handle*>(handle), iid, out);
-    if (magic == DMN_SHARED_TEXTURE_MAGIC)
-        return import_texture_d3d11(
+        return true;
+    }
+    if (magic == DMN_SHARED_TEXTURE_MAGIC) {
+        *out_hr = import_texture_d3d11(
             dev, reinterpret_cast<dmn_shared_texture_handle*>(handle), iid, out);
-    return E_FAIL; /* not ours; caller falls back to orig */
+        return true;
+    }
+    return false;
 }
 
 /* == D3D11 producer thunks ================================================= */
@@ -842,8 +875,14 @@ HRESULT STDMETHODCALLTYPE hook_d3d11_CreateTexture2D(
     HRESULT hr = orig(This, desc, init, out);
     DmnShareArm arm{};
     bool captured = dmn_share_disarm(&arm);
-    if (SUCCEEDED(hr) && captured && out && *out)
-        record_texture(*out, *desc, arm);
+    /* A null `out` is a parameter-validation call: nothing was allocated, so
+     * there is nothing to have shared and nothing to fail. */
+    if (FAILED(hr) || !out || !*out)
+        return hr;
+    if (!captured)
+        return fail_unshared("CreateTexture2D MISC_SHARED",
+                             reinterpret_cast<void**>(out));
+    record_texture(*out, *desc, arm);
     return hr;
 }
 
@@ -862,16 +901,19 @@ HRESULT STDMETHODCALLTYPE hook_d3d11_CreateTexture2D1(
     HRESULT hr = orig(This, desc, init, out);
     DmnShareArm arm{};
     bool captured = dmn_share_disarm(&arm);
-    if (SUCCEEDED(hr) && captured && out && *out) {
-        /* Flatten DESC1 -> DESC for the POD (drops only TextureLayout). */
-        D3D11_TEXTURE2D_DESC d{};
-        d.Width = desc->Width; d.Height = desc->Height;
-        d.MipLevels = desc->MipLevels; d.ArraySize = desc->ArraySize;
-        d.Format = desc->Format; d.SampleDesc = desc->SampleDesc;
-        d.Usage = desc->Usage; d.BindFlags = desc->BindFlags;
-        d.CPUAccessFlags = desc->CPUAccessFlags; d.MiscFlags = desc->MiscFlags;
-        record_texture(*out, d, arm);
-    }
+    if (FAILED(hr) || !out || !*out)
+        return hr;
+    if (!captured)
+        return fail_unshared("CreateTexture2D1 MISC_SHARED",
+                             reinterpret_cast<void**>(out));
+    /* Flatten DESC1 -> DESC for the POD (drops only TextureLayout). */
+    D3D11_TEXTURE2D_DESC d{};
+    d.Width = desc->Width; d.Height = desc->Height;
+    d.MipLevels = desc->MipLevels; d.ArraySize = desc->ArraySize;
+    d.Format = desc->Format; d.SampleDesc = desc->SampleDesc;
+    d.Usage = desc->Usage; d.BindFlags = desc->BindFlags;
+    d.CPUAccessFlags = desc->CPUAccessFlags; d.MiscFlags = desc->MiscFlags;
+    record_texture(*out, d, arm);
     return hr;
 }
 
@@ -915,9 +957,13 @@ HRESULT STDMETHODCALLTYPE hook_d3d11_CreateBuffer(
     HRESULT hr = orig(This, desc, init, out);
     DmnShareArm arm{};
     bool captured = dmn_share_disarm(&arm);
-    if (SUCCEEDED(hr) && captured && out && *out)
-        record_buffer(reinterpret_cast<IUnknown*>(*out), desc->ByteWidth,
-                      desc->BindFlags, desc->MiscFlags, desc->CPUAccessFlags, arm);
+    if (FAILED(hr) || !out || !*out)
+        return hr;
+    if (!captured)
+        return fail_unshared("CreateBuffer MISC_SHARED",
+                             reinterpret_cast<void**>(out));
+    record_buffer(reinterpret_cast<IUnknown*>(*out), desc->ByteWidth,
+                  desc->BindFlags, desc->MiscFlags, desc->CPUAccessFlags, arm);
     return hr;
 }
 
@@ -979,8 +1025,8 @@ HRESULT STDMETHODCALLTYPE hook_d3d11_CheckFeatureSupport(
 HRESULT STDMETHODCALLTYPE hook_d3d11_OpenSharedResource(
         ID3D11Device* This, HANDLE handle, REFIID iid, void** out) {
     if (handle && out) {
-        HRESULT hr = open_shared_d3d11(This, handle, iid, out);
-        if (hr != E_FAIL)
+        HRESULT hr = E_FAIL;
+        if (open_shared_d3d11(This, handle, iid, out, &hr))
             return hr;
     }
     auto orig = DMN_ORIG(d3d11_OpenSharedResource, This);
@@ -990,9 +1036,9 @@ HRESULT STDMETHODCALLTYPE hook_d3d11_OpenSharedResource(
 HRESULT STDMETHODCALLTYPE hook_d3d11_OpenSharedResource1(
         ID3D11Device1* This, HANDLE handle, REFIID iid, void** out) {
     if (handle && out) {
-        HRESULT hr = open_shared_d3d11(reinterpret_cast<ID3D11Device*>(This),
-                                       handle, iid, out);
-        if (hr != E_FAIL)
+        HRESULT hr = E_FAIL;
+        if (open_shared_d3d11(reinterpret_cast<ID3D11Device*>(This), handle, iid,
+                              out, &hr))
             return hr;
     }
     auto orig = DMN_ORIG(d3d11_OpenSharedResource1, This);
@@ -1162,9 +1208,12 @@ HRESULT d12_create_shared(const DescT* desc, void** out, OrigCall&& call) {
         HRESULT hr = call();
         DmnShareArm arm{};
         bool captured = dmn_share_disarm(&arm);
-        if (SUCCEEDED(hr) && captured && out && *out)
-            record_buffer(reinterpret_cast<IUnknown*>(*out), desc->Width,
-                          0, 0, 0, arm);
+        if (FAILED(hr) || !out || !*out)
+            return hr;
+        if (!captured)
+            return fail_unshared("D3D12 SHARED buffer create", out);
+        record_buffer(reinterpret_cast<IUnknown*>(*out), desc->Width,
+                      0, 0, 0, arm);
         return hr;
     }
     if (desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
@@ -1174,17 +1223,19 @@ HRESULT d12_create_shared(const DescT* desc, void** out, OrigCall&& call) {
         HRESULT hr = call();
         DmnShareArm arm{};
         bool captured = dmn_share_disarm(&arm);
-        if (SUCCEEDED(hr) && captured && out && *out) {
-            /* Flatten the D3D12 desc into the POD's D3D11 shape. */
-            D3D11_TEXTURE2D_DESC d{};
-            d.Width = (UINT)desc->Width;
-            d.Height = desc->Height;
-            d.MipLevels = desc->MipLevels ? desc->MipLevels : 1;
-            d.ArraySize = desc->DepthOrArraySize ? desc->DepthOrArraySize : 1;
-            d.Format = desc->Format;
-            d.SampleDesc.Count = desc->SampleDesc.Count ? desc->SampleDesc.Count : 1;
-            record_texture(reinterpret_cast<IUnknown*>(*out), d, arm);
-        }
+        if (FAILED(hr) || !out || !*out)
+            return hr;
+        if (!captured)
+            return fail_unshared("D3D12 SHARED texture create", out);
+        /* Flatten the D3D12 desc into the POD's D3D11 shape. */
+        D3D11_TEXTURE2D_DESC d{};
+        d.Width = (UINT)desc->Width;
+        d.Height = desc->Height;
+        d.MipLevels = desc->MipLevels ? desc->MipLevels : 1;
+        d.ArraySize = desc->DepthOrArraySize ? desc->DepthOrArraySize : 1;
+        d.Format = desc->Format;
+        d.SampleDesc.Count = desc->SampleDesc.Count ? desc->SampleDesc.Count : 1;
+        record_texture(reinterpret_cast<IUnknown*>(*out), d, arm);
         return hr;
     }
     DMN_WARN("hooks: D3D12 SHARED create with unsupported dimension %d passes "
