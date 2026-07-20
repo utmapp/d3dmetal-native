@@ -755,9 +755,93 @@ bool describe(uint32_t dxgi, DmnFormatDesc& out) {
     return true;
 }
 
+/* == Linear (buffer-backed) element size ================================== */
+/* Deliberately a switch and not a table build: this is the stride oracle for
+ * cross-process shared surfaces, so it must answer before any device exists,
+ * cannot depend on GPU family, and must fail closed on anything it has not
+ * been taught. Every colour format the capability table above knows is listed;
+ * the omissions are the ones with no linear element size — block-compressed
+ * (4x4 blocks), depth/stencil (opaque, tiled-only), and the 4:2:2 pair (two
+ * pixels per element). */
+uint32_t linear_bpp(MTLPixelFormat f) {
+    switch (f) {
+    case MTLPixelFormatA8Unorm:
+    case MTLPixelFormatR8Unorm:
+    case MTLPixelFormatR8Unorm_sRGB:
+    case MTLPixelFormatR8Snorm:
+    case MTLPixelFormatR8Uint:
+    case MTLPixelFormatR8Sint:
+        return 1;
+
+    case MTLPixelFormatR16Unorm:
+    case MTLPixelFormatR16Snorm:
+    case MTLPixelFormatR16Uint:
+    case MTLPixelFormatR16Sint:
+    case MTLPixelFormatR16Float:
+    case MTLPixelFormatRG8Unorm:
+    case MTLPixelFormatRG8Unorm_sRGB:
+    case MTLPixelFormatRG8Snorm:
+    case MTLPixelFormatRG8Uint:
+    case MTLPixelFormatRG8Sint:
+    case MTLPixelFormatB5G6R5Unorm:
+    case MTLPixelFormatA1BGR5Unorm:
+    case MTLPixelFormatABGR4Unorm:
+    case MTLPixelFormatBGR5A1Unorm:
+        return 2;
+
+    case MTLPixelFormatR32Uint:
+    case MTLPixelFormatR32Sint:
+    case MTLPixelFormatR32Float:
+    case MTLPixelFormatRG16Unorm:
+    case MTLPixelFormatRG16Snorm:
+    case MTLPixelFormatRG16Uint:
+    case MTLPixelFormatRG16Sint:
+    case MTLPixelFormatRG16Float:
+    case MTLPixelFormatRGBA8Unorm:
+    case MTLPixelFormatRGBA8Unorm_sRGB:
+    case MTLPixelFormatRGBA8Snorm:
+    case MTLPixelFormatRGBA8Uint:
+    case MTLPixelFormatRGBA8Sint:
+    case MTLPixelFormatBGRA8Unorm:
+    case MTLPixelFormatBGRA8Unorm_sRGB:
+    case MTLPixelFormatRGB10A2Unorm:
+    case MTLPixelFormatBGR10A2Unorm:
+    case MTLPixelFormatRGB10A2Uint:
+    case MTLPixelFormatRG11B10Float:
+    case MTLPixelFormatRGB9E5Float:
+    case MTLPixelFormatBGR10_XR:
+    case MTLPixelFormatBGR10_XR_sRGB:
+        return 4;
+
+    case MTLPixelFormatRG32Uint:
+    case MTLPixelFormatRG32Sint:
+    case MTLPixelFormatRG32Float:
+    case MTLPixelFormatRGBA16Unorm:
+    case MTLPixelFormatRGBA16Snorm:
+    case MTLPixelFormatRGBA16Uint:
+    case MTLPixelFormatRGBA16Sint:
+    case MTLPixelFormatRGBA16Float:
+    case MTLPixelFormatBGRA10_XR:
+    case MTLPixelFormatBGRA10_XR_sRGB:
+        return 8;
+
+    case MTLPixelFormatRGBA32Uint:
+    case MTLPixelFormatRGBA32Sint:
+    case MTLPixelFormatRGBA32Float:
+        return 16;
+
+    default:
+        return 0;
+    }
+}
+
 } /* namespace */
 
 /* == Public queries ======================================================= */
+
+uint32_t dmn_format_linear_bpp(uint32_t mtl_pixel_format) {
+    return linear_bpp((MTLPixelFormat)mtl_pixel_format);
+}
 
 bool dmn_format_support(uint32_t dxgi_format, uint32_t* out_support) {
     /* UNKNOWN is legal and means "structured/raw buffer": no texture caps. */

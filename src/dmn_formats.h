@@ -82,3 +82,20 @@ bool dmn_format_support(uint32_t dxgi_format, uint32_t* out_support);
 /* Same contract for the D3D11_FORMAT_SUPPORT2 mask (typed-UAV load/store,
  * UAV atomics, tiled). */
 bool dmn_format_support2(uint32_t dxgi_format, uint32_t* out_support2);
+
+/* Bytes per pixel of an MTLPixelFormat laid out linearly (row-major, one
+ * element per pixel) — the stride oracle for buffer-backed shared textures.
+ *
+ * Returns 0 for every format that has no such layout: block-compressed, depth,
+ * stencil, the packed 4:2:2 pair, MTLPixelFormatInvalid, and anything absent
+ * from the table. Callers MUST treat 0 as "this format cannot be shared" and
+ * fail, never as a reason to substitute a guess — this value is the sole
+ * authority for the stride that two processes have to agree on byte for byte,
+ * and a wrong one silently overlaps or spreads rows rather than erroring.
+ * Refusing 0 also keeps callers away from
+ * -[MTLDevice minimumLinearTextureAlignmentForPixelFormat:], which throws for
+ * exactly the depth/stencil/compressed formats this returns 0 for.
+ *
+ * Takes a uint32_t rather than MTLPixelFormat to keep Metal types out of this
+ * header, matching the rest of the facade. */
+uint32_t dmn_format_linear_bpp(uint32_t mtl_pixel_format);
