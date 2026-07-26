@@ -21,7 +21,9 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/mman.h>
+#include <sys/posix_shm.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -44,13 +46,42 @@ static_assert(sizeof(DmnShareFencePOD) == sizeof(dmn_shared_fence_handle),
 
 namespace {
 
+/* An app group prefix must leave room for "/", a slot digit and one nonce
+ * digit within PSHMNAMLEN. */
+constexpr size_t kAppSandboxGroupIdMax = PSHMNAMLEN - 3;
+
 /* == Anonymous shared file: shm_open a random name, unlink immediately ==== */
 int dmn_anon_file(off_t size) {
-    const unsigned nonce = arc4random();
+    /* Under App Sandbox a shm name must live in the app group container, i.e.
+     * be prefixed with the group identifier instead of '/'; anything else is
+     * denied. The PSHMNAMLEN budget then leaves no room for our tag or the
+     * pid, so the name is just a slot digit plus as much of the nonce as
+     * fits. */
+    const char* group = getenv("APP_SANDBOX_GROUP_ID");
+    if (group && !group[0])
+        group = nullptr;
+    if (group && strlen(group) > kAppSandboxGroupIdMax) {
+        DMN_ERROR("share: APP_SANDBOX_GROUP_ID is %zu chars, at most %zu fit",
+                  strlen(group), kAppSandboxGroupIdMax);
+        errno = EINVAL;
+        return -1;
+    }
+
+    const size_t nonce_room = group ? PSHMNAMLEN - strlen(group) - 2 : 8;
+    const unsigned nonce_digits = (unsigned)(nonce_room < 8 ? nonce_room : 8);
+    const unsigned nonce = arc4random() >> (32 - 4 * nonce_digits);
     int fd = -1;
     for (unsigned i = 0; i < 32; i++) {
         char name[64];
-        snprintf(name, sizeof(name), "/dmn-shm-%d-%x-%x", getpid(), nonce, i);
+        if (group) {
+            /* the slot must stay a single hex digit to fit the name budget */
+            if (i > 0xf)
+                break;
+            snprintf(name, sizeof(name), "%s/%x%x", group, i, nonce);
+        } else {
+            snprintf(name, sizeof(name), "/dmn-shm-%d-%x-%x", getpid(), nonce,
+                     i);
+        }
         fd = shm_open(name, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0600);
         if (fd >= 0) {
             shm_unlink(name); /* anonymous from here on */
