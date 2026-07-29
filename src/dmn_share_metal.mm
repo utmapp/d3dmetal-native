@@ -148,8 +148,9 @@ struct LinearLayout {
 /* Shared backing is reclaimed when the MTLBuffer dies: the deallocator block
  * munmaps the mapping and closes the fd we own (producer side; a consumer's fd
  * belongs to the app, so only the mapping goes). Metal copies the block, so
- * cleanup runs whenever D3DMetal drops its last reference — after any in-flight
- * command buffers, since those retain the buffer. */
+ * cleanup runs whenever the last reference goes. In-flight command buffers are
+ * NOT among those references — D3DMetal's are unretained — so a buffer still
+ * referencing this one is kept alive by sub_resources_make_resident() instead. */
 id<MTLBuffer> shared_buffer_over(id<MTLDevice> device, void* ptr, size_t aligned,
                                  int owned_fd) {
     return [device newBufferWithBytesNoCopy:ptr
@@ -959,8 +960,22 @@ MTLResourceUsage sub_resource_usage(id res) {
              : (MTLResourceUsageRead | MTLResourceUsageWrite);
 }
 
-/* Snapshot under the lock, useResource: outside it. */
-void sub_resources_make_resident(id enc, bool compute) {
+/* Snapshot under the lock, useResource: outside it, and hold the snapshot until
+ * `cb` completes rather than until this returns.
+ *
+ * Residency and lifetime must have the same scope here. g_sub_resources is weak
+ * and D3DMetal's command buffers come from commandBufferWithUnretainedReferences,
+ * so nothing else keeps an impostor alive between encode and execution — and
+ * useResource: has already promised the GPU it will be there. An impostor freed
+ * inside that window (the guest destroying an imported surface) aborts the buffer
+ * with kIOGPUCommandBufferCallbackErrorInvalidResource, which kills the whole
+ * MTLCommandQueue: every later submission on it fails, so its fences never
+ * complete and that process renders nothing again.
+ *
+ * Pinning the entire tracked set rather than the subset a buffer touches is
+ * deliberate — useResource: declares the entire set, so that is the promise being
+ * backed. It adds no allocation, since allObjects already copies per encoder. */
+void sub_resources_make_resident(id<MTLCommandBuffer> cb, id enc, bool compute) {
     NSArray* snapshot = nil;
     {
         std::lock_guard<std::mutex> lk(g_sub_lock);
@@ -979,7 +994,13 @@ void sub_resources_make_resident(id enc, bool compute) {
                      stages:MTLRenderStageVertex | MTLRenderStageFragment];
         }
     }
-    [snapshot release];
+    /* Encoders are created before commit, so a completion handler is always
+     * still accepted here; it runs on error paths too, so the pin cannot leak
+     * on an aborted buffer. */
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> unused) {
+        (void)unused;
+        [snapshot release];
+    }];
 }
 
 id swz_cb_cceD(id self, SEL _cmd, id desc) {
@@ -988,7 +1009,7 @@ id swz_cb_cceD(id self, SEL _cmd, id desc) {
         return nil;
     id enc = ((id (*)(id, SEL, id))orig)(self, _cmd, desc);
     if (enc)
-        sub_resources_make_resident(enc, true);
+        sub_resources_make_resident(self, enc, true);
     return enc;
 }
 
@@ -998,7 +1019,7 @@ id swz_cb_rce(id self, SEL _cmd, MTLRenderPassDescriptor* desc) {
         return nil;
     id enc = ((id (*)(id, SEL, MTLRenderPassDescriptor*))orig)(self, _cmd, desc);
     if (enc)
-        sub_resources_make_resident(enc, false);
+        sub_resources_make_resident(self, enc, false);
     return enc;
 }
 
@@ -1008,7 +1029,7 @@ id swz_cb_cce(id self, SEL _cmd) {
         return nil;
     id enc = ((id (*)(id, SEL))orig)(self, _cmd);
     if (enc)
-        sub_resources_make_resident(enc, true);
+        sub_resources_make_resident(self, enc, true);
     return enc;
 }
 
@@ -1018,7 +1039,7 @@ id swz_cb_cced(id self, SEL _cmd, NSUInteger dispatchType) {
         return nil;
     id enc = ((id (*)(id, SEL, NSUInteger))orig)(self, _cmd, dispatchType);
     if (enc)
-        sub_resources_make_resident(enc, true);
+        sub_resources_make_resident(self, enc, true);
     return enc;
 }
 
