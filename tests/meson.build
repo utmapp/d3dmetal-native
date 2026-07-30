@@ -1,3 +1,8 @@
+# Several tests run a second process (a forked/exec'd peer, or the churn
+# control child) and drive the GPU hard from both. Under meson's default
+# parallelism that multiplies the number of concurrent D3D devices until they
+# miss their timeouts, so those are marked is_parallel: false.
+
 test_native_inc = include_directories(
   '../include',
   '../include/native/windows',
@@ -84,6 +89,7 @@ shared_compute_triangle = executable('shared-compute-triangle',
 # Headless self-check of the data path (no window/present); run without
 # DMN_HEADLESS for the on-screen demo.
 test('shared-compute-triangle', shared_compute_triangle,
+     is_parallel: false,
      env: ['DMN_LOG=warn', 'DMN_HEADLESS=1', 'DMN_INTERVAL_MS=80', 'DMN_FRAMES=400'],
      timeout: 300)
 
@@ -114,7 +120,8 @@ shared_texture_test = executable('shared-texture-test',
   'shared_texture_test.cpp',
   include_directories: test_native_inc,
   link_with: dmn_lib)
-test('shared-texture', shared_texture_test, env: ['DMN_LOG=info'], timeout: 300)
+test('shared-texture', shared_texture_test, env: ['DMN_LOG=info'],
+     is_parallel: false, timeout: 300)
 
 # Windowless, no pixels: MISC_SHARED create/open contract — unshareable
 # formats fail the create instead of silently unsharing, imports validate the
@@ -159,9 +166,9 @@ fence_xapi = executable('fence-xapi-test',
   include_directories: test_native_inc,
   link_with: dmn_lib)
 test('fence-xapi-d11d12', fence_xapi, args: ['d11d12'],
-     env: ['DMN_LOG=info'], timeout: 300)
+     env: ['DMN_LOG=info'], is_parallel: false, timeout: 300)
 test('fence-xapi-d12d11', fence_xapi, args: ['d12d11'],
-     env: ['DMN_LOG=info'], timeout: 300)
+     env: ['DMN_LOG=info'], is_parallel: false, timeout: 300)
 
 # Regression: a fence must outlive its own signal. Signal-then-drop without
 # flushing, repeatedly, then confirm the queue still retires work — destroying a
@@ -181,7 +188,8 @@ fence_gpuwait = executable('fence-gpuwait-test',
   'fence_gpuwait_test.cpp',
   include_directories: test_native_inc,
   link_with: dmn_lib)
-test('fence-gpuwait', fence_gpuwait, env: ['DMN_LOG=info'], timeout: 300)
+test('fence-gpuwait', fence_gpuwait, env: ['DMN_LOG=info'],
+     is_parallel: false, timeout: 300)
 
 # Cross-process keyed mutex over a shared texture: forked producer/consumer
 # hand the lock back and forth by key to serialize a shared counter.
@@ -189,7 +197,8 @@ keyed_mutex = executable('keyed-mutex-test',
   'keyed_mutex_test.cpp',
   include_directories: test_native_inc,
   link_with: dmn_lib)
-test('keyed-mutex', keyed_mutex, env: ['DMN_LOG=info'], timeout: 300)
+test('keyed-mutex', keyed_mutex, env: ['DMN_LOG=info'],
+     is_parallel: false, timeout: 300)
 
 # Windowless: create -> open -> release-creator -> re-export (both APIs);
 # the opened resource's registration must own its own fd (MSDN handle rule).
@@ -205,7 +214,8 @@ lifecycle_churn = executable('lifecycle-churn-test',
   'lifecycle_churn_test.cpp',
   include_directories: test_native_inc,
   link_with: dmn_lib)
-test('lifecycle-churn', lifecycle_churn, env: ['DMN_LOG=warn'], timeout: 600)
+test('lifecycle-churn', lifecycle_churn, env: ['DMN_LOG=warn'],
+     is_parallel: false, timeout: 600)
 
 # Multi-threaded stress: concurrent device creation (races the vtable
 # patching) and same-device shared create/export/open churn from N threads
@@ -214,7 +224,8 @@ mt_stress = executable('mt-stress-test',
   'mt_stress_test.cpp',
   include_directories: test_native_inc,
   link_with: dmn_lib)
-test('mt-stress', mt_stress, env: ['DMN_LOG=warn'], timeout: 600)
+test('mt-stress', mt_stress, env: ['DMN_LOG=warn'],
+     is_parallel: false, timeout: 600)
 
 # Windowless, no init: public event API semantics — manual/auto reset,
 # initial state, wake-one auto-reset, and the pollable dup_fd view.
