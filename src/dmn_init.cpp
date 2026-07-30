@@ -245,6 +245,19 @@ extern "C" const char* dmn_framework_path(void) {
     return g_framework_binary.empty() ? nullptr : g_framework_binary.c_str();
 }
 
+extern "C" bool dmn_framework_has_entry_point(const char* name) {
+    if (!name || !*name || dmn_init(nullptr) != DMN_SUCCESS)
+        return false;
+    /* The image is already loaded, so this re-dlopen only bumps its reference
+     * count and hands back the same handle to look the symbol up in. */
+    void* handle = dlopen(g_framework_binary.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (!handle)
+        return false;
+    bool present = dlsym(handle, name) != nullptr;
+    dlclose(handle);
+    return present;
+}
+
 dmn_result dmn_ensure_init() {
     return dmn_init(nullptr);
 }

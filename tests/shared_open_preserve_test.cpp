@@ -45,6 +45,7 @@
 
 #define T_TAG "OPENPRES"
 #include "common/check.h"
+#include "common/skip.h"
 
 namespace {
 
@@ -133,6 +134,9 @@ int run() {
         fprintf(stderr, T_TAG ": dmn_init FAILED\n");
         return 1;
     }
+    /* The regression this covers is about what a render pass does to an opened
+     * shared surface, which needs shaders to draw with. */
+    T_SKIP_WITHOUT("D3DCompile");
 
     Com<ID3D11Device> dev;
     Com<ID3D11DeviceContext> ctx;

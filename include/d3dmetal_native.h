@@ -105,6 +105,14 @@ bool dmn_is_initialized(void);
 /* Resolved absolute path of the loaded framework binary; NULL before init. */
 const char* dmn_framework_path(void);
 
+/* Whether the loaded D3DMetal exports `name`. The Game Porting Toolkit
+ * releases differ in what they ship — 2.1 and earlier have no D3DCompile at
+ * all, for instance — so a caller that can fall back (bring its own shader
+ * compiler, take a different path) can ask instead of discovering it from a
+ * failing call. Initializes the library if it is not up yet; false when
+ * initialization fails or the symbol is absent. */
+bool dmn_framework_has_entry_point(const char* name);
+
 /* == Windows / pseudo-HWNDs ============================================== */
 
 typedef struct dmn_window* dmn_window_t;

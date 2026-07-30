@@ -31,6 +31,8 @@
 #include <windows.h>
 
 #include "d3dmetal_native.h"
+#define T_TAG "XFENCE"
+#include "common/skip.h"
 #include "common/com.h"
 #include "common/ipc.h"
 #include "common/util.h"
@@ -69,8 +71,9 @@ int producer_d11(int sock) {
         FAILED(ctx->QueryInterface(__uuidof(ID3D11DeviceContext4), (void**)&ctx4)) ||
         FAILED(dev5->CreateFence(0, D3D11_FENCE_FLAG_SHARED, __uuidof(ID3D11Fence),
                                  (void**)&fence))) {
+        /* GPTk 2.1 and earlier have no D3D11 fences at all. */
         fprintf(stderr, "XFENCE: prod CreateFence(SHARED) unavailable\n");
-        return 1;
+        return T_SKIP_CODE;
     }
     HANDLE h = nullptr;
     if (FAILED(fence->CreateSharedHandle(nullptr, 0, nullptr, &h)) || !h) {
@@ -163,7 +166,8 @@ int consume(int sock, const char* who, OpenFn open) {
     HRESULT hr = open(&pod, fence);
     if (FAILED(hr) || !fence) {
         fprintf(stderr, "XFENCE: %s open fence FAILED 0x%08x\n", who, (unsigned)hr);
-        return 1;
+        /* The D3D11 import needs ID3D11Device5::CreateFence under the hood. */
+        return t_unimplemented(hr) ? T_SKIP_CODE : 1;
     }
     printf("XFENCE: %s opened fence (fd=%d)\n", who, pod.fd);
 

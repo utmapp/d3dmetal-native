@@ -38,6 +38,7 @@
 
 #define T_TAG "FEVENTS"
 #include "common/check.h"
+#include "common/skip.h"
 #include "common/dx11.h"
 #include "common/dx12.h"
 
@@ -65,6 +66,8 @@ int main() {
        "OpenSharedHandle");
 
     uint64_t v = 0;
+    /* Cleared when this D3DMetal has no multi-fence wait (see step 3). */
+    bool have_multi_wait = true;
 
     /* 1) Event waits released by the producer's GPU signal. */
     {
@@ -115,9 +118,18 @@ int main() {
             /* ALL: must hold until BOTH are signaled. */
             void* evAll = dmn_event_create(0, 0);
             EXPECT(evAll, "event create failed");
-            CK(dev1->SetEventOnMultipleFenceCompletion(
-                   fences, values, 2, D3D12_MULTIPLE_FENCE_WAIT_FLAG_ALL, evAll),
-               "SetEventOnMultipleFenceCompletion(ALL)");
+            HRESULT mhr = dev1->SetEventOnMultipleFenceCompletion(
+                fences, values, 2, D3D12_MULTIPLE_FENCE_WAIT_FLAG_ALL, evAll);
+            /* GPTk 2.1 and earlier do not implement it; the steps that need one
+             * stand down (the rest of the fence-event contract still holds). */
+            if (t_unimplemented(mhr)) {
+                printf("FEVENTS: SetEventOnMultipleFenceCompletion is not "
+                       "implemented by this D3DMetal; multi-wait skipped\n");
+                dmn_event_close(evAll);
+                have_multi_wait = false;
+                goto after_multi;
+            }
+            CK(mhr, "SetEventOnMultipleFenceCompletion(ALL)");
             CK(queue->Signal(prod.ptr(), vImp), "queue Signal(shared)");
             v = vImp;
             EXPECT(dmn_event_wait(evAll, 200ull * 1000 * 1000) == DMN_WAIT_TIMEOUT,
@@ -143,8 +155,10 @@ int main() {
                    (unsigned long long)v);
         } else {
             printf("FEVENTS: ID3D12Device1 unavailable; multi-wait skipped\n");
+            have_multi_wait = false;
         }
     }
+after_multi:
 
     /* 4) Cross-API in-process: same POD opened as an ID3D11Fence. */
     {
@@ -154,6 +168,19 @@ int main() {
         Com<ID3D11Device5> d115;
         CK(d11->QueryInterface(__uuidof(ID3D11Device5), (void**)&d115),
            "ID3D11Device5");
+        /* An import is a real fence created on the opening device, so ask that
+         * device for one first: absent before GPTk 3.0, and asking directly
+         * keeps the import machinery out of a path it cannot complete. */
+        {
+            Com<ID3D11Fence> probe;
+            if (t_unimplemented(d115->CreateFence(0, D3D11_FENCE_FLAG_NONE,
+                                                  __uuidof(ID3D11Fence),
+                                                  (void**)&probe))) {
+                printf("FEVENTS: D3D11 fences are not implemented by this "
+                       "D3DMetal; cross-API import skipped\n");
+                goto after_xapi;
+            }
+        }
         Com<ID3D11Fence> imp11;
         CK(d115->OpenSharedFence(h, __uuidof(ID3D11Fence), (void**)&imp11),
            "OpenSharedFence");
@@ -170,6 +197,7 @@ int main() {
         printf("FEVENTS: cross-API import event ok (value %llu)\n",
                (unsigned long long)v);
     }
+after_xapi:
 
     /* 5) Pollable event fd released by D3DMetal's SetEvent on completion.
      *    Manual-reset, so the fd stays readable regardless of who looks
@@ -203,7 +231,8 @@ int main() {
      *    event across DuplicateEvent. Manual-reset so the fd latches. */
     {
         Com<ID3D12Device1> dev1;
-        if (SUCCEEDED(dev->QueryInterface(__uuidof(ID3D12Device1),
+        if (have_multi_wait &&
+            SUCCEEDED(dev->QueryInterface(__uuidof(ID3D12Device1),
                                           (void**)&dev1)) && dev1) {
             Com<ID3D12Fence> mf;
             CK(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence),

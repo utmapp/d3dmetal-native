@@ -20,6 +20,7 @@
 
 #define T_TAG "VARIANTS"
 #include "common/check.h"
+#include "common/skip.h"
 #include "common/dx11.h"
 
 int main() {
@@ -52,7 +53,9 @@ int main() {
     td.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
     td.TextureLayout = D3D11_TEXTURE_LAYOUT_UNDEFINED;
     Com<ID3D11Texture2D1> tex;
-    CK(dev3->CreateTexture2D1(&td, nullptr, &tex), "CreateTexture2D1(SHARED)");
+    /* GPTk 2.1 and earlier do not implement the ...1 create variants. */
+    T_SKIP_IF_UNIMPL(dev3->CreateTexture2D1(&td, nullptr, &tex),
+                     "ID3D11Device3::CreateTexture2D1");
 
     Com<IDXGIResource> res;
     HANDLE h = nullptr;

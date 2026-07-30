@@ -36,6 +36,7 @@
 
 #define T_TAG "SRVSAMPLE"
 #include "common/check.h"
+#include "common/skip.h"
 
 namespace {
 
@@ -106,6 +107,8 @@ int run() {
         fprintf(stderr, T_TAG ": dmn_init FAILED\n");
         return 1;
     }
+    /* This test is precisely "sample the shared texture in a shader". */
+    T_SKIP_WITHOUT("D3DCompile");
 
     /* Create + fill a MISC_SHARED gradient texture. */
     Com<ID3D11Device> pdev;

@@ -37,6 +37,8 @@
 
 #include "d3dmetal_native.h"
 #include "cocoa_window.h"
+#define T_TAG "SCT"
+#include "common/skip.h"
 #include "common/com.h"
 #include "common/ipc.h"
 #include "common/util.h"
@@ -555,6 +557,12 @@ int consumer(int sock) {
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     setvbuf(stderr, nullptr, _IONBF, 0);
+
+    /* Both halves are HLSL: a compute shader fills the shared texture and a
+     * pixel shader samples it. GPTk 2.1 and earlier ship no D3DCompile. */
+    if (dmn_init(nullptr) == DMN_SUCCESS &&
+        !dmn_framework_has_entry_point("D3DCompile"))
+        T_SKIP("this D3DMetal does not export D3DCompile");
 
     if (argc >= 3 && strcmp(argv[1], "--producer") == 0)
         return producer(atoi(argv[2]));

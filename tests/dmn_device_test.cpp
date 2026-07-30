@@ -24,6 +24,7 @@
 
 #define T_TAG "DEVICE"
 #include "common/check.h"
+#include "common/skip.h"
 
 
 static const char g_vertexShaderCode[] =
@@ -123,8 +124,12 @@ int main() {
     }
 
     /* D3DCompile — exercises the dxcompiler load path through the GFXT
-     * library interface before any windowing exists. */
-    {
+     * library interface before any windowing exists. GPTk 2.1 and earlier do
+     * not ship it at all, so this one check stands down there rather than
+     * failing the whole device bring-up test. */
+    if (!dmn_framework_has_entry_point("D3DCompile")) {
+        printf("DEVICE: D3DCompile: skipped (not exported by this D3DMetal)\n");
+    } else {
         Com<ID3DBlob> code;
         Com<ID3DBlob> errors;
         HRESULT hr = D3DCompile(g_vertexShaderCode, sizeof(g_vertexShaderCode) - 1,

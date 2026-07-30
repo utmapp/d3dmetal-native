@@ -99,6 +99,14 @@ static inline int run_fork_pair(const char* tag, int (*parent)(int),
     int status = 0;
     waitpid(pid, &status, 0);
     int crc = WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+    /* 77 is meson's "skipped": either side may report it after finding the
+     * loaded D3DMetal does not implement something the exchange needs (see
+     * common/skip.h). Its peer then fails on the half-finished handshake, which
+     * is a consequence, not a result — so a skip from either side wins. */
+    if (prc == 77 || crc == 77) {
+        fprintf(stderr, "%s: SKIP (parent=%d child=%d)\n", tag, prc, crc);
+        return 77;
+    }
     if (prc != 0 || crc != 0) {
         fprintf(stderr, "%s: FAIL (parent=%d child=%d)\n", tag, prc, crc);
         return 1;

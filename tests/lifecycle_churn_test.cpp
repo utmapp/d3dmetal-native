@@ -19,6 +19,7 @@
 #include <fcntl.h>
 #include <mach/mach.h>
 #include <time.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <d3d11_4.h>
@@ -27,7 +28,9 @@
 #include <windows.h>
 
 #include "d3dmetal_native.h"
+#define T_TAG "CHURN"
 #include "common/com.h"
+#include "common/skip.h"
 
 namespace {
 
@@ -148,9 +151,15 @@ int churn_d3d11() {
 
         /* Shared fence: create, signal once (drives the GPU slot store), export. */
         Com<ID3D11Fence> fence;
-        if (FAILED(dev5->CreateFence(0, g_shared ? D3D11_FENCE_FLAG_SHARED
-                                                 : D3D11_FENCE_FLAG_NONE,
-                                     __uuidof(ID3D11Fence), (void**)&fence))) {
+        HRESULT fhr = dev5->CreateFence(0, g_shared ? D3D11_FENCE_FLAG_SHARED
+                                                    : D3D11_FENCE_FLAG_NONE,
+                                        __uuidof(ID3D11Fence), (void**)&fence);
+        if (t_unimplemented(fhr)) {
+            /* GPTk 2.1 and earlier: no D3D11 fences, so a fence's share of the
+             * churn cannot be measured here. */
+            return -T_SKIP_CODE;
+        }
+        if (FAILED(fhr)) {
             fprintf(stderr, "CHURN: iter %d CreateFence FAILED\n", i);
             return -1;
         }
@@ -251,7 +260,10 @@ int churn_d3d12() {
 /* Warm up both APIs (one-time costs: shader caches, device-global pools, the
  * eviction probes), then run a measured round. Prints a parseable growth line. */
 int run_measured(int64_t* fd_growth, int64_t* mem_growth) {
-    if (churn_d3d11() != 0 || churn_d3d12() != 0)
+    int rc = churn_d3d11();
+    if (rc == -T_SKIP_CODE)
+        return rc;
+    if (rc != 0 || churn_d3d12() != 0)
         return -1;
 
     const int fd0 = count_fds();
@@ -259,7 +271,10 @@ int run_measured(int64_t* fd_growth, int64_t* mem_growth) {
     printf("CHURN: baseline fds=%d footprint=%llu MiB\n", fd0,
            (unsigned long long)(mem0 >> 20));
 
-    if (churn_d3d11() != 0 || churn_d3d12() != 0)
+    rc = churn_d3d11();
+    if (rc == -T_SKIP_CODE)
+        return rc;
+    if (rc != 0 || churn_d3d12() != 0)
         return -1;
 
     const int fd1 = count_fds();
@@ -291,6 +306,8 @@ int run_control(const char* self, int64_t* fd_growth, int64_t* mem_growth) {
             got = true;
     }
     int st = pclose(p);
+    if (WIFEXITED(st) && WEXITSTATUS(st) == T_SKIP_CODE)
+        return -T_SKIP_CODE;
     if (!got || st != 0) {
         fprintf(stderr, "CHURN: control run failed (status=%d parsed=%d)\n",
                 st, (int)got);
@@ -316,11 +333,18 @@ int main(int argc, char** argv) {
         if (dmn_init(nullptr) != DMN_SUCCESS)
             return 1;
         int64_t fdg = 0, memg = 0;
-        return run_measured(&fdg, &memg) != 0 ? 1 : 0;
+        int crc = run_measured(&fdg, &memg);
+        if (crc == -T_SKIP_CODE)
+            return T_SKIP_CODE; /* the parent turns this into a suite skip */
+        return crc != 0 ? 1 : 0;
     }
 
     int64_t ctl_fd = 0, ctl_mem = 0;
-    if (run_control(argv[0], &ctl_fd, &ctl_mem) != 0)
+    int crc = run_control(argv[0], &ctl_fd, &ctl_mem);
+    if (crc == -T_SKIP_CODE)
+        T_SKIP("ID3D11Device5::CreateFence is not implemented by this D3DMetal, "
+               "so fence churn cannot be measured");
+    if (crc != 0)
         return 1;
     printf("CHURN: control growth fds=%lld mem=%lld MiB\n",
            (long long)ctl_fd, (long long)ctl_mem);
@@ -330,7 +354,11 @@ int main(int argc, char** argv) {
         return 1;
     }
     int64_t fd_growth = 0, mem_growth = 0;
-    if (run_measured(&fd_growth, &mem_growth) != 0)
+    int mrc = run_measured(&fd_growth, &mem_growth);
+    if (mrc == -T_SKIP_CODE)
+        T_SKIP("ID3D11Device5::CreateFence is not implemented by this D3DMetal, "
+               "so fence churn cannot be measured");
+    if (mrc != 0)
         return 1;
 
     /* The sharing machinery must not add growth beyond D3DMetal's own churn

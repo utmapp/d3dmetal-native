@@ -35,6 +35,8 @@
 #include <windows.h>
 
 #include "d3dmetal_native.h"
+#define T_TAG "SHARED"
+#include "common/skip.h"
 #include "common/com.h"
 #include "common/ipc.h"
 #include "common/util.h"
@@ -154,8 +156,11 @@ int producer(int sock) {
         FAILED(context->QueryInterface(__uuidof(ID3D11DeviceContext4), (void**)&context4)) ||
         FAILED(device5->CreateFence(0, D3D11_FENCE_FLAG_SHARED,
                                     __uuidof(ID3D11Fence), (void**)&d3dFence))) {
+        /* No D3D11 fences in this D3DMetal (GPTk 2.1 and earlier): the
+         * cross-process handshake this test performs is fence-gated, so there
+         * is nothing here to pass or fail. */
         fprintf(stderr, "SHARED: ID3D11Device5::CreateFence(SHARED) unavailable\n");
-        return 1;
+        return T_SKIP_CODE;
     }
     HANDLE fenceH = nullptr;
     if (FAILED(hr = d3dFence->CreateSharedHandle(nullptr, 0, nullptr, &fenceH)) ||
@@ -408,6 +413,11 @@ int main(int argc, char** argv) {
     int status = 0;
     waitpid(pid, &status, 0);
     int crc = WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+    if (prc == T_SKIP_CODE) {
+        /* The consumer only failed because the producer never got far enough
+         * to hand it anything. */
+        T_SKIP("ID3D11Device5::CreateFence is not implemented by this D3DMetal");
+    }
     if (prc != 0 || crc != 0) {
         fprintf(stderr, "SHARED: FAIL (producer=%d consumer=%d)\n", prc, crc);
         return 1;

@@ -31,6 +31,8 @@
 #include <windows.h>
 
 #include "d3dmetal_native.h"
+#define T_TAG "MT-STRESS"
+#include "common/skip.h"
 #include "common/com.h"
 
 namespace {
@@ -324,6 +326,18 @@ void phase_fences() {
         fprintf(stderr, "MT-STRESS: phase-4 ID3D11Device5 unavailable\n");
         g_fail.fetch_add(1);
         return;
+    }
+    /* GPTk 2.1 and earlier have no D3D11 fences; phases 1-3 still say
+     * something there, so stand this phase down instead of failing. */
+    {
+        Com<ID3D11Fence> probe;
+        HRESULT hr = dev5->CreateFence(0, D3D11_FENCE_FLAG_NONE,
+                                       __uuidof(ID3D11Fence), (void**)&probe);
+        if (t_unimplemented(hr)) {
+            printf("MT-STRESS: phase 4 skipped (ID3D11Device5::CreateFence is "
+                   "not implemented by this D3DMetal)\n");
+            return;
+        }
     }
     Com<ID3D12Device> d12;
     if (FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0,
