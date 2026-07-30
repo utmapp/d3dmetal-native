@@ -1294,10 +1294,14 @@ HRESULT STDMETHODCALLTYPE hook_ctx_Signal(
      * after it. No-op for imports. */
     dmn_fd3d_on_ctx_signal(fence, value);
     HRESULT hr = orig ? orig(This, fence, value) : E_FAIL;
-    /* Import signal-back: store into the slot once the local fence completes
-     * the value. */
-    if (SUCCEEDED(hr))
+    if (SUCCEEDED(hr)) {
+        /* The signalled fence must outlive its own signal (see
+         * dmn_fd3d_keepalive_d3d11); the app may drop it right here. */
+        dmn_fd3d_keepalive_d3d11(This, fence, value);
+        /* Import signal-back: store into the slot once the local fence
+         * completes the value. */
         dmn_fd3d_after_ctx_signal(fence, value);
+    }
     return hr;
 }
 
@@ -1610,10 +1614,12 @@ HRESULT STDMETHODCALLTYPE hook_queue_Signal(
         ID3D12CommandQueue* This, ID3D12Fence* fence, UINT64 value) {
     auto orig = DMN_ORIG(queue_Signal, This);
     HRESULT hr = orig ? orig(This, fence, value) : E_FAIL;
-    /* Producer: GPU-write the slot via the helper queue. Import signal-back:
-     * store into the slot once the local fence completes the value. */
-    if (SUCCEEDED(hr))
+    if (SUCCEEDED(hr)) {
+        dmn_fd3d_keepalive_d3d12(fence, value);
+        /* Producer: GPU-write the slot via the helper queue. Import signal-back:
+         * store into the slot once the local fence completes the value. */
         dmn_fd3d_on_queue_signal(fence, value);
+    }
     return hr;
 }
 

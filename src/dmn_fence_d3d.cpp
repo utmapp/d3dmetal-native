@@ -35,6 +35,7 @@
 #include <new>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
 #include <d3d11_4.h>
 #include <d3d12.h>
@@ -265,18 +266,26 @@ void gpufence_signal_d3d12(GpuFence* gf, UINT64 value) {
     std::lock_guard<std::mutex> lk(gf->mtx);
     auto* rf = reinterpret_cast<ID3D12Fence*>(gf->realFence);
     ID3D12CommandAllocator* alloc = gf->helperAlloc[gf->seq++ % GpuFence::kRing];
-    gf->helperQ->Wait(rf, value);
-    alloc->Reset();
-    gf->helperList->Reset(alloc, nullptr);
+    HRESULT hrw = gf->helperQ->Wait(rf, value);
+    HRESULT hra = alloc->Reset();
+    HRESULT hrr = gf->helperList->Reset(alloc, nullptr);
     D3D12_WRITEBUFFERIMMEDIATE_PARAMETER lo{gf->gpuVA,
                                             (UINT32)(value & 0xffffffffu)};
     D3D12_WRITEBUFFERIMMEDIATE_PARAMETER hi{gf->gpuVA + 4,
                                             (UINT32)(value >> 32)};
     gf->helperList->WriteBufferImmediate(1, &lo, nullptr);
     gf->helperList->WriteBufferImmediate(1, &hi, nullptr);
-    gf->helperList->Close();
+    HRESULT hrc = gf->helperList->Close();
     ID3D12CommandList* lists[] = {gf->helperList};
     gf->helperQ->ExecuteCommandLists(1, lists);
+    if (FAILED(hrw) || FAILED(hra) || FAILED(hrr) || FAILED(hrc))
+        DMN_WARN("fence: D3D12 slot store for value=%llu: Wait=0x%08x "
+                 "allocReset=0x%08x listReset=0x%08x Close=0x%08x",
+                 (unsigned long long)value, (unsigned)hrw, (unsigned)hra,
+                 (unsigned)hrr, (unsigned)hrc);
+    else
+        DMN_DEBUG("fence: D3D12 Signal value=%llu -> GPU store at va=0x%llx",
+                  (unsigned long long)value, (unsigned long long)gf->gpuVA);
 }
 
 /* D3D11: on the immediate context (the one the app signals on, so this rides
@@ -527,6 +536,105 @@ static bool fence_slot(IUnknown* fence, dmn_shared_fence_handle* pod,
 bool dmn_fd3d_export(IUnknown* fence, dmn_shared_fence_handle* out) {
     dmn_shared_fence_t view = nullptr;
     return out && fence_slot(fence, out, &view);
+}
+
+/* == Signalled-fence keepalive (see dmn_fence_d3d.h) ====================== */
+namespace {
+
+struct PendingSignal {
+    IUnknown* fence;   /* +1 held here */
+    UINT64    value;
+    bool      is_d3d12;
+};
+
+/* A D3D11 context batches commands, so a signalled value only retires once the
+ * batch is submitted — and an app is free never to Flush. Past this many
+ * outstanding signals the deferred context is flushed to let them retire, which
+ * the D3D11 runtime may do at any point anyway. */
+constexpr size_t kFlushAt = 8;
+
+/* A signal is retired asynchronously, so the flush above only makes progress
+ * possible — the reap on a later call is what collects it. The list is
+ * therefore never trimmed by force: releasing a fence the GPU has not reached
+ * is precisely what wedges the queue (an over-retain leaks, an over-release
+ * corrupts), so past this many outstanding signals say so and keep holding. */
+constexpr size_t kComplainAt = 512;
+
+std::mutex g_keep_mtx;
+std::vector<PendingSignal> g_keep; /* oldest first */
+bool g_keep_complained = false;
+
+UINT64 pending_completed(const PendingSignal& p) {
+    return p.is_d3d12
+        ? reinterpret_cast<ID3D12Fence*>(p.fence)->GetCompletedValue()
+        : reinterpret_cast<ID3D11Fence*>(p.fence)->GetCompletedValue();
+}
+
+/* Reap entries the GPU has caught up with, oldest-first order preserved.
+ * Returns them for release outside the lock: a fence's destructor runs
+ * eviction, which takes other locks. */
+void reap_locked(std::vector<IUnknown*>& done) {
+    size_t keep = 0;
+    for (size_t i = 0; i < g_keep.size(); i++) {
+        if (pending_completed(g_keep[i]) >= g_keep[i].value)
+            done.push_back(g_keep[i].fence);
+        else
+            g_keep[keep++] = g_keep[i];
+    }
+    g_keep.resize(keep);
+    if (g_keep.size() > kComplainAt && !g_keep_complained) {
+        g_keep_complained = true;
+        DMN_WARN("fence: %zu signalled fences the GPU has not reached; it has "
+                 "stopped retiring them (each shared one holds a companion "
+                 "buffer and its fd)", g_keep.size());
+    }
+}
+
+size_t keepalive_add(IUnknown* fence, UINT64 value, bool is_d3d12) {
+    std::vector<IUnknown*> done;
+    size_t pending;
+    {
+        std::lock_guard<std::mutex> lk(g_keep_mtx);
+        reap_locked(done);
+        fence->AddRef();
+        g_keep.push_back({fence, value, is_d3d12});
+        pending = g_keep.size();
+    }
+    for (IUnknown* f : done)
+        f->Release();
+    return pending;
+}
+
+void keepalive_reap() {
+    std::vector<IUnknown*> done;
+    {
+        std::lock_guard<std::mutex> lk(g_keep_mtx);
+        reap_locked(done);
+    }
+    for (IUnknown* f : done)
+        f->Release();
+}
+
+} // namespace
+
+void dmn_fd3d_keepalive_d3d11(ID3D11DeviceContext4* ctx, ID3D11Fence* fence,
+                              UINT64 value) {
+    if (!fence)
+        return;
+    if (keepalive_add(fence, value, /*is_d3d12=*/false) > kFlushAt && ctx) {
+        /* Submit what is queued so the outstanding signals can retire, then
+         * reap. Without this an app that signals and never flushes would have
+         * us hold every fence it ever signalled. */
+        ctx->Flush();
+        keepalive_reap();
+    }
+}
+
+void dmn_fd3d_keepalive_d3d12(ID3D12Fence* fence, UINT64 value) {
+    /* A D3D12 queue Signal is submitted as it is made, so these retire on their
+     * own and the reap on the next call is enough. */
+    if (fence)
+        keepalive_add(fence, value, /*is_d3d12=*/true);
 }
 
 void dmn_fd3d_on_ctx_signal(ID3D11Fence* fence, UINT64 value) {

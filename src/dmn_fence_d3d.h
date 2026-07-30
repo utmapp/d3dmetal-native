@@ -59,6 +59,26 @@ void dmn_fd3d_on_ctx_signal(ID3D11Fence* fence, UINT64 value);    /* before orig
 void dmn_fd3d_after_ctx_signal(ID3D11Fence* fence, UINT64 value); /* after orig */
 void dmn_fd3d_on_queue_signal(ID3D12Fence* fence, UINT64 value);  /* after orig */
 
+/* Hold a reference to a fence that was just signalled until the GPU reaches the
+ * value, then drop it — the deferred destruction the D3D runtime owes a
+ * signalled fence.
+ *
+ * GPTk 4.0b1 does not do it: destroying an ID3D11Fence before the GPU has passed
+ * the value it was signalled to kills the Metal command queue outright
+ * ("ExecuteCL MTL3 completion error ... IOGPUCommandQueueErrorDomain Code=10"),
+ * after which the process is wedged in the kernel and unkillable. An app is
+ * entitled to Signal a fence and drop it immediately, so the reference has to
+ * come from somewhere; earlier versions hold it themselves and are unaffected.
+ *
+ * Completed entries are reaped on each call, so the list holds only signals the
+ * GPU has not caught up with. A D3D11 context batches, so a signal does not
+ * retire until something submits it: past a small bound the context is flushed
+ * (which the runtime may do on its own at any time) rather than holding every
+ * fence an app signalled without ever flushing. */
+void dmn_fd3d_keepalive_d3d11(ID3D11DeviceContext4* ctx,
+                              ID3D11Fence* fence, UINT64 value);
+void dmn_fd3d_keepalive_d3d12(ID3D12Fence* fence, UINT64 value);
+
 /* CPU ID3D12Fence::Signal interception (after a successful orig): Windows CPU
  * signal is immediately visible cross-process, so raise the shared slot now.
  * No-op for fences that are neither producers nor imports. */

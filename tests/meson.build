@@ -154,6 +154,17 @@ test('fence-xapi-d11d12', fence_xapi, args: ['d11d12'],
 test('fence-xapi-d12d11', fence_xapi, args: ['d12d11'],
      env: ['DMN_LOG=info'], timeout: 300)
 
+# Regression: a fence must outlive its own signal. Signal-then-drop without
+# flushing, repeatedly, then confirm the queue still retires work — destroying a
+# signalled fence early kills the whole Metal queue on some versions, which shows
+# up as an unkillable process rather than a failed assertion.
+fence_release_race = executable('fence-release-race-test',
+  'fence_release_race_test.cpp',
+  include_directories: test_native_inc,
+  link_with: dmn_lib)
+test('fence-release-race', fence_release_race, env: ['DMN_LOG=warn'],
+     is_parallel: false, timeout: 600)
+
 # GPU-side wait on an imported fence: a native wait on the real local fence,
 # released by the wait watcher only when the producer's GPU writes the value
 # into the shared slot.
