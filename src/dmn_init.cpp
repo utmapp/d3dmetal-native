@@ -16,6 +16,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -184,6 +185,11 @@ dmn_result init_locked(const dmn_options* options) {
     load_sym(handle, g_dmn_api.D3DCompileFromFile, "D3DCompileFromFile", nullptr);
     load_sym(handle, g_dmn_api.D3D10CreateBlob, "D3D10CreateBlob", nullptr);
 
+    /* Absent before GPTk 4.0b1 — nothing suballocated resources then, so a
+     * missing symbol needs no warning. */
+    g_dmn_api.UseInternalHeaps = reinterpret_cast<unsigned char*>(
+        dlsym(handle, "_ZN10D3DMDevice16UseInternalHeapsE"));
+
     g_framework_binary = binary;
     {
         char buf[PATH_MAX];
@@ -260,6 +266,37 @@ extern "C" bool dmn_framework_has_entry_point(const char* name) {
 
 dmn_result dmn_ensure_init() {
     return dmn_init(nullptr);
+}
+
+/* The substitution mechanism swaps the single Metal allocation a D3D resource
+ * create makes. GPTk 4.0b1 broke that assumption for buffers: with
+ * UseInternalHeaps set (its default for any executable the per-app profile
+ * table does not recognise), a 4 KiB shared D3D11 buffer is an offset into a
+ * 256 MiB pooled MTLBuffer, and the armed create substitutes — and then exports
+ * — that entire pool. Clearing the flag for the duration of the armed create
+ * gets a dedicated allocation, the pre-4.0 shape, without giving up pooling for
+ * the resources that do not need it.
+ *
+ * The flag is process-global, so overlapping armed creates on other threads are
+ * reference-counted here; a create on an unrelated thread landing inside the
+ * window merely gets a dedicated allocation too, which is a supported
+ * configuration (it is what every earlier GPTk did). */
+namespace {
+std::atomic<int> g_dedicated_depth{0};
+}
+
+void dmn_dedicated_metal_alloc_begin() {
+    if (!g_dmn_api.UseInternalHeaps)
+        return;
+    if (g_dedicated_depth.fetch_add(1, std::memory_order_acq_rel) == 0)
+        *g_dmn_api.UseInternalHeaps = 0;
+}
+
+void dmn_dedicated_metal_alloc_end() {
+    if (!g_dmn_api.UseInternalHeaps)
+        return;
+    if (g_dedicated_depth.fetch_sub(1, std::memory_order_acq_rel) == 1)
+        *g_dmn_api.UseInternalHeaps = 1;
 }
 
 /* == Exported D3D entry points =========================================== */

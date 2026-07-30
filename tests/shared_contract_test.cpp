@@ -17,6 +17,14 @@
  *      "our handle, but bad" must not collapse into the same HRESULT: the
  *      first falls through to D3DMetal, and taking that path with a POD
  *      pointer hands it something that is not a Windows HANDLE at all.
+ *   4. An export describes THIS resource. The substitution replaces the one
+ *      Metal allocation a create makes, so it has to be handed that resource's
+ *      allocation and not a region the resource merely sits inside. GPTk 4.0b1
+ *      suballocates out of large internal heaps: a 4 KiB shared buffer became an
+ *      offset into a 256 MiB pooled MTLBuffer, and the armed create substituted
+ *      — then exported — the whole pool. A peer reading offset 0 of that gets
+ *      the wrong bytes. Lower bounds alone cannot see it (a pool covers any
+ *      surface), so the geometry is bounded from above as well.
  *
  * Same-process throughout: opening a handle this process exported exercises
  * exactly the consumer path, and none of these assertions are about data
@@ -30,6 +38,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+
+#include <unistd.h>
 
 #include <d3d11_4.h>
 #include <dxgi1_2.h>
@@ -65,6 +75,16 @@ bool export_pod(ID3D11Texture2D* tex, dmn_shared_texture_handle* out) {
         return false;
     memcpy(out, h, sizeof(*out));
     return out->magic == DMN_SHARED_TEXTURE_MAGIC;
+}
+
+bool export_buffer_pod(ID3D11Buffer* buf, dmn_shared_buffer_handle* out) {
+    Com<IDXGIResource> res;
+    HANDLE h = nullptr;
+    if (FAILED(buf->QueryInterface(__uuidof(IDXGIResource), (void**)&res)) ||
+        FAILED(res->GetSharedHandle(&h)) || !h)
+        return false;
+    memcpy(out, h, sizeof(*out));
+    return out->magic == DMN_SHARED_BUFFER_MAGIC;
 }
 
 /* == 1. Unshareable formats fail the create ============================== */
@@ -174,6 +194,75 @@ int test_import_validation(ID3D11Device* dev) {
     return 0;
 }
 
+/* == 4. An export describes THIS resource ================================= */
+/* The bounds are deliberately loose. Whatever a framework does for alignment is
+ * a page at most, while the fault being guarded against is orders of magnitude
+ * out — a 256 MiB pool exported for a 4 KiB buffer — so a generous bound still
+ * catches it and will not fail on a future version that pads differently. */
+int test_export_geometry(ID3D11Device* dev) {
+    const uint64_t page = (uint64_t)getpagesize();
+
+    {
+        constexpr uint32_t kW = 256, kH = 256;
+        const uint64_t row = (uint64_t)kW * 4; /* BGRA8 */
+        D3D11_TEXTURE2D_DESC td =
+            shared_desc(kW, kH, DXGI_FORMAT_B8G8R8A8_UNORM,
+                        D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET);
+        Com<ID3D11Texture2D> tex;
+        CK(dev->CreateTexture2D(&td, nullptr, &tex), "shared texture create");
+        dmn_shared_texture_handle pod{};
+        EXPECT(export_pod(tex.ptr(), &pod), "texture export");
+
+        EXPECT(pod.stride >= row, "exported stride covers a row");
+        if (pod.stride > row + page) {
+            fprintf(stderr, T_TAG ": exported stride %llu for a %llu-byte row — "
+                    "this is not a %ux%u surface's own backing\n",
+                    (unsigned long long)pod.stride, (unsigned long long)row,
+                    kW, kH);
+            return 1;
+        }
+        /* The POD's documented meaning: stride*height, not page-padded. */
+        if (pod.size != pod.stride * kH) {
+            fprintf(stderr, T_TAG ": exported size %llu != stride %llu * height "
+                    "%u\n", (unsigned long long)pod.size,
+                    (unsigned long long)pod.stride, kH);
+            return 1;
+        }
+        printf(T_TAG ": exported texture geometry describes the texture "
+               "(stride=%llu size=%llu): OK\n",
+               (unsigned long long)pod.stride, (unsigned long long)pod.size);
+    }
+
+    {
+        /* The buffer case is the one that actually regressed, and a buffer has
+         * no stride to sanity-check — only its length. */
+        constexpr uint32_t kBytes = 65536;
+        D3D11_BUFFER_DESC bd = {};
+        bd.ByteWidth = kBytes;
+        bd.Usage = D3D11_USAGE_DEFAULT;
+        bd.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+        bd.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
+        Com<ID3D11Buffer> buf;
+        CK(dev->CreateBuffer(&bd, nullptr, &buf), "shared buffer create");
+        dmn_shared_buffer_handle pod{};
+        EXPECT(export_buffer_pod(buf.ptr(), &pod), "buffer export");
+
+        EXPECT(pod.size >= kBytes, "exported size covers the buffer");
+        const uint64_t limit = (uint64_t)kBytes + (1u << 20); /* + 1 MiB */
+        if (pod.size > limit) {
+            fprintf(stderr, T_TAG ": a %u-byte shared buffer exported a "
+                    "%llu-byte region — the substitution captured a pool, not "
+                    "this buffer's own backing, so a peer reading offset 0 gets "
+                    "the wrong bytes\n", kBytes, (unsigned long long)pod.size);
+            return 1;
+        }
+        printf(T_TAG ": exported buffer geometry describes the buffer "
+               "(size=%llu for %u requested): OK\n",
+               (unsigned long long)pod.size, kBytes);
+    }
+    return 0;
+}
+
 } // namespace
 
 int main() {
@@ -193,6 +282,8 @@ int main() {
     if (test_reject_unshareable(dev.ptr()) != 0)
         return 1;
     if (test_import_validation(dev.ptr()) != 0)
+        return 1;
+    if (test_export_geometry(dev.ptr()) != 0)
         return 1;
 
     T_PASS();

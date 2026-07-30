@@ -623,7 +623,9 @@ id<MTLBuffer> substitute_buffer(id<MTLDevice> device, NSUInteger length) {
         t_arm.captured = true;
         t_arm.out_fd   = fd;
         t_arm.out_size = logical;
-        DMN_INFO("share: substituted producer buffer size=%zu fd=%d", logical, fd);
+        DMN_INFO("share: substituted producer buffer size=%zu fd=%d "
+                 "(asked %lu) gpuAddress=0x%llx", logical, fd,
+                 (unsigned long)length, (unsigned long long)buf.gpuAddress);
         return buf;
     }
 
@@ -1155,6 +1157,7 @@ void swizzle_device_class(Class cls) {
 /* == dmn_share.h entry points ============================================= */
 
 void dmn_share_arm_producer(uint64_t extra_bytes) {
+    dmn_dedicated_metal_alloc_begin();
     t_arm = {};
     t_arm.armed = true;
     t_arm.kind = DMN_SHARE_TEXTURE;
@@ -1163,6 +1166,7 @@ void dmn_share_arm_producer(uint64_t extra_bytes) {
 }
 
 void dmn_share_arm_consumer(int fd, uint64_t stride, uint64_t size) {
+    dmn_dedicated_metal_alloc_begin();
     t_arm = {};
     t_arm.armed = true;
     t_arm.kind = DMN_SHARE_TEXTURE;
@@ -1173,6 +1177,7 @@ void dmn_share_arm_consumer(int fd, uint64_t stride, uint64_t size) {
 }
 
 void dmn_share_arm_producer_buffer(uint64_t size) {
+    dmn_dedicated_metal_alloc_begin();
     t_arm = {};
     t_arm.armed = true;
     t_arm.kind = DMN_SHARE_BUFFER;
@@ -1181,6 +1186,7 @@ void dmn_share_arm_producer_buffer(uint64_t size) {
 }
 
 void dmn_share_arm_consumer_buffer(int fd, uint64_t size) {
+    dmn_dedicated_metal_alloc_begin();
     t_arm = {};
     t_arm.armed = true;
     t_arm.kind = DMN_SHARE_BUFFER;
@@ -1194,6 +1200,7 @@ bool dmn_share_is_armed(void) { return t_arm.armed; }
 const void* dmn_share_init_data_sentinel(void) { return init_sentinel_base(); }
 
 bool dmn_share_disarm(DmnShareArm* out) {
+    dmn_dedicated_metal_alloc_end();
     bool captured = t_arm.captured;
     if (t_arm.armed && !captured)
         DMN_WARN("share: armed create reached NONE of the hooked Metal entry "

@@ -55,9 +55,27 @@ struct DmnFrameworkApi {
                                   const char*, const char*, uint32_t, uint32_t,
                                   void**, void**);
     int32_t (DMN_MS_ABI *D3D10CreateBlob)(size_t, void**);
+
+    /* D3DMDevice::UseInternalHeaps — new in GPTk 4.0b1 (absent before), an
+     * exported static bool that makes D3DMetal suballocate resources out of
+     * large internal Metal heaps: a 4 KiB D3D11 buffer becomes an offset into a
+     * 256 MiB MTLBuffer. The substitution mechanism replaces the ONE Metal
+     * allocation a D3D resource create makes, so a pooled create hands it the
+     * whole pool. NULL if the symbol is absent.
+     * See dmn_dedicated_metal_alloc_begin(). */
+    unsigned char* UseInternalHeaps;
 };
 
 extern DmnFrameworkApi g_dmn_api;
+
+/* Bracket an armed create so the Metal allocation it makes is dedicated to the
+ * resource rather than suballocated from one of D3DMetal's internal heaps —
+ * without which the substitution captures the shared pool. Reference-counted
+ * (concurrent armed creates on other threads overlap); a no-op when the
+ * framework has no such knob. Paired by the dmn_share_arm entry points and
+ * dmn_share_disarm. */
+void dmn_dedicated_metal_alloc_begin();
+void dmn_dedicated_metal_alloc_end();
 
 /* Absolute path of the loaded framework binary ("" before init). */
 const std::string& dmn_framework_binary_path();
