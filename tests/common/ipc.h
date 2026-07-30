@@ -68,6 +68,56 @@ static inline bool recv_with_fd(int sock, void* data, size_t len, int* fd) {
     return recv_with_fds(sock, data, len, fd, 1);
 }
 
+/* Exec harness: like run_fork_pair, but the peer runs in a FRESH process
+ * (fork + exec of argv[0] with `child_flag <sockfd>`) rather than a bare
+ * forked one. D3DMetal needs that: MTLCompilerService is unreachable across a
+ * bare fork, and some framework versions build a Metal pipeline during
+ * D3D11CreateDevice — in a forked child that trips
+ * "computeFunction must not be nil" and aborts it, leaving the parent waiting
+ * on a peer that will never answer (GPTk 1.0 does this).
+ *
+ * The caller's main() must dispatch `child_flag` before calling this:
+ *     if (argc >= 3 && strcmp(argv[1], FLAG) == 0) return child(atoi(argv[2]));
+ */
+static inline int run_exec_pair(const char* tag, const char* self,
+                                const char* child_flag, int (*parent)(int)) {
+    setvbuf(stdout, nullptr, _IONBF, 0);
+    setvbuf(stderr, nullptr, _IONBF, 0);
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
+        fprintf(stderr, "%s: socketpair FAILED: %s\n", tag, strerror(errno));
+        return 1;
+    }
+    pid_t pid = fork();
+    if (pid < 0) {
+        fprintf(stderr, "%s: fork FAILED: %s\n", tag, strerror(errno));
+        return 1;
+    }
+    if (pid == 0) {
+        close(sv[0]);
+        char fdbuf[16];
+        snprintf(fdbuf, sizeof(fdbuf), "%d", sv[1]); /* inherited, not CLOEXEC */
+        execl(self, self, child_flag, fdbuf, (char*)nullptr);
+        fprintf(stderr, "%s: execl peer FAILED: %s\n", tag, strerror(errno));
+        _exit(127);
+    }
+    close(sv[1]);
+    int prc = parent(sv[0]);
+    close(sv[0]);
+    int status = 0;
+    waitpid(pid, &status, 0);
+    int crc = WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+    if (prc == 77 || crc == 77) {
+        fprintf(stderr, "%s: SKIP (parent=%d child=%d)\n", tag, prc, crc);
+        return 77;
+    }
+    if (prc != 0 || crc != 0) {
+        fprintf(stderr, "%s: FAIL (parent=%d child=%d)\n", tag, prc, crc);
+        return 1;
+    }
+    return 0;
+}
+
 /* Fork harness: the child runs `child(sock)`, the parent runs `parent(sock)`,
  * then the child is reaped. Each side does its own dmn_init. Returns 0 only
  * when both sides returned 0. */

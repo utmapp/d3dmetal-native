@@ -16,6 +16,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include <sys/socket.h>
@@ -177,6 +178,11 @@ int producer_main(int sock) {
 }
 } // namespace
 
-int main() {
-    return run_fork_pair("KMUTEX", producer_main, consumer);
+int main(int argc, char** argv) {
+    /* The consumer runs in a FRESH process (exec, not a bare fork): its
+     * D3D11CreateDevice may build a Metal pipeline, which needs a compiler
+     * service a forked child cannot reach. */
+    if (argc >= 3 && strcmp(argv[1], "--consumer") == 0)
+        return consumer(atoi(argv[2]));
+    return run_exec_pair("KMUTEX", argv[0], "--consumer", producer_main);
 }
