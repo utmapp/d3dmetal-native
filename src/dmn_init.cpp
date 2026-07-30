@@ -185,6 +185,17 @@ dmn_result init_locked(const dmn_options* options) {
     load_sym(handle, g_dmn_api.D3DCompileFromFile, "D3DCompileFromFile", nullptr);
     load_sym(handle, g_dmn_api.D3D10CreateBlob, "D3D10CreateBlob", nullptr);
 
+    /* Not an entry point: a static bool inside D3DMetal that gates
+     * WriteBufferImmediate. Resolved here so the D3D12 fence path can
+     * re-assert it after each device creation (see
+     * dmn_force_write_buffer_immediate). Absent on no shipped version so far,
+     * but treat it as optional. */
+    g_dmn_api.EnableWriteBufferImmediate = reinterpret_cast<unsigned char*>(
+        dlsym(handle, "_ZN10D3DMDevice26EnableWriteBufferImmediateE"));
+    if (!g_dmn_api.EnableWriteBufferImmediate)
+        DMN_WARN("D3DMetal does not export EnableWriteBufferImmediate; if this "
+                 "build defaults it off, shared D3D12 fences will not signal");
+
     /* Absent before GPTk 4.0b1 — nothing suballocated resources then, so a
      * missing symbol needs no warning. */
     g_dmn_api.UseInternalHeaps = reinterpret_cast<unsigned char*>(
@@ -266,6 +277,22 @@ extern "C" bool dmn_framework_has_entry_point(const char* name) {
 
 dmn_result dmn_ensure_init() {
     return dmn_init(nullptr);
+}
+
+/* GPTk 4.0b1 turns WriteBufferImmediate off for every executable its per-app
+ * profile table does not recognise, and the D3D12 shared-fence value store is a
+ * WriteBufferImmediate — with the flag clear the GPU write is dropped, the
+ * companion slot never advances, and every consumer of the fence waits forever.
+ * The encode path itself is intact (forcing the flag makes the store land), so
+ * re-assert it, restoring the pre-4.0 default. The D3DMDevice constructor writes
+ * the flag from the profile, so this has to run after each device creation. */
+void dmn_force_write_buffer_immediate() {
+    unsigned char* flag = g_dmn_api.EnableWriteBufferImmediate;
+    if (!flag || *flag)
+        return;
+    *flag = 1;
+    DMN_INFO("forced D3DMetal EnableWriteBufferImmediate on (this build's "
+             "per-app profile left it off)");
 }
 
 /* The substitution mechanism swaps the single Metal allocation a D3D resource

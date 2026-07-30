@@ -47,6 +47,7 @@
 #include "dmn_hook.h"
 #include "dmn_kmtx.h"
 #include "dmn_log.h"
+#include "dmn_private.h"
 #include "dmn_share.h"
 
 /* == Format-support bit mirrors ============================================ */
@@ -1846,6 +1847,9 @@ extern "C" void dmn_hooks_after_d3d11_device(void* device) {
 extern "C" void dmn_hooks_after_d3d12_device(void* device) {
     if (!device)
         return;
+    /* The D3D12 shared-fence value store rides WriteBufferImmediate, which the
+     * D3DMDevice constructor may have just gated off (GPTk 4.0b1). */
+    dmn_force_write_buffer_immediate();
     auto* dev = reinterpret_cast<IUnknown*>(device);
     ID3D12Device* d = nullptr;
     if (SUCCEEDED(dev->QueryInterface(__uuidof(ID3D12Device),

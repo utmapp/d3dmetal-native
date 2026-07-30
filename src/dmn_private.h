@@ -56,6 +56,15 @@ struct DmnFrameworkApi {
                                   void**, void**);
     int32_t (DMN_MS_ABI *D3D10CreateBlob)(size_t, void**);
 
+    /* D3DMDevice::EnableWriteBufferImmediate — an exported static bool that
+     * gates ID3D12GraphicsCommandList2::WriteBufferImmediate. GPTk 3.0 and
+     * earlier initialise it to true; 4.0b1 zero-initialises it and fills it
+     * from the matched per-app profile, so it is FALSE for anything the
+     * profile table does not know — and the shared-fence value store, which
+     * is exactly a WriteBufferImmediate, silently does nothing.
+     * NULL if the symbol is absent. See dmn_force_write_buffer_immediate(). */
+    unsigned char* EnableWriteBufferImmediate;
+
     /* D3DMDevice::UseInternalHeaps — new in GPTk 4.0b1 (absent before), an
      * exported static bool that makes D3DMetal suballocate resources out of
      * large internal Metal heaps: a 4 KiB D3D11 buffer becomes an offset into a
@@ -67,6 +76,11 @@ struct DmnFrameworkApi {
 };
 
 extern DmnFrameworkApi g_dmn_api;
+
+/* Re-assert EnableWriteBufferImmediate after a device creation (the D3DMDevice
+ * constructor writes it from the profile, so it must be set afterwards, and
+ * again for every device). No-op when the symbol is absent or already set. */
+void dmn_force_write_buffer_immediate();
 
 /* Bracket an armed create so the Metal allocation it makes is dedicated to the
  * resource rather than suballocated from one of D3DMetal's internal heaps —
