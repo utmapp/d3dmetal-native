@@ -26,7 +26,8 @@ test('abi-check', abi_check, timeout: 30)
 com_contract = executable('com-contract-test', 'com_contract_test.cpp',
   include_directories: [test_native_inc, include_directories('../src')],
   link_with: dmn_lib)
-test('com-contract', com_contract, env: ['DMN_LOG=info'], timeout: 300)
+test('com-contract', com_contract, env: ['DMN_LOG=info'],
+     is_parallel: false, timeout: 300)
 
 evict_contract = executable('evict-contract-test', 'evict_contract_test.cpp',
   include_directories: test_native_inc,
@@ -157,7 +158,8 @@ error_paths = executable('error-paths-test',
   'error_paths_test.cpp',
   include_directories: test_native_inc,
   link_with: dmn_lib)
-test('error-paths', error_paths, env: ['DMN_LOG=warn'], timeout: 300)
+test('error-paths', error_paths, env: ['DMN_LOG=warn'],
+     is_parallel: false, timeout: 300)
 
 # Cross-API, cross-process shared fence: forked producer/consumer, one direction
 # per test entry (D3D11 fence -> D3D12 consumer, and D3D12 fence -> D3D11 consumer).

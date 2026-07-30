@@ -75,8 +75,11 @@ constexpr uint32_t kW = 256, kH = 256;
 constexpr int kResolveReps = 64;
 
 /* Destruction can be deferred off-thread — the runtime holds an object until the
- * GPU is done with it — so observing it means waiting. */
-constexpr unsigned kDeathWaitMs = 5000;
+ * GPU is done with it — so observing it means waiting. Generous on purpose: the
+ * wait ends as soon as the thing happens, so the length only costs anything when
+ * the test is about to fail, and being stingy here made it fail under suite load
+ * on a framework it passes on when run alone. */
+constexpr unsigned kDeathWaitMs = 30000;
 
 HRESULT make_shared_texture(ID3D11Device* dev, Com<ID3D11Texture2D>& out) {
     D3D11_TEXTURE2D_DESC td = {};
