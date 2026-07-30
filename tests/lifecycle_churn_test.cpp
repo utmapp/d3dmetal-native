@@ -30,7 +30,9 @@
 #include "d3dmetal_native.h"
 #define T_TAG "CHURN"
 #include "common/com.h"
+#include "common/gpu.h"
 #include "common/skip.h"
+#include "common/util.h"
 
 namespace {
 
@@ -42,6 +44,20 @@ constexpr uint32_t kW = 512, kH = 512; /* 1 MiB per BGRA texture */
  * interception at all) — the control for separating D3DMetal's own
  * per-resource footprint behavior from the sharing machinery's. */
 bool g_shared = true;
+
+/* Which resource kinds a churn round exercises. The aggregate round runs all of
+ * them, which is what a real workload does; measuring them one at a time is what
+ * turns "fds grew by 408" into "D3D11 shared fences leak 1.5 per iteration". */
+enum ChurnKind : unsigned {
+    K_TEX11   = 1u << 0,
+    K_BUF11   = 1u << 1,
+    K_FENCE11 = 1u << 2,
+    K_TEX12   = 1u << 3,
+    K_FENCE12 = 1u << 4,
+    K_ALL_11  = K_TEX11 | K_BUF11 | K_FENCE11,
+    K_ALL_12  = K_TEX12 | K_FENCE12,
+    K_ALL     = K_ALL_11 | K_ALL_12,
+};
 
 int count_fds() {
     int n = 0;
@@ -69,7 +85,7 @@ void settle(ID3D11DeviceContext* ctx) {
     nanosleep(&ns, nullptr);
 }
 
-int churn_d3d11() {
+int churn_d3d11(unsigned kinds = K_ALL_11) {
     Com<ID3D11Device> dev;
     Com<ID3D11DeviceContext> ctx;
     D3D_FEATURE_LEVEL fl = D3D_FEATURE_LEVEL_11_1, flo;
@@ -88,6 +104,7 @@ int churn_d3d11() {
     }
 
     for (int i = 0; i < kIters11; i++) {
+      if (kinds & K_TEX11) {
         /* Shared texture, keyed mutex on every other iteration. */
         D3D11_TEXTURE2D_DESC td{};
         td.Width = kW;
@@ -136,7 +153,9 @@ int churn_d3d11() {
                 return -1;
             }
         }
+      }
 
+      if (kinds & K_BUF11) {
         /* Shared buffer. */
         D3D11_BUFFER_DESC bd{};
         bd.ByteWidth = 65536;
@@ -148,7 +167,9 @@ int churn_d3d11() {
             fprintf(stderr, "CHURN: iter %d CreateBuffer FAILED\n", i);
             return -1;
         }
+      }
 
+      if (kinds & K_FENCE11) {
         /* Shared fence: create, signal once (drives the GPU slot store), export. */
         Com<ID3D11Fence> fence;
         HRESULT fhr = dev5->CreateFence(0, g_shared ? D3D11_FENCE_FLAG_SHARED
@@ -177,6 +198,7 @@ int churn_d3d11() {
             return -1;
         }
         ctx4->Signal(fence.ptr(), 1);
+      }
 
         /* Everything drops here (Com dtors): texture + buffer + fence must
          * take their registry entries, PODs, mutex, and backing with them. */
@@ -185,7 +207,7 @@ int churn_d3d11() {
     return 0;
 }
 
-int churn_d3d12() {
+int churn_d3d12(unsigned kinds = K_ALL_12) {
     Com<ID3D12Device> dev;
     if (FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0,
                                  __uuidof(ID3D12Device), (void**)&dev))) {
@@ -202,6 +224,7 @@ int churn_d3d12() {
     }
 
     for (int i = 0; i < kIters12; i++) {
+      if (kinds & K_TEX12) {
         /* Shared committed texture. */
         D3D12_HEAP_PROPERTIES hp{};
         hp.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -237,7 +260,9 @@ int churn_d3d12() {
             fprintf(stderr, "CHURN: iter %d D3D12 handle close FAILED\n", i);
             return -1;
         }
+      }
 
+      if (kinds & K_FENCE12) {
         /* Shared fence, queue-signaled (helper-queue write + drained teardown). */
         Com<ID3D12Fence> fence;
         if (FAILED(dev->CreateFence(0, g_shared ? D3D12_FENCE_FLAG_SHARED
@@ -252,6 +277,7 @@ int churn_d3d12() {
             struct timespec ns = {0, 1000 * 1000};
             nanosleep(&ns, nullptr);
         }
+      }
     }
     settle(nullptr);
     return 0;
@@ -287,6 +313,71 @@ int run_measured(int64_t* fd_growth, int64_t* mem_growth) {
     printf("CHURN-GROWTH fds=%lld mem_mib=%lld\n", (long long)*fd_growth,
            (long long)*mem_growth);
     return 0;
+}
+
+/* == Per-kind accounting =================================================
+ * The aggregate number above says whether the process leaks; it does not say
+ * what. Running each kind on its own does, and the difference matters: a leak of
+ * one fd per resource and bounded retention by a framework-side pool look
+ * identical in a single total. (Measured this way, GPTk 3.0 retains roughly half
+ * an fd per shared texture — its texture pool, see com-contract — while shared
+ * D3D11 fences leaked about 1.5 each.)
+ *
+ * The budget is per iteration and deliberately not zero: a framework may hold a
+ * bounded number of recently released resources, and the whole point is to
+ * separate that from growth proportional to the work done. */
+struct KindBudget {
+    const char* name;
+    unsigned    kinds;
+    bool        d3d12;
+    double      fds_per_iter;
+};
+
+const KindBudget kKindBudgets[] = {
+    {"D3D11 shared texture", K_TEX11,   false, 0.25},
+    {"D3D11 shared buffer",  K_BUF11,   false, 0.25},
+    {"D3D11 shared fence",   K_FENCE11, false, 0.25},
+    {"D3D12 shared texture", K_TEX12,   true,  0.25},
+    {"D3D12 shared fence",   K_FENCE12, true,  0.25},
+};
+
+/* Returns 0 on success, -T_SKIP_CODE when a kind needs an API this D3DMetal does
+ * not implement, 1 on a budget failure. */
+int measure_per_kind() {
+    int failures = 0;
+    for (const KindBudget& k : kKindBudgets) {
+        const int iters = k.d3d12 ? kIters12 : kIters11;
+        /* Warm up: first use of a kind pays one-time costs that never come
+         * back and have nothing to do with churn. */
+        int rc = k.d3d12 ? churn_d3d12(k.kinds) : churn_d3d11(k.kinds);
+        if (rc == -T_SKIP_CODE)
+            return rc;
+        if (rc != 0)
+            return 1;
+
+        const int before = t_count_fds();
+        rc = k.d3d12 ? churn_d3d12(k.kinds) : churn_d3d11(k.kinds);
+        if (rc == -T_SKIP_CODE)
+            return rc;
+        if (rc != 0)
+            return 1;
+        const int after = t_count_fds();
+
+        const int growth = after - before;
+        const double per_iter = (double)growth / iters;
+        const int budget = (int)(k.fds_per_iter * iters);
+        printf("CHURN-KIND %-22s %4d iterations: fds %+d (%.2f/iter, budget "
+               "%d) %s\n", k.name, iters, growth, per_iter, budget,
+               growth > budget ? "OVER" : "ok");
+        if (growth > budget) {
+            fprintf(stderr, "CHURN: %s grew by %d fd(s) over %d iterations "
+                    "(%.2f per iteration) — that is proportional to the work "
+                    "done, not a bounded cache\n", k.name, growth, iters,
+                    per_iter);
+            failures++;
+        }
+    }
+    return failures ? 1 : 0;
 }
 
 /* Re-exec self in control mode and parse its CHURN-GROWTH line. */
@@ -361,6 +452,54 @@ int main(int argc, char** argv) {
     if (mrc != 0)
         return 1;
 
+    /* Per-kind, so a failure names the resource kind that grew rather than
+     * leaving the total to be bisected by hand.
+     *
+     * Opt-in: it repeats the churn once per kind, which multiplies the runtime
+     * and, on GPTk 4.0b1, the exposure to the shared-D3D11-fence wedge this
+     * suite has an open issue for. It is the tool for attributing the aggregate
+     * number above, not something every run needs. */
+    int kind_failed = 0;
+    if (getenv("CHURN_PER_KIND")) {
+        int krc = measure_per_kind();
+        if (krc == -T_SKIP_CODE)
+            T_SKIP("ID3D11Device5::CreateFence is not implemented by this "
+                   "D3DMetal, so fence churn cannot be measured");
+        kind_failed = (krc != 0);
+    } else {
+        printf("CHURN: per-kind breakdown not run (set CHURN_PER_KIND=1 to "
+               "attribute any growth above to a resource kind)\n");
+    }
+
+    /* And the post-condition that matters most: after all that lifetime
+     * traffic, is the GPU still executing anything? A command buffer left
+     * referencing a freed shared backing kills the queue, and without this the
+     * only symptom is the next test timing out. */
+    bool queue_ok = true;
+    {
+        Com<ID3D11Device> dev;
+        Com<ID3D11DeviceContext> ctx;
+        D3D_FEATURE_LEVEL fl = D3D_FEATURE_LEVEL_11_1, flo;
+        if (SUCCEEDED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE,
+                                        nullptr, 0, &fl, 1, D3D11_SDK_VERSION,
+                                        &dev, &flo, &ctx)))
+            queue_ok = t_gpu_queue_alive_d3d11(dev.ptr(), ctx.ptr(), 5000);
+        Com<ID3D12Device> d12;
+        if (queue_ok &&
+            SUCCEEDED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0,
+                                        __uuidof(ID3D12Device), (void**)&d12))) {
+            D3D12_COMMAND_QUEUE_DESC qd = {};
+            qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+            Com<ID3D12CommandQueue> q;
+            if (SUCCEEDED(d12->CreateCommandQueue(&qd,
+                                                  __uuidof(ID3D12CommandQueue),
+                                                  (void**)&q)))
+                queue_ok = t_gpu_queue_alive_d3d12(d12.ptr(), q.ptr(), 5000);
+        }
+    }
+    if (queue_ok)
+        printf("CHURN: GPU queues still executing after the churn: OK\n");
+
     /* The sharing machinery must not add growth beyond D3DMetal's own churn
      * behavior (the control): a leaked backing would be ~1 fd + ~1 MiB per
      * texture iteration ON TOP of it — 300+ fds / 300+ MiB here. fds are
@@ -384,6 +523,11 @@ int main(int argc, char** argv) {
         printf("CHURN: holding %s s (pid=%d)\n", hold, getpid());
         sleep((unsigned)atoi(hold));
     }
+
+    if (kind_failed)
+        rc = 1;
+    if (!queue_ok)
+        rc = 1;
 
     if (rc == 0)
         printf("CHURN: PASS\n");
