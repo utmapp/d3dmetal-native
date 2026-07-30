@@ -1669,13 +1669,18 @@ HRESULT STDMETHODCALLTYPE hook_d3d12_CreateCommandQueue1(
 HRESULT STDMETHODCALLTYPE hook_d3d12_SetEventOnMultipleFenceCompletion(
         ID3D12Device1* This, ID3D12Fence* const* fences, const UINT64* values,
         UINT count, D3D12_MULTIPLE_FENCE_WAIT_FLAGS flags, HANDLE ev) {
+    auto orig = DMN_ORIG(d3d12_SetEventOnMultipleFenceCompletion, This);
+    HRESULT hr = orig ? orig(This, fences, values, count, flags, ev) : E_NOTIMPL;
     /* Imports are real fences, so the native multi-wait works as-is; each
      * imported entry just needs its wait watcher armed so the local fence
-     * reaches the awaited value. */
-    for (UINT i = 0; fences && values && i < count; i++)
-        dmn_fd3d_before_queue_wait(fences[i], values[i]);
-    auto orig = DMN_ORIG(d3d12_SetEventOnMultipleFenceCompletion, This);
-    return orig ? orig(This, fences, values, count, flags, ev) : E_NOTIMPL;
+     * reaches the awaited value. Only after the wait was actually registered
+     * though: a rejected call (GPTk 2.1 and earlier do not implement this one)
+     * would otherwise leave watcher threads waiting on values nobody is going
+     * to deliver, outliving the state they were armed against. */
+    if (SUCCEEDED(hr))
+        for (UINT i = 0; fences && values && i < count; i++)
+            dmn_fd3d_before_queue_wait(fences[i], values[i]);
+    return hr;
 }
 
 /* == D3D12 share entry points ============================================== */

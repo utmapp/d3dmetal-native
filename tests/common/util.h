@@ -8,6 +8,7 @@
 #pragma once
 
 #include <fcntl.h>
+#include <mach/mach.h>
 #include <stdint.h>
 #include <time.h>
 
@@ -41,4 +42,19 @@ static inline int t_count_fds(void) {
         if (fcntl(fd, F_GETFD) != -1)
             n++;
     return n;
+}
+
+/* Live threads in this process. A rejected call that armed a watcher before
+ * discovering it had nothing to watch leaves one of these behind, and a leaked
+ * thread is otherwise invisible until it touches freed state. */
+static inline int t_count_threads(void) {
+    thread_act_array_t list = nullptr;
+    mach_msg_type_number_t n = 0;
+    if (task_threads(mach_task_self(), &list, &n) != KERN_SUCCESS)
+        return -1;
+    for (mach_msg_type_number_t i = 0; i < n; i++)
+        mach_port_deallocate(mach_task_self(), list[i]);
+    vm_deallocate(mach_task_self(), (vm_address_t)list,
+                  n * sizeof(thread_act_t));
+    return (int)n;
 }
