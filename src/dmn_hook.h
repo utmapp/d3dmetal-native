@@ -18,6 +18,10 @@
 #include <unordered_map>
 
 #include <windows.h>
+/* dmn_com_identity() canonicalizes through ID3D11DeviceChild / ID3D12Object,
+ * so both hierarchies must be declared here. */
+#include <d3d11.h>
+#include <d3d12.h>
 
 /* == Member-pointer -> vtable slot (Itanium C++ ABI) ======================= */
 template <class F>
@@ -92,16 +96,75 @@ inline size_t dmn_vindex_qi() {
 #define DMN_ORIG(name, This) h_##name.original((void*)(This))
 
 /* == COM helpers =========================================================== */
-/* Canonical identity of a COM object (QI to IUnknown), usable as a map key. */
+
+/* Which object a QueryInterface issued through a given interface pointer takes
+ * its reference on. COM says the one it hands back, and every D3DMetal does
+ * that from a resource's own vtable — but GPTk 4.0b1's DXGI resource views
+ * AddRef *themselves* while handing back the resource they front. Releasing the
+ * returned pointer there destroys a resource the app still holds; releasing
+ * nothing pins it forever (the view keeps a reference on the resource). Either
+ * way the resource's lifetime breaks, so identity resolution has to give back
+ * whichever object actually got the count.
+ *
+ * Answered in dmn_com_hooks.cpp, where the views are minted and probed. */
+enum DmnQiRefTarget {
+    DMN_QI_REF_RESULT = 0, /* the returned interface (correct COM) */
+    DMN_QI_REF_SOURCE,     /* the interface QueryInterface was called on */
+    DMN_QI_REF_NONE,       /* no reference taken at all */
+};
+/* extern "C" so it lands in the dylib's exported dmn_* set (the tests assert
+ * these invariants against the very function the registries call). */
+extern "C" DmnQiRefTarget dmn_com_qi_ref_target(void* obj);
+
+/* Current reference count of `p`, without changing it. */
+inline unsigned long dmn_com_refs(IUnknown* p) {
+    p->AddRef();
+    return p->Release();
+}
+
+namespace dmn_detail {
+/* QueryInterface purely for identity: the returned pointer is used as a map key
+ * and never dereferenced, so the reference it took is given straight back — to
+ * whichever object holds it (see DmnQiRefTarget). */
+inline void* qi_ptr(IUnknown* p, REFIID iid, DmnQiRefTarget target) {
+    IUnknown* o = nullptr;
+    if (FAILED(p->QueryInterface(iid, reinterpret_cast<void**>(&o))) || !o)
+        return nullptr;
+    if (target == DMN_QI_REF_RESULT)
+        o->Release();
+    else if (target == DMN_QI_REF_SOURCE)
+        p->Release();
+    return o;
+}
+} // namespace dmn_detail
+
+/* Canonical identity of a COM object, usable as a map key: the same value from
+ * every interface view of the same underlying object, and stable across
+ * repeated queries.
+ *
+ * QI(IID_IUnknown) is the textbook way to get that, but D3DMetal 4.0b1 broke
+ * it: for a D3D11 resource, QueryInterface(IDXGIResource) mints a *fresh*
+ * wrapper object per call, and IUnknown on that wrapper returns the wrapper
+ * itself rather than the resource it fronts. Keying on IUnknown then makes
+ * every registry lookup arriving through a DXGI view (GetSharedHandle,
+ * CreateSharedHandle, the keyed-mutex QI) miss, and the export falls through to
+ * D3DMetal's own "Unsupported: IDXGIResource::GetSharedHandle" stub.
+ *
+ * ID3D11DeviceChild / ID3D12Object *are* forwarded to the owning object on
+ * every GPTk version tested (1.0, 2.1, 3.0, 4.0b1), from the object and from a
+ * DXGI view alike, so ask those first. Every object the sharing registry keys
+ * on (textures, buffers, fences, heaps, resources, queues) exposes one of them;
+ * IUnknown remains the fallback for anything that exposes neither. */
 inline void* dmn_com_identity(IUnknown* p) {
     if (!p)
         return nullptr;
-    IUnknown* unk = nullptr;
-    if (SUCCEEDED(p->QueryInterface(__uuidof(IUnknown),
-                                    reinterpret_cast<void**>(&unk))) && unk) {
-        unk->Release();
+    const DmnQiRefTarget t = dmn_com_qi_ref_target(p);
+    if (void* c11 = dmn_detail::qi_ptr(p, __uuidof(ID3D11DeviceChild), t))
+        return c11;
+    if (void* o12 = dmn_detail::qi_ptr(p, __uuidof(ID3D12Object), t))
+        return o12;
+    if (void* unk = dmn_detail::qi_ptr(p, __uuidof(IUnknown), t))
         return unk;
-    }
     return p;
 }
 

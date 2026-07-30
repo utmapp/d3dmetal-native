@@ -522,6 +522,58 @@ void track_fence_d3d12(ID3D12Fence* f) {
     attach_evict_sentinel(f, dmn_com_identity(f), EV_FENCE);
 }
 
+/* == DXGI view identity ===================================================
+ * A DXGI resource view is a distinct object fronting a D3D resource, minted
+ * fresh by each QueryInterface(IDXGIResource). Two of its properties vary by
+ * D3DMetal version and both break identity resolution on GPTk 4.0b1:
+ *
+ *   - QueryInterface(IID_IUnknown) on a view returns the VIEW, not the resource
+ *     it fronts, so IUnknown is no longer a canonical key (handled by asking
+ *     ID3D11DeviceChild / ID3D12Object first — see dmn_com_identity).
+ *   - QueryInterface for those interfaces hands back the resource but AddRefs
+ *     the VIEW, so the reference is on the wrong object. Releasing the returned
+ *     resource destroys it under the app (whose own next Release then faults on
+ *     freed memory); releasing nothing instead leaves the view alive forever,
+ *     and the view holds a reference on the resource — so the resource is never
+ *     destroyed, its registry entry is never evicted, and its fd and shared
+ *     mapping leak.
+ *
+ * Both are properties of the view, so identity resolution has to know it is
+ * looking at one. A view's vtable is exactly a vtable we patched GetSharedHandle
+ * onto, which the hook state already records — no extra bookkeeping.
+ *
+ * Which object the QueryInterface counts against is probed once, the first time
+ * a view is in hand next to the resource it fronts. */
+std::atomic<int> g_view_qi_ref_target{-1}; /* -1 unknown, else DmnQiRefTarget */
+
+void probe_view_qi_ref_target(IUnknown* primary, IUnknown* view) {
+    if (g_view_qi_ref_target.load(std::memory_order_acquire) >= 0)
+        return;
+    const unsigned long pri_before = dmn_com_refs(primary);
+    const unsigned long view_before = dmn_com_refs(view);
+    ID3D11DeviceChild* c = nullptr;
+    if (FAILED(view->QueryInterface(__uuidof(ID3D11DeviceChild),
+                                    reinterpret_cast<void**>(&c))) || !c)
+        return; /* nothing to learn from; leave it unknown and probe again */
+
+    DmnQiRefTarget target;
+    if (dmn_com_refs(primary) > pri_before) {
+        target = DMN_QI_REF_RESULT;
+        c->Release();
+    } else if (dmn_com_refs(view) > view_before) {
+        target = DMN_QI_REF_SOURCE;
+        view->Release();
+        DMN_WARN("hooks: this D3DMetal's DXGI views AddRef themselves when their "
+                 "QueryInterface hands back the resource they front; identity "
+                 "lookups will release the view instead of the result");
+    } else {
+        target = DMN_QI_REF_NONE;
+        DMN_WARN("hooks: this D3DMetal's DXGI views take no reference at all in "
+                 "QueryInterface; identity lookups will release nothing");
+    }
+    g_view_qi_ref_target.store((int)target, std::memory_order_release);
+}
+
 /* Patch the export methods (and keyed-mutex QI) onto a shared resource's
  * vtables. Patches both the interface pointer the app holds and its
  * IDXGIResource view, since QueryInterface sits at slot 0 of each. */
@@ -533,6 +585,7 @@ void patch_shared_resource_exports(IUnknown* res) {
         DMN_PATCH_QI(r1, res_QueryInterface);
         DMN_PATCH(r1, IDXGIResource, GetSharedHandle, GetSharedHandle);
         DMN_PATCH(r1, IDXGIResource1, CreateSharedHandle, res_CreateSharedHandle);
+        probe_view_qi_ref_target(res, r1);
         r1->Release();
         return;
     }
@@ -541,6 +594,7 @@ void patch_shared_resource_exports(IUnknown* res) {
                                       reinterpret_cast<void**>(&r0))) && r0) {
         DMN_PATCH_QI(r0, res_QueryInterface);
         DMN_PATCH(r0, IDXGIResource, GetSharedHandle, GetSharedHandle);
+        probe_view_qi_ref_target(res, r0);
         r0->Release();
     }
 }
@@ -1716,6 +1770,20 @@ bool dmn_res_lookup_buffer_pod(IUnknown* res, dmn_shared_buffer_handle* out) {
 }
 
 /* == Post-create patch entry points (called from dmn_init.cpp) =========== */
+
+/* dmn_hook.h's identity resolution asks these (see the DXGI view identity
+ * comment above); they live here because the view vtables and the probe do. */
+extern "C" DmnQiRefTarget dmn_com_qi_ref_target(void* obj) {
+    /* Only a DXGI view can deviate; a resource's own vtable is COM-correct on
+     * every version. A view is exactly an object whose vtable we patched
+     * GetSharedHandle onto. */
+    if (!obj || !h_GetSharedHandle.original_for(obj))
+        return DMN_QI_REF_RESULT;
+    const int probed = g_view_qi_ref_target.load(std::memory_order_acquire);
+    /* Not probed yet (the view was minted before any patch landed): assume the
+     * COM-correct answer, which is what every version but 4.0b1 does. */
+    return probed < 0 ? DMN_QI_REF_RESULT : (DmnQiRefTarget)probed;
+}
 
 extern "C" void dmn_hooks_after_d3d11_device(void* device) {
     if (!device)

@@ -14,6 +14,15 @@ abi_check = executable('abi-check-test', 'abi_check_test.cpp',
   include_directories: [test_native_inc, include_directories('../src')])
 test('abi-check', abi_check, timeout: 30)
 
+# The COM invariants every registry in the library keys on: identity resolved
+# through a DXGI view must match the resource's and cost no references, and a
+# shared resource must die when the app drops it. Needs ../src for the library's
+# own dmn_com_identity().
+com_contract = executable('com-contract-test', 'com_contract_test.cpp',
+  include_directories: [test_native_inc, include_directories('../src')],
+  link_with: dmn_lib)
+test('com-contract', com_contract, env: ['DMN_LOG=info'], timeout: 300)
+
 evict_contract = executable('evict-contract-test', 'evict_contract_test.cpp',
   include_directories: test_native_inc,
   link_with: dmn_lib)
