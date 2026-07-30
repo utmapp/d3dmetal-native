@@ -37,6 +37,15 @@ format_caps_test = executable('format-caps-test',
   link_with: dmn_lib)
 test('format-caps', format_caps_test, env: ['DMN_LOG=info'], timeout: 300)
 
+# Windowless: CreateBlendState1 must hand back a usable blend state. Also
+# reports what the framework does unaided, so an upstream fix — after which the
+# dmn_com_hooks repair is dead code — shows up in the test log.
+blend_state1_test = executable('blend-state1-test',
+  'blend_state1_test.cpp',
+  include_directories: test_native_inc,
+  link_with: dmn_lib)
+test('blend-state1', blend_state1_test, env: ['DMN_LOG=info'], timeout: 300)
+
 d3d11_triangle = executable('d3d11-triangle',
   ['d3d11_triangle.cpp', 'cocoa_window.mm'],
   include_directories: test_native_inc,

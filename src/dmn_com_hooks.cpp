@@ -370,6 +370,8 @@ HRESULT STDMETHODCALLTYPE hook_d3d11_CreateBuffer(ID3D11Device*, const D3D11_BUF
 HRESULT STDMETHODCALLTYPE hook_d3d11_CheckFormatSupport(ID3D11Device*, DXGI_FORMAT, UINT*);
 HRESULT STDMETHODCALLTYPE hook_d3d11_CheckFeatureSupport(ID3D11Device*, D3D11_FEATURE, void*,
     UINT);
+HRESULT STDMETHODCALLTYPE hook_d3d11_CreateBlendState1(ID3D11Device1*,
+    const D3D11_BLEND_DESC1*, ID3D11BlendState1**);
 HRESULT STDMETHODCALLTYPE hook_d3d11_OpenSharedResource(ID3D11Device*, HANDLE, REFIID, void**);
 HRESULT STDMETHODCALLTYPE hook_d3d11_OpenSharedResource1(ID3D11Device1*, HANDLE, REFIID, void**);
 HRESULT STDMETHODCALLTYPE hook_d3d11_OpenSharedResourceByName(ID3D11Device1*, LPCWSTR, DWORD,
@@ -450,6 +452,7 @@ DMN_HOOK_STATE(d3d11_CreateTexture3D);
 DMN_HOOK_STATE(d3d11_CreateBuffer);
 DMN_HOOK_STATE(d3d11_CheckFormatSupport);
 DMN_HOOK_STATE(d3d11_CheckFeatureSupport);
+DMN_HOOK_STATE(d3d11_CreateBlendState1);
 DMN_HOOK_STATE(d3d11_OpenSharedResource);
 DMN_HOOK_STATE(d3d11_OpenSharedResource1);
 DMN_HOOK_STATE(d3d11_OpenSharedResourceByName);
@@ -942,6 +945,97 @@ HRESULT STDMETHODCALLTYPE hook_d3d11_CreateTexture2D1(
     d.CPUAccessFlags = desc->CPUAccessFlags; d.MiscFlags = desc->MiscFlags;
     record_texture(*out, d, arm);
     return hr;
+}
+
+/* == CreateBlendState1 repair ==============================================
+ * GPTk 4.0b1's ID3D11Device1::CreateBlendState1 returns S_OK and writes NULL.
+ * It builds and caches the state correctly, then fetches the COM pointer to
+ * hand back through the 4.0-era D3DMExternalInterface lookup
+ * (D3D11BlendState::AsInterface(GUID)), which has no case for
+ * IID_ID3D11BlendState1 and answers NULL. It neither checks that NULL nor drops
+ * the reference it took, so the caller sees success with an empty
+ * out-parameter. Sibling CreateBlendState asks for IID_ID3D11BlendState, which
+ * the table does have.
+ *
+ * Repair: satisfy the call through CreateBlendState. The object it returns is
+ * the one CreateBlendState1 would have cached — D3DMetal keys blend states on
+ * the widened DESC1 and vends one external interface per object, whose vtable
+ * is the full ID3D11BlendState1 one (GetDesc1 included) — so the pointer is a
+ * valid ID3D11BlendState1 and repeat creates still dedupe to one state.
+ *
+ * The pass-through comes first, so a framework whose CreateBlendState1 works
+ * (3.0 and earlier) is untouched and keeps full DESC1 fidelity. Once a call has
+ * shown the entry point broken the original is skipped: the missing AsInterface
+ * case does not depend on the desc, and calling it anyway would strand another
+ * reference on the cached state. */
+
+/* Narrow a DESC1 to the DESC that CreateBlendState takes. D3DMetal widens it
+ * straight back, so the only fields that cannot survive the round trip are the
+ * two this drops. */
+D3D11_BLEND_DESC narrow_blend_desc(const D3D11_BLEND_DESC1& d1, bool* lost_logic_op) {
+    D3D11_BLEND_DESC d{};
+    d.AlphaToCoverageEnable = d1.AlphaToCoverageEnable;
+    d.IndependentBlendEnable = d1.IndependentBlendEnable;
+    for (int i = 0; i < 8; i++) {
+        const D3D11_RENDER_TARGET_BLEND_DESC1& s = d1.RenderTarget[i];
+        d.RenderTarget[i].BlendEnable = s.BlendEnable;
+        d.RenderTarget[i].SrcBlend = s.SrcBlend;
+        d.RenderTarget[i].DestBlend = s.DestBlend;
+        d.RenderTarget[i].BlendOp = s.BlendOp;
+        d.RenderTarget[i].SrcBlendAlpha = s.SrcBlendAlpha;
+        d.RenderTarget[i].DestBlendAlpha = s.DestBlendAlpha;
+        d.RenderTarget[i].BlendOpAlpha = s.BlendOpAlpha;
+        d.RenderTarget[i].RenderTargetWriteMask = s.RenderTargetWriteMask;
+        if (s.LogicOpEnable)
+            *lost_logic_op = true;
+        /* Only RenderTarget[0] is read unless IndependentBlendEnable. */
+        if (!d1.IndependentBlendEnable)
+            break;
+    }
+    return d;
+}
+
+std::atomic<bool> g_blend_state1_broken{false};
+
+HRESULT STDMETHODCALLTYPE hook_d3d11_CreateBlendState1(
+        ID3D11Device1* This, const D3D11_BLEND_DESC1* desc,
+        ID3D11BlendState1** out) {
+    auto orig = DMN_ORIG(d3d11_CreateBlendState1, This);
+    if (!orig)
+        return E_FAIL;
+    if (!g_blend_state1_broken.load(std::memory_order_acquire)) {
+        HRESULT hr = orig(This, desc, out);
+        /* Working framework, a real failure, or a parameter-validation call
+         * with no out-parameter to fill: nothing to repair. */
+        if (FAILED(hr) || !out || *out || !desc)
+            return hr;
+        g_blend_state1_broken.store(true, std::memory_order_release);
+    } else if (!out || !desc) {
+        /* Preserve the original's own parameter validation. */
+        return orig(This, desc, out);
+    }
+
+    ID3D11Device* d0 = nullptr;
+    if (FAILED(This->QueryInterface(__uuidof(ID3D11Device),
+                                    reinterpret_cast<void**>(&d0))) || !d0)
+        return E_NOINTERFACE;
+
+    bool lost_logic_op = false;
+    const D3D11_BLEND_DESC d = narrow_blend_desc(*desc, &lost_logic_op);
+    ID3D11BlendState* bs = nullptr;
+    HRESULT hr = d0->CreateBlendState(&d, &bs);
+    d0->Release();
+    if (FAILED(hr) || !bs)
+        return FAILED(hr) ? hr : E_NOINTERFACE;
+
+    /* Same object, and its external vtable IS ID3D11BlendState1's. */
+    *out = reinterpret_cast<ID3D11BlendState1*>(bs);
+
+    if (lost_logic_op)
+        DMN_WARN("hooks: CreateBlendState1 asked for logic-op blending, which "
+                 "the CreateBlendState retry path cannot express; the state was "
+                 "created without it");
+    return S_OK;
 }
 
 /* 1D/3D shared textures have no backing implementation: warn loudly instead
@@ -1661,6 +1755,8 @@ extern "C" void dmn_hooks_after_d3d11_device(void* device) {
                                       reinterpret_cast<void**>(&d1))) && d1) {
         DMN_PATCH(d1, ID3D11Device1, OpenSharedResource1, d3d11_OpenSharedResource1);
         DMN_PATCH(d1, ID3D11Device1, OpenSharedResourceByName, d3d11_OpenSharedResourceByName);
+        /* Repairs a 4.0b1 CreateBlendState1 that answers S_OK with no state. */
+        DMN_PATCH(d1, ID3D11Device1, CreateBlendState1, d3d11_CreateBlendState1);
         d1->Release();
     }
     ID3D11Device3* d3 = nullptr;
