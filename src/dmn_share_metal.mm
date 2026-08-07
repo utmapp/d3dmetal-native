@@ -985,14 +985,21 @@ void sub_resources_make_resident(id<MTLCommandBuffer> cb, id enc, bool compute) 
             return;
         snapshot = [[g_sub_resources allObjects] retain];
     }
+    /* Residency-only declaration: always Read, never the resource's stored
+     * usage.  Writes to impostors ride explicit binding points (render-pass
+     * attachments, blit arguments), which hazard-track on their own; a Write
+     * declared here would instead put a write hazard on the whole tracked set
+     * in every encoder, serializing every encoder against every other one.
+     * Read is the weakest usage that still pins residency for the
+     * unretained CBs. */
     for (id<MTLResource> r in snapshot) {
-        const MTLResourceUsage usage = sub_resource_usage(r);
         if (compute) {
-            [(id<MTLComputeCommandEncoder>)enc useResource:r usage:usage];
+            [(id<MTLComputeCommandEncoder>)enc useResource:r
+                                                     usage:MTLResourceUsageRead];
         } else {
             [(id<MTLRenderCommandEncoder>)enc
                 useResource:r
-                      usage:usage
+                      usage:MTLResourceUsageRead
                      stages:MTLRenderStageVertex | MTLRenderStageFragment];
         }
     }
