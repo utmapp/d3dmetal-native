@@ -373,6 +373,15 @@ HRESULT STDMETHODCALLTYPE hook_d3d11_CheckFeatureSupport(ID3D11Device*, D3D11_FE
     UINT);
 HRESULT STDMETHODCALLTYPE hook_d3d11_CreateBlendState1(ID3D11Device1*,
     const D3D11_BLEND_DESC1*, ID3D11BlendState1**);
+HRESULT STDMETHODCALLTYPE hook_d3d11_CreateShaderResourceView1(ID3D11Device3*,
+    ID3D11Resource*, const D3D11_SHADER_RESOURCE_VIEW_DESC1*,
+    ID3D11ShaderResourceView1**);
+HRESULT STDMETHODCALLTYPE hook_d3d11_CreateRenderTargetView1(ID3D11Device3*,
+    ID3D11Resource*, const D3D11_RENDER_TARGET_VIEW_DESC1*,
+    ID3D11RenderTargetView1**);
+HRESULT STDMETHODCALLTYPE hook_d3d11_CreateUnorderedAccessView1(ID3D11Device3*,
+    ID3D11Resource*, const D3D11_UNORDERED_ACCESS_VIEW_DESC1*,
+    ID3D11UnorderedAccessView1**);
 HRESULT STDMETHODCALLTYPE hook_d3d11_OpenSharedResource(ID3D11Device*, HANDLE, REFIID, void**);
 HRESULT STDMETHODCALLTYPE hook_d3d11_OpenSharedResource1(ID3D11Device1*, HANDLE, REFIID, void**);
 HRESULT STDMETHODCALLTYPE hook_d3d11_OpenSharedResourceByName(ID3D11Device1*, LPCWSTR, DWORD,
@@ -454,6 +463,9 @@ DMN_HOOK_STATE(d3d11_CreateBuffer);
 DMN_HOOK_STATE(d3d11_CheckFormatSupport);
 DMN_HOOK_STATE(d3d11_CheckFeatureSupport);
 DMN_HOOK_STATE(d3d11_CreateBlendState1);
+DMN_HOOK_STATE(d3d11_CreateShaderResourceView1);
+DMN_HOOK_STATE(d3d11_CreateRenderTargetView1);
+DMN_HOOK_STATE(d3d11_CreateUnorderedAccessView1);
 DMN_HOOK_STATE(d3d11_OpenSharedResource);
 DMN_HOOK_STATE(d3d11_OpenSharedResource1);
 DMN_HOOK_STATE(d3d11_OpenSharedResourceByName);
@@ -1091,6 +1103,129 @@ HRESULT STDMETHODCALLTYPE hook_d3d11_CreateBlendState1(
                  "the CreateBlendState retry path cannot express; the state was "
                  "created without it");
     return S_OK;
+}
+
+/* == Create*View1 repair ===================================================
+ * D3DMetal answers E_NOTIMPL for the ID3D11Device3 view creates
+ * (CreateShaderResourceView1 / CreateRenderTargetView1 /
+ * CreateUnorderedAccessView1). The D3D11.3 runtime hands a UMD the DESC1
+ * forms, so a driver at that DDI tier reasonably calls the ...1 entry
+ * points, and a caller that cannot see the failure goes on to bind a view
+ * that was never created.
+ *
+ * Satisfy the call through the base create. Every DESC is a layout prefix
+ * of its DESC1 (PlaneSlice is appended to the Texture2D/Texture2DArray
+ * union members), so narrowing is a DESC-sized copy; only a nonzero
+ * PlaneSlice cannot survive, and a request for one warns. The base create
+ * vends the framework's per-object external interface, same as the
+ * blend-state repair above. */
+
+HRESULT STDMETHODCALLTYPE hook_d3d11_CreateShaderResourceView1(
+        ID3D11Device3* This, ID3D11Resource* res,
+        const D3D11_SHADER_RESOURCE_VIEW_DESC1* desc1,
+        ID3D11ShaderResourceView1** out) {
+    auto orig = DMN_ORIG(d3d11_CreateShaderResourceView1, This);
+    if (!orig)
+        return E_FAIL;
+    HRESULT hr = orig(This, res, desc1, out);
+    if (hr != E_NOTIMPL)
+        return hr;
+
+    D3D11_SHADER_RESOURCE_VIEW_DESC d{};
+    D3D11_SHADER_RESOURCE_VIEW_DESC* pd = nullptr;
+    if (desc1) {
+        memcpy(&d, desc1, sizeof(d));
+        pd = &d;
+        if ((desc1->ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2D &&
+             desc1->Texture2D.PlaneSlice) ||
+            (desc1->ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2DARRAY &&
+             desc1->Texture2DArray.PlaneSlice))
+            DMN_WARN("hooks: CreateShaderResourceView1 asked for PlaneSlice, "
+                     "which the CreateShaderResourceView retry path cannot "
+                     "express; the view was created for plane 0");
+    }
+    ID3D11Device* d0 = nullptr;
+    if (FAILED(This->QueryInterface(__uuidof(ID3D11Device),
+                                    reinterpret_cast<void**>(&d0))) || !d0)
+        return E_NOTIMPL;
+    ID3D11ShaderResourceView* v = nullptr;
+    hr = d0->CreateShaderResourceView(res, pd, out ? &v : nullptr);
+    d0->Release();
+    if (SUCCEEDED(hr) && out)
+        *out = reinterpret_cast<ID3D11ShaderResourceView1*>(v);
+    return hr;
+}
+
+HRESULT STDMETHODCALLTYPE hook_d3d11_CreateRenderTargetView1(
+        ID3D11Device3* This, ID3D11Resource* res,
+        const D3D11_RENDER_TARGET_VIEW_DESC1* desc1,
+        ID3D11RenderTargetView1** out) {
+    auto orig = DMN_ORIG(d3d11_CreateRenderTargetView1, This);
+    if (!orig)
+        return E_FAIL;
+    HRESULT hr = orig(This, res, desc1, out);
+    if (hr != E_NOTIMPL)
+        return hr;
+
+    D3D11_RENDER_TARGET_VIEW_DESC d{};
+    D3D11_RENDER_TARGET_VIEW_DESC* pd = nullptr;
+    if (desc1) {
+        memcpy(&d, desc1, sizeof(d));
+        pd = &d;
+        if ((desc1->ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2D &&
+             desc1->Texture2D.PlaneSlice) ||
+            (desc1->ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2DARRAY &&
+             desc1->Texture2DArray.PlaneSlice))
+            DMN_WARN("hooks: CreateRenderTargetView1 asked for PlaneSlice, "
+                     "which the CreateRenderTargetView retry path cannot "
+                     "express; the view was created for plane 0");
+    }
+    ID3D11Device* d0 = nullptr;
+    if (FAILED(This->QueryInterface(__uuidof(ID3D11Device),
+                                    reinterpret_cast<void**>(&d0))) || !d0)
+        return E_NOTIMPL;
+    ID3D11RenderTargetView* v = nullptr;
+    hr = d0->CreateRenderTargetView(res, pd, out ? &v : nullptr);
+    d0->Release();
+    if (SUCCEEDED(hr) && out)
+        *out = reinterpret_cast<ID3D11RenderTargetView1*>(v);
+    return hr;
+}
+
+HRESULT STDMETHODCALLTYPE hook_d3d11_CreateUnorderedAccessView1(
+        ID3D11Device3* This, ID3D11Resource* res,
+        const D3D11_UNORDERED_ACCESS_VIEW_DESC1* desc1,
+        ID3D11UnorderedAccessView1** out) {
+    auto orig = DMN_ORIG(d3d11_CreateUnorderedAccessView1, This);
+    if (!orig)
+        return E_FAIL;
+    HRESULT hr = orig(This, res, desc1, out);
+    if (hr != E_NOTIMPL)
+        return hr;
+
+    D3D11_UNORDERED_ACCESS_VIEW_DESC d{};
+    D3D11_UNORDERED_ACCESS_VIEW_DESC* pd = nullptr;
+    if (desc1) {
+        memcpy(&d, desc1, sizeof(d));
+        pd = &d;
+        if ((desc1->ViewDimension == D3D11_UAV_DIMENSION_TEXTURE2D &&
+             desc1->Texture2D.PlaneSlice) ||
+            (desc1->ViewDimension == D3D11_UAV_DIMENSION_TEXTURE2DARRAY &&
+             desc1->Texture2DArray.PlaneSlice))
+            DMN_WARN("hooks: CreateUnorderedAccessView1 asked for PlaneSlice, "
+                     "which the CreateUnorderedAccessView retry path cannot "
+                     "express; the view was created for plane 0");
+    }
+    ID3D11Device* d0 = nullptr;
+    if (FAILED(This->QueryInterface(__uuidof(ID3D11Device),
+                                    reinterpret_cast<void**>(&d0))) || !d0)
+        return E_NOTIMPL;
+    ID3D11UnorderedAccessView* v = nullptr;
+    hr = d0->CreateUnorderedAccessView(res, pd, out ? &v : nullptr);
+    d0->Release();
+    if (SUCCEEDED(hr) && out)
+        *out = reinterpret_cast<ID3D11UnorderedAccessView1*>(v);
+    return hr;
 }
 
 /* 1D/3D shared textures have no backing implementation: warn loudly instead
@@ -1843,6 +1978,10 @@ extern "C" void dmn_hooks_after_d3d11_device(void* device) {
     if (SUCCEEDED(dev->QueryInterface(__uuidof(ID3D11Device3),
                                       reinterpret_cast<void**>(&d3))) && d3) {
         DMN_PATCH(d3, ID3D11Device3, CreateTexture2D1, d3d11_CreateTexture2D1);
+        /* Repairs the E_NOTIMPL ...View1 creates (D3D11.3 DDI-tier UMDs). */
+        DMN_PATCH(d3, ID3D11Device3, CreateShaderResourceView1, d3d11_CreateShaderResourceView1);
+        DMN_PATCH(d3, ID3D11Device3, CreateRenderTargetView1, d3d11_CreateRenderTargetView1);
+        DMN_PATCH(d3, ID3D11Device3, CreateUnorderedAccessView1, d3d11_CreateUnorderedAccessView1);
         d3->Release();
     }
     ID3D11Device5* d5 = nullptr;
