@@ -631,18 +631,38 @@ id<MTLBuffer> substitute_buffer(id<MTLDevice> device, NSUInteger length) {
 
     /* Consumer: the shared region has to cover what the caller asked for. A
      * short buffer is not something to hand back and hope about — D3DMetal
-     * would read and write past the mapping. */
-    const size_t logical = (size_t)t_arm.existing_size;
+     * would read and write past the mapping. With a window (existing_max set,
+     * imported-heap placements) a request past the armed size but inside the
+     * window is D3DMetal rounding the placed size up, and aliasing more of the
+     * window is legal; past the window stays a hard error. */
+    size_t logical = (size_t)t_arm.existing_size;
+    const size_t window = (size_t)t_arm.existing_max;
     if (!logical || logical > kMaxSharedBytes) {
         DMN_ERROR("share: import buffer size %zu out of range", logical);
         return nil;
     }
     if (length && (size_t)length > logical) {
-        DMN_ERROR("share: import buffer is %zu bytes but %lu were requested",
-                  logical, (unsigned long)length);
+        if (window && (size_t)length <= window) {
+            logical = (size_t)length;
+        } else {
+            DMN_ERROR("share: import buffer is %zu bytes but %lu were "
+                      "requested (window %zu)", logical, (unsigned long)length,
+                      window);
+            return nil;
+        }
+    }
+    if (t_arm.existing_offset & (page_align(1) - 1)) {
+        DMN_ERROR("share: import window offset %llu is not page-aligned",
+                  (unsigned long long)t_arm.existing_offset);
         return nil;
     }
     const size_t mapped = page_align(logical);
+    if (window && mapped > window) {
+        DMN_ERROR("share: import window is %zu bytes but the substitution "
+                  "needs %zu mapped — would run past the shm object", window,
+                  mapped);
+        return nil;
+    }
     const int fd = t_arm.existing_fd;
 
     /* Deliberately NOT served from the shared-mapping cache. For a texture the
@@ -652,10 +672,12 @@ id<MTLBuffer> substitute_buffer(id<MTLDevice> device, NSUInteger length) {
      * per-resource state D3DMetal keeps on it. Buffer imports are rare (fence
      * pages) and do not churn per frame, so a private mapping each time is the
      * right trade. */
-    void* ptr = mmap(nullptr, mapped, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    void* ptr = mmap(nullptr, mapped, PROT_READ | PROT_WRITE, MAP_SHARED, fd,
+                     (off_t)t_arm.existing_offset);
     if (ptr == MAP_FAILED) {
-        DMN_ERROR("share: consumer buffer mmap(fd=%d, %zu) failed: %s", fd,
-                  mapped, strerror(errno));
+        DMN_ERROR("share: consumer buffer mmap(fd=%d, off=%llu, %zu) failed: "
+                  "%s", fd, (unsigned long long)t_arm.existing_offset, mapped,
+                  strerror(errno));
         return nil;
     }
     id<MTLBuffer> buf = shared_buffer_over(device, ptr, mapped, /*owned_fd=*/-1);
@@ -664,7 +686,7 @@ id<MTLBuffer> substitute_buffer(id<MTLDevice> device, NSUInteger length) {
         munmap(ptr, mapped);
         return nil;
     }
-    buf.label = @"dmn-shared-cons-buffer";
+    buf.label = window ? @"dmn-imported-heap-window" : @"dmn-shared-cons-buffer";
     sub_resource_track(buf, both);
 
     t_arm.captured = true;
@@ -1200,6 +1222,19 @@ void dmn_share_arm_consumer_buffer(int fd, uint64_t size) {
     t_arm.alloc_new = false;
     t_arm.existing_fd = fd;
     t_arm.existing_size = size;
+}
+
+void dmn_share_arm_import_window(int fd, uint64_t offset, uint64_t size,
+                                 uint64_t max_size) {
+    dmn_dedicated_metal_alloc_begin();
+    t_arm = {};
+    t_arm.armed = true;
+    t_arm.kind = DMN_SHARE_BUFFER;
+    t_arm.alloc_new = false;
+    t_arm.existing_fd = fd;
+    t_arm.existing_size = size;
+    t_arm.existing_offset = offset;
+    t_arm.existing_max = max_size;
 }
 
 bool dmn_share_is_armed(void) { return t_arm.armed; }

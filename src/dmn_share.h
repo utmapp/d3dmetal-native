@@ -68,6 +68,13 @@ struct DmnShareArm {
                                closed here and never handed to a deallocator */
     uint64_t existing_stride;
     uint64_t existing_size;
+    uint64_t existing_offset; /* page-aligned mmap offset into existing_fd */
+    uint64_t existing_max;  /* bytes available at existing_offset. 0 means a
+                               plain import: existing_size is a hard ceiling.
+                               Nonzero lets the substitution grow to whatever
+                               D3DMetal asked for, up to this, so a rounded-up
+                               placed size stays a legal alias of the window
+                               instead of an error */
 
     /* Filled by the swizzle on capture. */
     bool     init_dropped;  /* consumer: the sentinel initial-data upload was
@@ -95,6 +102,13 @@ void dmn_share_arm_consumer(int fd, uint64_t stride, uint64_t size);
  * `size` is the byte length to back with shared memory. */
 void dmn_share_arm_producer_buffer(uint64_t size);
 void dmn_share_arm_consumer_buffer(int fd, uint64_t size);
+/* Arm for the next raw MTLBuffer creation, backing it with the window of
+ * `fd` at page-aligned `offset`: [offset + 0, offset + size) is the placed
+ * resource, and up to max_size bytes exist at `offset` for D3DMetal's
+ * size rounding. The fd is BORROWED (the imported-heap record owns it);
+ * the substituted buffer's deallocator only munmaps its own window. */
+void dmn_share_arm_import_window(int fd, uint64_t offset, uint64_t size,
+                                 uint64_t max_size);
 /* Disarm; copies the capture result into *out (may be NULL). Returns whether a
  * substitution was actually captured. Logs loudly if armed-but-not-captured. */
 bool dmn_share_disarm(DmnShareArm* out);

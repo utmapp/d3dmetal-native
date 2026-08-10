@@ -337,6 +337,27 @@ typedef struct dmn_shared_buffer_handle {
     uint64_t size;          /* logical byte length */
 } dmn_shared_buffer_handle;
 
+/* == Imported placed-buffer heaps ======================================== */
+/* Import [offset, offset+size) of a shared-memory fd as an ID3D12Heap on
+ * `device` (an ID3D12Device*). Buffers later placed on the returned heap via
+ * CreatePlacedResource alias those pages exactly (heap_offset-preserving), so
+ * a CPU writer of the shm object and the GPU see one allocation; texture
+ * placements are rejected. Built for the Neptune render server's shmem heap
+ * import (guest UPLOAD/READBACK rings that are Mapped persistently).
+ *
+ * `fd` is BORROWED (dup'd internally). `offset` must be page-aligned; `size`
+ * nonzero, at most 4 GiB, with the window inside the file (fstat-checked).
+ * `heap_type`/`heap_flags` are the app's D3D12_HEAP_TYPE / D3D12_HEAP_FLAGS
+ * (advisory: the type shapes the backing heap when it is DEFAULT/UPLOAD/
+ * READBACK, the flags are dropped). `iid` points at the 16-byte GUID of the
+ * interface to return, normally IID_ID3D12Heap. Returns an HRESULT; on
+ * success *out_heap is an AddRef'd heap the caller must Release. Plain host
+ * (SysV) calling convention. */
+int32_t dmn_open_existing_heap_from_fd(void* device, int fd,
+                                       uint64_t offset, uint64_t size,
+                                       uint32_t heap_type, uint32_t heap_flags,
+                                       const void* iid, void** out_heap);
+
 #ifdef __cplusplus
 }
 #endif

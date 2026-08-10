@@ -24,6 +24,7 @@
  */
 
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -110,6 +111,17 @@ std::unordered_map<void*, dmn_shared_texture_handle> g_tex_reg; /* identity -> P
 std::unordered_map<void*, dmn_shared_buffer_handle>  g_buf_reg;
 std::unordered_set<void*> g_shared_heaps; /* identities of SHARED-flag heaps */
 std::unordered_map<void*, int> g_owned_fds; /* identity -> registry-owned dup */
+
+/* Heaps minted by dmn_open_existing_heap_from_fd: a real D3DMetal heap whose
+ * placed buffers get their Metal backing substituted with windows into the
+ * imported shm object. The fd here is a borrowed view of the g_owned_fds dup
+ * (closed by eviction); each placed buffer's mmap window is independent of it. */
+struct DmnImportedHeap {
+    int      fd;
+    uint64_t fd_off; /* window start inside the fd (page-aligned) */
+    uint64_t size;   /* imported window length */
+};
+std::unordered_map<void*, DmnImportedHeap> g_imported_heaps; /* under g_reg_mtx */
 
 /* Every registration stores its OWN duplicate of the backing fd in its POD
  * (closed at eviction). This is what makes re-export from an OPENED resource
@@ -234,7 +246,7 @@ HRESULT vend_pod_owned(Pod pod, HANDLE* out) {
  * is validated by the evict-contract meson test against the vendored
  * framework, not re-probed at runtime. */
 
-enum EvictKind { EV_TEX, EV_BUF, EV_HEAP, EV_FENCE };
+enum EvictKind { EV_TEX, EV_BUF, EV_HEAP, EV_FENCE, EV_IMPORTED_HEAP };
 
 /* {7D3A1F7B-9C44-4A6E-8F21-5D0E6B3CA942} — private-data slot for the sentinel. */
 const GUID kDmnEvictGuid = {0x7d3a1f7b, 0x9c44, 0x4a6e,
@@ -246,6 +258,7 @@ const char* evict_kind_name(int kind) {
     case EV_BUF:   return "buffer";
     case EV_HEAP:  return "heap";
     case EV_FENCE: return "fence";
+    case EV_IMPORTED_HEAP: return "imported-heap";
     default:       return "?";
     }
 }
@@ -273,6 +286,12 @@ void evict_identity(void* id, int kind) {
         break;
     case EV_FENCE:
         dmn_fd3d_fence_destroy(id);
+        break;
+    case EV_IMPORTED_HEAP:
+        {
+            std::lock_guard<std::mutex> lk(g_reg_mtx);
+            g_imported_heaps.erase(id);
+        }
         break;
     }
     close_owned_fd(id);
@@ -1566,6 +1585,55 @@ bool heap_is_shared(ID3D12Heap* heap) {
     return g_shared_heaps.count(id) != 0;
 }
 
+bool heap_import_lookup(ID3D12Heap* heap, DmnImportedHeap* out) {
+    if (!heap)
+        return false;
+    void* id = dmn_com_identity(reinterpret_cast<IUnknown*>(heap));
+    std::lock_guard<std::mutex> lk(g_reg_mtx);
+    auto it = g_imported_heaps.find(id);
+    if (it == g_imported_heaps.end())
+        return false;
+    *out = it->second;
+    return true;
+}
+
+/* A placed buffer on an imported heap: arm the window substitution and forward
+ * the create to D3DMetal unchanged, so its suballocation bookkeeping (GetDesc,
+ * GetGPUVirtualAddress, offset validation against the real heap) stays
+ * consistent while the swizzle swaps the Metal backing for a
+ * newBufferWithBytesNoCopy view of the guest's pages at heap_offset. */
+template <class DescT, class OrigCall>
+HRESULT d12_create_placed_imported(const DmnImportedHeap& rec, UINT64 offset,
+                                   const DescT* desc, void** out,
+                                   OrigCall&& call) {
+    if (desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
+        DMN_ERROR("hooks: non-buffer placed on an imported heap (dim=%d) — "
+                  "imported heaps alias guest CPU pages and back buffers only",
+                  (int)desc->Dimension);
+        return E_INVALIDARG;
+    }
+    UINT64 end = 0;
+    if (__builtin_add_overflow(offset, desc->Width, &end) || end > rec.size) {
+        DMN_ERROR("hooks: placed buffer [%llu, +%llu) exceeds imported heap "
+                  "size %llu", (unsigned long long)offset,
+                  (unsigned long long)desc->Width,
+                  (unsigned long long)rec.size);
+        return E_INVALIDARG;
+    }
+    DMN_INFO("hooks: placed buffer on imported heap offset=%llu size=%llu",
+             (unsigned long long)offset, (unsigned long long)desc->Width);
+    dmn_share_arm_import_window(rec.fd, rec.fd_off + offset, desc->Width,
+                                rec.size - offset);
+    HRESULT hr = call();
+    DmnShareArm arm{};
+    bool captured = dmn_share_disarm(&arm);
+    if (FAILED(hr) || !out || !*out)
+        return hr; /* validation call or failed create: nothing was made */
+    if (!captured)
+        return fail_unshared("placed buffer on imported heap", out);
+    return hr;
+}
+
 HRESULT STDMETHODCALLTYPE hook_d3d12_CreateCommittedResource(
         ID3D12Device* This, const D3D12_HEAP_PROPERTIES* hp,
         D3D12_HEAP_FLAGS flags, const D3D12_RESOURCE_DESC* desc,
@@ -1660,6 +1728,9 @@ HRESULT STDMETHODCALLTYPE hook_d3d12_CreatePlacedResource(
         return E_FAIL;
     auto call = [&] { return orig(This, heap, offset, desc, state, clear,
                                   riid, out); };
+    DmnImportedHeap rec;
+    if (!dmn_share_is_armed() && desc && heap_import_lookup(heap, &rec))
+        return d12_create_placed_imported(rec, offset, desc, out, call);
     if (dmn_share_is_armed() || !desc || !heap_is_shared(heap))
         return call();
     return d12_create_shared(desc, out, call);
@@ -1674,6 +1745,9 @@ HRESULT STDMETHODCALLTYPE hook_d3d12_CreatePlacedResource1(
         return E_FAIL;
     auto call = [&] { return orig(This, heap, offset, desc, state, clear,
                                   riid, out); };
+    DmnImportedHeap rec;
+    if (!dmn_share_is_armed() && desc && heap_import_lookup(heap, &rec))
+        return d12_create_placed_imported(rec, offset, desc, out, call);
     if (dmn_share_is_armed() || !desc || !heap_is_shared(heap))
         return call();
     return d12_create_shared(desc, out, call);
@@ -1689,6 +1763,9 @@ HRESULT STDMETHODCALLTYPE hook_d3d12_CreatePlacedResource2(
         return E_FAIL;
     auto call = [&] { return orig(This, heap, offset, desc, layout, clear,
                                   num_castable, castable, riid, out); };
+    DmnImportedHeap rec;
+    if (!dmn_share_is_armed() && desc && heap_import_lookup(heap, &rec))
+        return d12_create_placed_imported(rec, offset, desc, out, call);
     if (dmn_share_is_armed() || !desc || !heap_is_shared(heap))
         return call();
     return d12_create_shared(desc, out, call);
@@ -1892,6 +1969,95 @@ extern "C" dmn_result dmn_shared_handle_close(void* handle) {
         close(fd);
     std::free(handle);
     return DMN_SUCCESS;
+}
+
+/* == Public API: import a shared-memory window as an ID3D12Heap ========== */
+/* Contract documented on the declaration in d3dmetal_native.h. Plain
+ * extern "C" (SysV, no STDMETHODCALLTYPE): the Neptune render server resolves
+ * this with dlsym and calls it with the host convention — the same deliberate
+ * choice as virglrenderer's npt_library.h function-pointer typedefs. */
+extern "C" int32_t dmn_open_existing_heap_from_fd(void* device, int fd,
+                                                  uint64_t offset,
+                                                  uint64_t size,
+                                                  uint32_t heap_type,
+                                                  uint32_t heap_flags,
+                                                  const void* iid,
+                                                  void** out_heap) {
+    if (!device || !iid || !out_heap)
+        return E_INVALIDARG;
+    *out_heap = nullptr;
+    /* Mirrors dmn_share_metal.mm's kMaxSharedBytes. */
+    const uint64_t kMaxImportBytes = 1ull << 32;
+    if (fd < 0 || !size || size > kMaxImportBytes) {
+        DMN_ERROR("hooks: heap import rejected (fd=%d size=%llu)", fd,
+                  (unsigned long long)size);
+        return E_INVALIDARG;
+    }
+    const uint64_t page = (uint64_t)dmn_share_page_align(1);
+    if (offset & (page - 1)) {
+        DMN_ERROR("hooks: heap import offset %llu is not page-aligned",
+                  (unsigned long long)offset);
+        return E_INVALIDARG;
+    }
+    struct stat st;
+    uint64_t end = 0;
+    if (fstat(fd, &st) != 0 || st.st_size < 0 ||
+        __builtin_add_overflow(offset, size, &end) ||
+        end > (uint64_t)st.st_size) {
+        DMN_ERROR("hooks: heap import window [%llu, +%llu) does not fit "
+                  "fd=%d (size %lld)", (unsigned long long)offset,
+                  (unsigned long long)size, fd, (long long)st.st_size);
+        return E_INVALIDARG;
+    }
+
+    ID3D12Device* dev = nullptr;
+    auto* unk = reinterpret_cast<IUnknown*>(device);
+    if (FAILED(unk->QueryInterface(__uuidof(ID3D12Device),
+                                   reinterpret_cast<void**>(&dev))) || !dev) {
+        DMN_ERROR("hooks: heap import device %p is not an ID3D12Device",
+                  device);
+        return E_NOINTERFACE;
+    }
+
+    /* A real D3DMetal heap backs the import so the returned pointer is a
+     * genuine heap everywhere it can travel (MakeResident, Evict, ...); the
+     * reservation stays untouched — placed buffers get their Metal backing
+     * substituted with windows into the shm object instead. The guest's flags
+     * are deliberately dropped: SHARED would misroute placed creates into the
+     * per-resource shared backing path, and only buffers may alias the
+     * window. heap_type is advisory (the guest answers GetDesc locally). */
+    D3D12_HEAP_DESC hd{};
+    hd.SizeInBytes = size;
+    hd.Properties.Type = (heap_type >= (uint32_t)D3D12_HEAP_TYPE_DEFAULT &&
+                          heap_type <= (uint32_t)D3D12_HEAP_TYPE_READBACK)
+                             ? (D3D12_HEAP_TYPE)heap_type
+                             : D3D12_HEAP_TYPE_UPLOAD;
+    hd.Alignment = 0;
+    hd.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
+
+    HRESULT hr = dev->CreateHeap(&hd, *reinterpret_cast<const IID*>(iid),
+                                 out_heap);
+    dev->Release();
+    if (FAILED(hr) || !*out_heap) {
+        DMN_ERROR("hooks: heap import CreateHeap(size=%llu type=%u) failed "
+                  "0x%08x", (unsigned long long)size,
+                  (unsigned)hd.Properties.Type, (unsigned)hr);
+        return FAILED(hr) ? hr : E_FAIL;
+    }
+
+    auto* heap_unk = reinterpret_cast<IUnknown*>(*out_heap);
+    void* id = dmn_com_identity(heap_unk);
+    int owned = register_owned_fd(id, fd); /* fd is borrowed; this dups */
+    {
+        std::lock_guard<std::mutex> lk(g_reg_mtx);
+        g_imported_heaps[id] = DmnImportedHeap{owned, offset, size};
+    }
+    attach_evict_sentinel(heap_unk, id, EV_IMPORTED_HEAP);
+    DMN_INFO("hooks: imported shm window fd=%d off=%llu size=%llu app_type=%u "
+             "app_flags=0x%x as heap identity=%p", fd,
+             (unsigned long long)offset, (unsigned long long)size, heap_type,
+             heap_flags, id);
+    return S_OK;
 }
 
 /* == Provided to dmn_fence_d3d.cpp ======================================== */

@@ -254,6 +254,16 @@ heap_placed = executable('heap-placed-test',
   link_with: dmn_lib)
 test('heap-placed', heap_placed, env: ['DMN_LOG=info'], timeout: 300)
 
+# Windowless: dmn_open_existing_heap_from_fd — a shm window imported as an
+# ID3D12Heap whose placed buffers alias the caller's pages in both directions
+# (import offset + heap offset compose), the backing survives releasing the
+# heap first, fds return to baseline, and the validation paths refuse cleanly.
+heap_import = executable('heap-import-test',
+  'heap_import_test.cpp',
+  include_directories: [test_native_inc, include_directories('../src')],
+  link_with: dmn_lib)
+test('heap-import', heap_import, env: ['DMN_LOG=info'], timeout: 300)
+
 # Windowless: D3D11 variant shared entry points (CreateTexture2D1 producer,
 # OpenSharedResource1 consumer).
 d3d11_variants = executable('d3d11-variants-test',
