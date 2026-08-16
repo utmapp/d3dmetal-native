@@ -1413,9 +1413,11 @@ HRESULT STDMETHODCALLTYPE hook_d3d11_CreateFence(
     ID3D11Fence* f = nullptr;
     if (SUCCEEDED(reinterpret_cast<IUnknown*>(*out)->QueryInterface(
             __uuidof(ID3D11Fence), reinterpret_cast<void**>(&f))) && f) {
-        if (dmn_fd3d_producer_create_d3d11(This, f, initial, (UINT)flags)) {
+        if (dmn_fd3d_producer_create_d3d11(f, initial, (UINT)flags)) {
             /* Producer signal interception + export + slot-merged readback. */
-            if (ID3D11DeviceContext* ctx = dmn_fd3d_producer_d3d11_ctx(f)) {
+            ID3D11DeviceContext* ctx = nullptr;
+            This->GetImmediateContext(&ctx);
+            if (ctx) {
                 ID3D11DeviceContext4* c4 = nullptr;
                 if (SUCCEEDED(ctx->QueryInterface(__uuidof(ID3D11DeviceContext4),
                                                   reinterpret_cast<void**>(&c4))) && c4) {
@@ -1423,6 +1425,7 @@ HRESULT STDMETHODCALLTYPE hook_d3d11_CreateFence(
                     DMN_PATCH(c4, ID3D11DeviceContext4, Wait, ctx_Wait);
                     c4->Release();
                 }
+                ctx->Release();
             }
             track_fence_d3d11(f);
         } else {
@@ -1454,18 +1457,13 @@ HRESULT STDMETHODCALLTYPE hook_d3d11_OpenSharedFence(
 HRESULT STDMETHODCALLTYPE hook_ctx_Signal(
         ID3D11DeviceContext4* This, ID3D11Fence* fence, UINT64 value) {
     auto orig = DMN_ORIG(ctx_Signal, This);
-    /* Producer: encode the value store BEFORE the app's Signal so it rides
-     * the same submission as the immediate context's pending render (the
-     * work this value represents), making the store GPU-ordered strictly
-     * after it. No-op for imports. */
-    dmn_fd3d_on_ctx_signal(fence, value);
     HRESULT hr = orig ? orig(This, fence, value) : E_FAIL;
     if (SUCCEEDED(hr)) {
         /* The signalled fence must outlive its own signal (see
          * dmn_fd3d_keepalive_d3d11); the app may drop it right here. */
         dmn_fd3d_keepalive_d3d11(This, fence, value);
-        /* Import signal-back: store into the slot once the local fence
-         * completes the value. */
+        /* Producer or import: publish the value into the shared slot once
+         * the fence itself completes it. */
         dmn_fd3d_after_ctx_signal(fence, value);
     }
     return hr;
@@ -2162,6 +2160,26 @@ HRESULT dmn_hooks_ctx_signal_orig(ID3D11DeviceContext4* c, ID3D11Fence* fence,
                                   UINT64 value) {
     auto orig = DMN_ORIG(ctx_Signal, c);
     return orig ? orig(c, fence, value) : c->Signal(fence, value);
+}
+
+UINT64 dmn_hooks_f11_completed_orig(ID3D11Fence* fence) {
+    auto orig = DMN_ORIG(f11_GetCompletedValue, fence);
+    return orig ? orig(fence) : fence->GetCompletedValue();
+}
+
+UINT64 dmn_hooks_f12_completed_orig(ID3D12Fence* fence) {
+    auto orig = DMN_ORIG(f12_GetCompletedValue, fence);
+    return orig ? orig(fence) : fence->GetCompletedValue();
+}
+
+HRESULT dmn_hooks_f11_seoc_orig(ID3D11Fence* fence, UINT64 value, HANDLE ev) {
+    auto orig = DMN_ORIG(f11_SetEventOnCompletion, fence);
+    return orig ? orig(fence, value, ev) : fence->SetEventOnCompletion(value, ev);
+}
+
+HRESULT dmn_hooks_f12_seoc_orig(ID3D12Fence* fence, UINT64 value, HANDLE ev) {
+    auto orig = DMN_ORIG(f12_SetEventOnCompletion, fence);
+    return orig ? orig(fence, value, ev) : fence->SetEventOnCompletion(value, ev);
 }
 
 bool dmn_res_lookup_buffer_pod(IUnknown* res, dmn_shared_buffer_handle* out) {

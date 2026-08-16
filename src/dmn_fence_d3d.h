@@ -27,10 +27,10 @@
 #include "d3dmetal_native.h" /* the shared-handle PODs */
 
 /* == Producer side ======================================================== */
-/* Wrap a freshly created SHARED-flag fence: build the companion buffer and
- * GPU write machinery and register the fence. Returns false on failure (the
- * fence then behaves like a plain unshared fence). */
-bool dmn_fd3d_producer_create_d3d11(ID3D11Device5* dev, ID3D11Fence* fence,
+/* Wrap a freshly created SHARED-flag fence: build the companion slot (and,
+ * for D3D12, the GPU write machinery) and register the fence. Returns false on
+ * failure (the fence then behaves like a plain unshared fence). */
+bool dmn_fd3d_producer_create_d3d11(ID3D11Fence* fence,
                                     UINT64 initial, UINT flags);
 bool dmn_fd3d_producer_create_d3d12(ID3D12Device* dev, ID3D12Fence* fence,
                                     UINT64 initial, UINT flags);
@@ -42,22 +42,15 @@ bool dmn_fd3d_producer_create_d3d12(ID3D12Device* dev, ID3D12Fence* fence,
  * hooks' eviction sentinel; no-op for unknown identities. */
 void dmn_fd3d_fence_destroy(void* identity);
 
-/* The immediate context the D3D11 producer signals on (borrowed; only valid
- * for a registered D3D11 producer fence). Hooks patch its Signal slot. */
-ID3D11DeviceContext* dmn_fd3d_producer_d3d11_ctx(ID3D11Fence* fence);
-
 /* Fill `out` with the fence's shareable POD. False if the fence is neither a
  * producer nor an import (re-export from an opened fence is allowed). */
 bool dmn_fd3d_export(IUnknown* fence, dmn_shared_fence_handle* out);
 
-/* GPU signal interception. The producer's D3D11 store must be encoded BEFORE
- * the app's own Signal (same submission ordering); on_ctx_signal is a no-op
- * for imports. The D3D12 producer write rides a helper queue and the import
- * signal-back watchers wait for local completion, so on_queue_signal and
- * after_ctx_signal run after a SUCCESSFUL orig call. */
-void dmn_fd3d_on_ctx_signal(ID3D11Fence* fence, UINT64 value);    /* before orig */
-void dmn_fd3d_after_ctx_signal(ID3D11Fence* fence, UINT64 value); /* after orig */
-void dmn_fd3d_on_queue_signal(ID3D12Fence* fence, UINT64 value);  /* after orig */
+/* Signal interception, called after a SUCCESSFUL orig Signal. A D3D12
+ * producer's slot store rides its helper queue; a D3D11 producer's, and every
+ * import's signal-back, waits for the fence's own completion of the value. */
+void dmn_fd3d_after_ctx_signal(ID3D11Fence* fence, UINT64 value);
+void dmn_fd3d_on_queue_signal(ID3D12Fence* fence, UINT64 value);
 
 /* Hold a reference to a fence that was just signalled until the GPU reaches the
  * value, then drop it — the deferred destruction the D3D runtime owes a
@@ -133,3 +126,14 @@ bool dmn_res_lookup_buffer_pod(IUnknown* res, dmn_shared_buffer_handle* out);
 HRESULT dmn_hooks_f12_signal_orig(ID3D12Fence* fence, UINT64 value);
 HRESULT dmn_hooks_ctx_signal_orig(ID3D11DeviceContext4* c, ID3D11Fence* fence,
                                   UINT64 value);
+
+/* GetCompletedValue / SetEventOnCompletion through the ORIGINAL methods: the
+ * fence's OWN progress, without the shared-slot merge (or slot watcher) the
+ * hooked entry points add. Anything that must know the fence itself has
+ * reached a value — releasing it, or publishing that value to peers — asks
+ * here: the slot can hold V (a peer's signal-back, or a store racing ahead of
+ * the fence's own signal command) while the fence's signal is still queued. */
+UINT64 dmn_hooks_f11_completed_orig(ID3D11Fence* fence);
+UINT64 dmn_hooks_f12_completed_orig(ID3D12Fence* fence);
+HRESULT dmn_hooks_f11_seoc_orig(ID3D11Fence* fence, UINT64 value, HANDLE ev);
+HRESULT dmn_hooks_f12_seoc_orig(ID3D12Fence* fence, UINT64 value, HANDLE ev);

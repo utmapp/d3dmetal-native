@@ -6,14 +6,17 @@
  *             Metal backing is anonymous shared memory), renders a per-tick
  *             solid color into it, exports the texture + a shared fence, and
  *             ships both PODs plus their fds to the child over a socketpair
- *             (SCM_RIGHTS). Each tick it Flushes, confirms the GPU write landed
- *             in the shared mapping, signals the fence, and waits for the
- *             child's ack before overwriting.
- *   child   = consumer. Receives the PODs, patches the received fds, maps the
- *             texture directly (the backing is MTLStorageModeShared, so the
- *             producer's GPU writes are CPU-visible), waits on the fence for
- *             each tick, samples the center pixel, and acks. Asserts each tick
- *             shows the expected color and that colors differ across ticks.
+ *             (SCM_RIGHTS). Each tick it clears, signals the fence on the same
+ *             context (no Flush: the fence must order the clear on its own),
+ *             and waits for the child's ack before overwriting.
+ *   child   = consumer. Receives the PODs, patches the received fds, opens
+ *             both through the standard D3D entry points, waits on the fence
+ *             for each tick, and reads the texture back through a GPU copy.
+ *             Asserts, per tick: the moment the fence reads the tick's value
+ *             the shared bytes ALREADY hold the tick's color (checked through
+ *             a CPU mapping of the fd — a fence that flips before the render
+ *             it stands for is visible would fail here first), the GPU copy
+ *             shows it too, and colors differ across ticks.
  *
  * Prints "SHARED: PASS" and exits 0 on success. Set DMN_SHARE_DUMP=<dir> to
  * write per-tick .ppm frames for visual inspection.
@@ -25,6 +28,7 @@
 #include <cstdlib>
 #include <cstring>
 
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -44,20 +48,18 @@
 namespace {
 
 constexpr uint32_t kW = 256, kH = 256;
-constexpr int kTicks = 3;
-/* Cross-process GPU reads of a freshly shared surface are stale until a few
- * producer submissions have propagated (a CPU-polled fence carries no GPU-side
- * cross-process barrier — the MTLSharedEvent gap). Prime with warm-up frames so
- * every measured frame is coherent. */
-constexpr int kWarmup = 3;
+constexpr int kTicks = 12;
 
 struct Rgba { float r, g, b, a; };
-/* Pure channels: gamma-invariant, so validation needs no sRGB guesswork. */
-const Rgba kColors[kTicks] = {
-    {1.0f, 0.0f, 0.0f, 1.0f}, /* red   -> BGRA 00 00 ff ff */
-    {0.0f, 1.0f, 0.0f, 1.0f}, /* green -> BGRA 00 ff 00 ff */
-    {0.0f, 0.0f, 1.0f, 1.0f}, /* blue  -> BGRA ff 00 00 ff */
-};
+/* Pure channels, cycled: gamma-invariant, so validation needs no sRGB
+ * guesswork, and consecutive ticks always differ. */
+Rgba tick_color(int tick) {
+    switch (tick % 3) {
+    case 0:  return {1.0f, 0.0f, 0.0f, 1.0f}; /* red   -> BGRA 00 00 ff ff */
+    case 1:  return {0.0f, 1.0f, 0.0f, 1.0f}; /* green -> BGRA 00 ff 00 ff */
+    default: return {0.0f, 0.0f, 1.0f, 1.0f}; /* blue  -> BGRA ff 00 00 ff */
+    }
+}
 
 void expected_bgr(const Rgba& c, uint8_t out[3]) {
     out[0] = (uint8_t)(c.b * 255.0f + 0.5f);
@@ -188,22 +190,17 @@ int producer(int sock) {
         return 1;
     }
 
-    /* Ticks [-kWarmup, 0) are warm-up frames (see consumer): they prime the
-     * shared surface so every measured frame is coherent for the consumer's GPU. */
-    for (int tick = -kWarmup; tick < kTicks; tick++) {
-        const Rgba& col = kColors[tick < 0 ? 0 : tick];
+    for (int tick = 0; tick < kTicks; tick++) {
+        const Rgba col = tick_color(tick);
         FLOAT c[4] = { col.r, col.g, col.b, col.a };
         context->ClearRenderTargetView(rtv.ptr(), c);
 
-        /* Don't flush here: let the fence-store (injected right after Signal on
-         * this same context) ride the same submission as the clear, so the value
-         * write is GPU-ordered strictly after the render. The consumer's fence
-         * wait completing then means the render has landed in the shared texture. */
-        uint64_t value = (uint64_t)(tick + kWarmup + 1);
-        context4->Signal(d3dFence.ptr(), value); /* hook writes value via GPU */
-        if (tick >= 0)
-            printf("SHARED: producer signaled tick %d (value=%llu)\n", tick,
-                   (unsigned long long)value);
+        /* No Flush: the fence's value must not become visible to the consumer
+         * before the clear it stands for is. */
+        uint64_t value = (uint64_t)(tick + 1);
+        context4->Signal(d3dFence.ptr(), value);
+        printf("SHARED: producer signaled tick %d (value=%llu)\n", tick,
+               (unsigned long long)value);
 
         /* Wait for the child's ack before overwriting next tick. */
         char ack = 0;
@@ -298,8 +295,19 @@ int consumer(int sock) {
     uint8_t observed[kTicks][3] = {};
     int rc = 0;
 
-    for (int tick = -kWarmup; tick < kTicks; tick++) {
-        uint64_t value = (uint64_t)(tick + kWarmup + 1);
+    /* A CPU view of the shared bytes, to check what is there at the instant
+     * the fence flips (the impostor is StorageModeShared: GPU writes are
+     * CPU-visible once complete). */
+    const size_t map_len = (size_t)((wire.tex.size + 16383) & ~16383ull);
+    const uint8_t* cpu = (const uint8_t*)mmap(nullptr, map_len, PROT_READ,
+                                              MAP_SHARED, wire.tex.fd, 0);
+    if (cpu == MAP_FAILED) {
+        fprintf(stderr, "SHARED: consumer mmap(texture fd) FAILED\n");
+        return 1;
+    }
+
+    for (int tick = 0; tick < kTicks; tick++) {
+        uint64_t value = (uint64_t)(tick + 1);
         /* Wait on the imported fence — pure D3D. */
         uint64_t t0 = now_ms();
         bool signaled = false;
@@ -316,10 +324,24 @@ int consumer(int sock) {
             break;
         }
 
+        uint8_t want[3];
+        expected_bgr(tick_color(tick), want);
+
+        /* The fence says the tick is done: the shared bytes must already be
+         * the tick's color. This is the ordering guarantee the fence exists to
+         * provide, checked without a GPU read in the way. */
+        const uint8_t* at_flip = cpu + (uint64_t)cy * wire.tex.stride + cx * 4;
+        if (memcmp(at_flip, want, 3) != 0) {
+            fprintf(stderr, "SHARED: tick %d: fence reached %llu but the shared "
+                    "bytes still read BGR=%02x%02x%02x (want %02x%02x%02x) — "
+                    "the value was published before the render landed\n",
+                    tick, (unsigned long long)value, at_flip[0], at_flip[1],
+                    at_flip[2], want[0], want[1], want[2]);
+            rc = 1;
+        }
+
         /* Read the imported texture back the standard way (GPU copy -> staging
-         * -> Map). Frame -1 is a warm-up: the first cross-process GPU read of a
-         * freshly shared surface is stale (a CPU-polled fence carries no GPU-side
-         * cross-process cache barrier), so it primes rather than validates. */
+         * -> Map). */
         ctx->CopyResource(staging.ptr(), shared.ptr());
         ctx->Flush();
         D3D11_MAPPED_SUBRESOURCE m = {};
@@ -330,23 +352,19 @@ int consumer(int sock) {
         }
         const uint8_t* px = (const uint8_t*)m.pData + (uint64_t)cy * m.RowPitch + cx * 4;
         uint8_t got[3] = { px[0], px[1], px[2] };
-        if (tick >= 0) dump_ppm(dumpDir, tick, (const uint8_t*)m.pData, m.RowPitch);
+        dump_ppm(dumpDir, tick, (const uint8_t*)m.pData, m.RowPitch);
         ctx->Unmap(staging.ptr(), 0);
 
-        if (tick >= 0) {
-            observed[tick][0] = got[0]; observed[tick][1] = got[1]; observed[tick][2] = got[2];
-            uint8_t want[3];
-            expected_bgr(kColors[tick], want);
-            bool match = true;
-            for (int k = 0; k < 3; k++)
-                if (abs((int)got[k] - (int)want[k]) > 12)
-                    match = false;
-            printf("SHARED: consumer tick %d center BGR=%02x%02x%02x want %02x%02x%02x %s\n",
-                   tick, got[0], got[1], got[2], want[0], want[1], want[2],
-                   match ? "OK" : "MISMATCH");
-            if (!match)
-                rc = 1;
-        }
+        observed[tick][0] = got[0]; observed[tick][1] = got[1]; observed[tick][2] = got[2];
+        bool match = true;
+        for (int k = 0; k < 3; k++)
+            if (abs((int)got[k] - (int)want[k]) > 12)
+                match = false;
+        printf("SHARED: consumer tick %d center BGR=%02x%02x%02x want %02x%02x%02x %s\n",
+               tick, got[0], got[1], got[2], want[0], want[1], want[2],
+               match ? "OK" : "MISMATCH");
+        if (!match)
+            rc = 1;
 
         char ack = 1;
         if (write(sock, &ack, 1) != 1) {
@@ -358,12 +376,13 @@ int consumer(int sock) {
 
     /* Distinct frames prove the fence ordered separate producer writes. */
     if (rc == 0) {
-        bool differ = memcmp(observed[0], observed[kTicks - 1], 3) != 0;
+        bool differ = memcmp(observed[0], observed[1], 3) != 0;
         if (!differ) {
             fprintf(stderr, "SHARED: colors did not change across ticks\n");
             rc = 1;
         }
     }
+    munmap((void*)cpu, map_len);
 
     if (rc == 0)
         printf("SHARED: PASS\n");

@@ -5,14 +5,17 @@
  * D3D-facing shared-fence implementation. See dmn_fence_d3d.h for the API and
  * the module boundaries.
  *
- * Producer mechanism (GPU writes the reached value into the companion slot):
+ * Producer mechanism (the reached value is written into the companion slot
+ * only once the work it stands for is complete and visible outside the
+ * producer):
  *   D3D12: a helper command queue does Wait(realFence,V) then a command list
  *          of two WriteBufferImmediate stores (low word, then high).
- *   D3D11: right before the app's own immediate-context Signal, the two slot
- *          words are written via ClearUnorderedAccessViewUint on that same
- *          context (same GPU timeline, so the store is ordered after the work
- *          the value represents; a compute-shader store would not reach the
- *          StorageModeShared backing under D3DMetal, a clear/blit does).
+ *   D3D11: the value is stored from the CPU when the fence's own completion
+ *          for it fires. D3D11 has no second queue to order a GPU store
+ *          behind the app's, and a store encoded on the immediate context
+ *          beside the render is not ordered against the render's memory
+ *          writes as seen from another process — only command-buffer
+ *          completion is.
  *
  * Consumer mechanism: an import is a REAL fence created on the opening device,
  * plus a view of the shared slot (dmn_fence.cpp). Reads merge the slot into
@@ -45,6 +48,7 @@
 #include "dmn_fence_d3d.h"
 #include "dmn_hook.h"
 #include "dmn_log.h"
+#include "dmn_share.h"
 
 /* GFXT event handles (dmn_gfxt_event.cpp): the HANDLEs apps pass into
  * SetEventOnCompletion are these, and the watcher threads use them too. */
@@ -77,12 +81,9 @@ struct GpuFence {
     ID3D12GraphicsCommandList2* helperList = nullptr;
     uint64_t                    seq = 0;
 
-    /* D3D11 GPU-store path: two single-element R32_UINT UAVs (low word slot,
-     * high word slot) cleared per Signal via ClearUnorderedAccessViewUint. */
-    ID3D11Buffer*               d11buf = nullptr;
-    ID3D11UnorderedAccessView*  d11uavLo = nullptr;
-    ID3D11UnorderedAccessView*  d11uavHi = nullptr;
-    ID3D11DeviceContext*        d11ctx = nullptr; /* immediate; AddRef'd */
+    /* D3D11: the slot is a plain page of shared memory, written from the CPU
+     * on completion; nothing on the GPU side refers to it. */
+    int                         d11slot_fd = -1; /* owned */
 
     std::mutex mtx;                        /* serialize signals on this fence */
 };
@@ -124,10 +125,9 @@ void register_producer(IUnknown* fence, GpuFence* gf) {
              (unsigned long long)gf->initial);
 }
 
-/* Free everything a GpuFence owns. D3D11 objects can be released with work in
- * flight (the runtime defers destruction); the D3D12 helper queue is drained
- * first — bounded, since a pending Wait whose value never arrives (app
- * destroyed the fence early) must not hang the app's Release call. */
+/* Free everything a GpuFence owns. The D3D12 helper queue is drained first —
+ * bounded, since a pending Wait whose value never arrives (app destroyed the
+ * fence early) must not hang the app's Release call. */
 void gpufence_teardown(GpuFence* gf) {
     if (gf->is_d3d12 && gf->helperQ) {
         ID3D12Device* dev = nullptr;
@@ -157,12 +157,22 @@ void gpufence_teardown(GpuFence* gf) {
         if (gf->helperAlloc[i]) gf->helperAlloc[i]->Release();
     if (gf->helperQ) gf->helperQ->Release();
     if (gf->d12buf) gf->d12buf->Release();
-    if (gf->d11uavLo) gf->d11uavLo->Release();
-    if (gf->d11uavHi) gf->d11uavHi->Release();
-    if (gf->d11buf) gf->d11buf->Release();
-    if (gf->d11ctx) gf->d11ctx->Release();
+    if (gf->d11slot_fd >= 0) close(gf->d11slot_fd);
     if (gf->view) dmn_shared_fence_close(gf->view);
     delete gf;
+}
+
+bool gpufence_setup_d3d11(GpuFence* gf) {
+    gf->d11slot_fd = dmn_share_anon_file(dmn_share_page_align(1));
+    if (gf->d11slot_fd < 0) {
+        DMN_ERROR("fence: D3D11 slot allocation failed");
+        return false;
+    }
+    gf->bufPod.magic = DMN_SHARED_BUFFER_MAGIC;
+    gf->bufPod.version = DMN_SHARED_HANDLE_VERSION;
+    gf->bufPod.fd = gf->d11slot_fd;
+    gf->bufPod.size = dmn_share_page_align(1);
+    return true;
 }
 
 bool gpufence_setup_d3d12(ID3D12Device* dev, GpuFence* gf) {
@@ -221,44 +231,6 @@ bool gpufence_setup_d3d12(ID3D12Device* dev, GpuFence* gf) {
     return true;
 }
 
-/* One single-element R32_UINT UAV over `buf` at element `elem`, so a subsequent
- * ClearUnorderedAccessViewUint writes exactly that 32-bit slot (nothing else). */
-bool make_slot_uav(ID3D11Device* dev, ID3D11Buffer* buf, UINT elem,
-                   ID3D11UnorderedAccessView** out) {
-    D3D11_UNORDERED_ACCESS_VIEW_DESC ud{};
-    ud.Format = DXGI_FORMAT_R32_UINT;
-    ud.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
-    ud.Buffer.FirstElement = elem;
-    ud.Buffer.NumElements = 1;
-    HRESULT hr = dev->CreateUnorderedAccessView(buf, &ud, out);
-    if (FAILED(hr)) { DMN_ERROR("fence: slot UAV 0x%08x", (unsigned)hr); return false; }
-    return true;
-}
-
-bool gpufence_setup_d3d11(ID3D11Device* dev, GpuFence* gf) {
-    /* Companion shared buffer via the standard hooked path. */
-    D3D11_BUFFER_DESC bd{};
-    bd.ByteWidth = 4096;
-    bd.Usage = D3D11_USAGE_DEFAULT;
-    bd.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
-    bd.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
-    HRESULT hr = dev->CreateBuffer(&bd, nullptr, &gf->d11buf);
-    if (FAILED(hr) || !gf->d11buf) {
-        DMN_ERROR("fence: companion CreateBuffer 0x%08x", (unsigned)hr);
-        return false;
-    }
-    if (!dmn_res_lookup_buffer_pod(gf->d11buf, &gf->bufPod)) {
-        DMN_ERROR("fence: companion buffer not routed through the swizzle");
-        return false;
-    }
-    if (!make_slot_uav(dev, gf->d11buf, 0, &gf->d11uavLo) ||
-        !make_slot_uav(dev, gf->d11buf, 1, &gf->d11uavHi))
-        return false;
-
-    dev->GetImmediateContext(&gf->d11ctx); /* AddRef'd */
-    return true;
-}
-
 /* D3D12: helper queue waits for the real fence to reach V, then the GPU writes
  * V into the companion buffer (low word first so a torn consumer read of a
  * value crossing a 32-bit boundary under-reports rather than over-reports). */
@@ -286,19 +258,6 @@ void gpufence_signal_d3d12(GpuFence* gf, UINT64 value) {
     else
         DMN_DEBUG("fence: D3D12 Signal value=%llu -> GPU store at va=0x%llx",
                   (unsigned long long)value, (unsigned long long)gf->gpuVA);
-}
-
-/* D3D11: on the immediate context (the one the app signals on, so this rides
- * the same GPU timeline as the work the value represents), clear the two slot
- * UAVs to the value's low and high words. Low word first: see above. */
-void gpufence_signal_d3d11(GpuFence* gf, UINT64 value) {
-    std::lock_guard<std::mutex> lk(gf->mtx);
-    ID3D11DeviceContext* c = gf->d11ctx;
-    UINT lo[4] = {(UINT)(value & 0xffffffffu), 0, 0, 0};
-    UINT hi[4] = {(UINT)(value >> 32), 0, 0, 0};
-    c->ClearUnorderedAccessViewUint(gf->d11uavLo, lo);
-    c->ClearUnorderedAccessViewUint(gf->d11uavHi, hi);
-    c->Flush();
 }
 
 /* == Consumer (import) state =============================================== */
@@ -392,17 +351,15 @@ void import_raise_d3d11(ImportedFence* imp, ID3D11DeviceContext4* c,
     imp->raised = value;
 }
 
-/* Local-completion wait for the signal-back watchers: poll the (hooked,
- * slot-merged) GetCompletedValue. The merge can only exit the loop early when
- * the slot already holds >= value — in which case the pending store is a
- * no-op anyway. */
-template <class FenceT>
-void wait_local_completion(FenceT* f, UINT64 value) {
+/* Block until the fence ITSELF has completed `value`, through the original
+ * entry points: the hooked ones merge the slot, which may already hold the
+ * value this caller is about to publish. */
+void wait_local_completion(ID3D11Fence* f, UINT64 value) {
     void* ev = dmn_event_create(1, 0);
-    if (ev && SUCCEEDED(f->SetEventOnCompletion(value, ev))) {
+    if (ev && SUCCEEDED(dmn_hooks_f11_seoc_orig(f, value, ev))) {
         dmn_event_wait(ev, DMN_WAIT_INFINITE);
     } else {
-        while (f->GetCompletedValue() < value) {
+        while (dmn_hooks_f11_completed_orig(f) < value) {
             struct timespec ns = {0, 200 * 1000};
             nanosleep(&ns, nullptr);
         }
@@ -411,14 +368,29 @@ void wait_local_completion(FenceT* f, UINT64 value) {
         dmn_event_close(ev);
 }
 
-/* GPU signal-back: once the local fence completes `value`, store it into the
- * shared slot so the producer (and other consumers) observe it. */
+void wait_local_completion(ID3D12Fence* f, UINT64 value) {
+    void* ev = dmn_event_create(1, 0);
+    if (ev && SUCCEEDED(dmn_hooks_f12_seoc_orig(f, value, ev))) {
+        dmn_event_wait(ev, DMN_WAIT_INFINITE);
+    } else {
+        while (dmn_hooks_f12_completed_orig(f) < value) {
+            struct timespec ns = {0, 200 * 1000};
+            nanosleep(&ns, nullptr);
+        }
+    }
+    if (ev)
+        dmn_event_close(ev);
+}
+
+/* Publish `value` into `view` once the fence completes it. The thread holds a
+ * reference on the fence, so the producer/import state that owns `view`
+ * (freed only by destruction-driven eviction) outlives the store. */
 template <class FenceT>
-void arm_signal_store(ImportedFence* imp, FenceT* f, UINT64 value) {
+void arm_signal_store(dmn_shared_fence_t view, FenceT* f, UINT64 value) {
     f->AddRef();
-    std::thread([imp, f, value]() {
+    std::thread([view, f, value]() {
         wait_local_completion(f, value);
-        dmn_shared_fence_signal(imp->view, value);
+        dmn_shared_fence_signal(view, value);
         f->Release();
     }).detach();
 }
@@ -427,13 +399,13 @@ void arm_signal_store(ImportedFence* imp, FenceT* f, UINT64 value) {
 
 /* == Producer API ========================================================== */
 
-bool dmn_fd3d_producer_create_d3d11(ID3D11Device5* dev, ID3D11Fence* fence,
-                                    UINT64 initial, UINT flags) {
+bool dmn_fd3d_producer_create_d3d11(ID3D11Fence* fence, UINT64 initial,
+                                    UINT flags) {
     auto* gf = new GpuFence();
     gf->is_d3d12 = false;
     gf->initial = initial;
     gf->flags = flags;
-    if (!gpufence_setup_d3d11(dev, gf)) {
+    if (!gpufence_setup_d3d11(gf)) {
         gpufence_teardown(gf); /* releases whatever setup got to */
         return false;
     }
@@ -488,11 +460,6 @@ void dmn_fd3d_fence_destroy(void* identity) {
         delete imp;
         DMN_INFO("fence: destroyed import identity=%p", identity);
     }
-}
-
-ID3D11DeviceContext* dmn_fd3d_producer_d3d11_ctx(ID3D11Fence* fence) {
-    GpuFence* gf = lookup_producer(fence);
-    return (gf && !gf->is_d3d12) ? gf->d11ctx : nullptr;
 }
 
 /* The slot pod + live view of a fence that is a producer or an import; false
@@ -637,19 +604,15 @@ void dmn_fd3d_keepalive_d3d12(ID3D12Fence* fence, UINT64 value) {
         keepalive_add(fence, value, /*is_d3d12=*/true);
 }
 
-void dmn_fd3d_on_ctx_signal(ID3D11Fence* fence, UINT64 value) {
-    GpuFence* gf = lookup_producer(fence);
-    if (gf && !gf->is_d3d12) {
-        DMN_INFO("fence: D3D11 Signal value=%llu -> GPU store",
-                 (unsigned long long)value);
-        gpufence_signal_d3d11(gf, value);
-    }
-}
-
 void dmn_fd3d_after_ctx_signal(ID3D11Fence* fence, UINT64 value) {
+    if (GpuFence* gf = lookup_producer(fence)) {
+        if (!gf->is_d3d12 && gf->view)
+            arm_signal_store(gf->view, fence, value);
+        return;
+    }
     ImportedFence* imp = lookup_import(reinterpret_cast<IUnknown*>(fence));
     if (imp && !imp->is_d3d12)
-        arm_signal_store(imp, fence, value);
+        arm_signal_store(imp->view, fence, value);
 }
 
 void dmn_fd3d_on_queue_signal(ID3D12Fence* fence, UINT64 value) {
@@ -660,7 +623,7 @@ void dmn_fd3d_on_queue_signal(ID3D12Fence* fence, UINT64 value) {
     }
     ImportedFence* imp = lookup_import(reinterpret_cast<IUnknown*>(fence));
     if (imp && imp->is_d3d12)
-        arm_signal_store(imp, fence, value);
+        arm_signal_store(imp->view, fence, value);
 }
 
 void dmn_fd3d_on_cpu_signal(IUnknown* fence, UINT64 value) {

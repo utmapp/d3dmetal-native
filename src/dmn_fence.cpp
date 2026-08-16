@@ -3,9 +3,10 @@
  * SPDX-License-Identifier: MIT
  *
  * The shared fence-value slot protocol: a uint64 at the start of an fd-shared
- * companion buffer (the same shm backing as textures/buffers). The producer's
- * GPU writes the reached value once the fence's GPU work completes — no CPU
- * on the producer's signal path — and readers poll the mapped slot. Each
+ * companion buffer (the same shm backing as textures/buffers). The producer
+ * writes the reached value once the fence's GPU work completes — from the
+ * GPU (D3D12 helper queue) or the CPU (D3D11, on completion) — and readers
+ * poll the mapped slot. Each
  * dmn_shared_fence_t is an independent view with its own mapping; both the
  * consumer side (imported fences, watcher threads) and the producer's own
  * merge/watch views in dmn_fence_d3d.cpp are built on it.
@@ -87,14 +88,19 @@ extern "C" uint64_t dmn_shared_fence_get_completed(dmn_shared_fence_t f) {
     return v > f->initial ? v : f->initial;
 }
 
-/* Same low-word-first store order as the GPU writers, so a torn cross-process
- * read under-reports rather than over-reports. */
+/* Monotonic: CPU stores race each other (two completion watchers waking in
+ * either order) and must never move the slot backwards, so the store is a
+ * compare-and-swap on the whole word. A single 64-bit store also keeps the
+ * seqlock read above consistent. */
 extern "C" void dmn_shared_fence_signal(dmn_shared_fence_t f, uint64_t value) {
-    if (!f || read64(f->slot) >= value)
+    if (!f)
         return;
-    __atomic_store_n(&f->slot[0], (uint32_t)(value & 0xffffffffu),
-                     __ATOMIC_RELEASE);
-    __atomic_store_n(&f->slot[1], (uint32_t)(value >> 32), __ATOMIC_RELEASE);
+    auto* w = reinterpret_cast<volatile uint64_t*>(f->slot);
+    uint64_t cur = __atomic_load_n(w, __ATOMIC_ACQUIRE);
+    while (cur < value &&
+           !__atomic_compare_exchange_n(w, &cur, value, true,
+                                        __ATOMIC_RELEASE, __ATOMIC_ACQUIRE)) {
+    }
 }
 
 extern "C" dmn_wait_status dmn_shared_fence_wait(dmn_shared_fence_t f,
