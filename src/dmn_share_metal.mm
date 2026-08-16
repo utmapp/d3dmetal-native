@@ -1217,7 +1217,13 @@ id swz_dev_newtex(id self, SEL _cmd, MTLTextureDescriptor* desc) {
         return nil;
     }
     trace_alloc("dev_newtex", false, 0, tex_desc_str(desc, tb, sizeof tb));
-    return ((id (*)(id, SEL, MTLTextureDescriptor*))orig)(self, _cmd, desc);
+    id tex = ((id (*)(id, SEL, MTLTextureDescriptor*))orig)(self, _cmd, desc);
+    /* The view guard must be installed before a view is taken of a texture
+     * that never went through the share path. Memoized: one atomic load per
+     * texture after the first. */
+    if (tex)
+        ensure_texture_class_swizzled(tex);
+    return tex;
 }
 
 /* Heap placed path: -[heap newTextureWithDescriptor:offset:] (ignore offset:
@@ -1471,12 +1477,69 @@ id swz_cb_cced(id self, SEL _cmd, NSUInteger dispatchType) {
     return enc;
 }
 
+/* -newTextureViewWithPixelFormat:textureType:levels:slices:swizzle:
+ *
+ * An impostor is a single-slice, single-level linear texture, so a view naming
+ * a slice or level the parent does not have is reachable from a D3D12 view
+ * desc that is correct for the resource the guest created. Metal validates the
+ * range itself and calls abort() on a mismatch, which kills the render server
+ * inside the call and leaves the guest blocked forever on a reply that never
+ * comes. Clamp into range instead: the view then addresses a slice the caller
+ * did not ask for, which is wrong but recoverable and logged.
+ *
+ * This is a backstop for a resource that should not have been substituted at
+ * all; the guest driver is responsible for not sharing array resources. */
+id swz_tex_new_view(id self, SEL _cmd, MTLPixelFormat fmt,
+                    MTLTextureType type, NSRange levels, NSRange slices,
+                    MTLTextureSwizzleChannels swz) {
+    id<MTLTexture> tex = (id<MTLTexture>)self;
+    const NSUInteger have_slices =
+        tex.textureType == MTLTextureType3D ? 1 : tex.arrayLength;
+    const NSUInteger have_levels = tex.mipmapLevelCount;
+
+    if (slices.location + slices.length > have_slices ||
+        levels.location + levels.length > have_levels) {
+        DMN_ERROR("share: texture view out of range on a %s texture "
+                  "(%lux%lux%lu, arrayLength=%lu, mips=%lu): asked levels "
+                  "[%lu,+%lu) slices [%lu,+%lu) -- CLAMPED to keep Metal "
+                  "from aborting the worker; the view will address the "
+                  "wrong slice/level",
+                  tex.textureType == MTLTextureType3D ? "3D" : "non-3D",
+                  (unsigned long)tex.width, (unsigned long)tex.height,
+                  (unsigned long)tex.depth, (unsigned long)tex.arrayLength,
+                  (unsigned long)have_levels,
+                  (unsigned long)levels.location, (unsigned long)levels.length,
+                  (unsigned long)slices.location, (unsigned long)slices.length);
+        if (slices.location >= have_slices)
+            slices.location = have_slices ? have_slices - 1 : 0;
+        if (slices.location + slices.length > have_slices)
+            slices.length = have_slices - slices.location;
+        if (!slices.length)
+            slices.length = 1;
+        if (levels.location >= have_levels)
+            levels.location = have_levels ? have_levels - 1 : 0;
+        if (levels.location + levels.length > have_levels)
+            levels.length = have_levels - levels.location;
+        if (!levels.length)
+            levels.length = 1;
+    }
+
+    IMP orig = lookup_orig(object_getClass(self), _cmd);
+    if (!orig)
+        return nil;
+    return ((id (*)(id, SEL, MTLPixelFormat, MTLTextureType, NSRange, NSRange,
+                    MTLTextureSwizzleChannels))orig)(
+        self, _cmd, fmt, type, levels, slices, swz);
+}
+
 void ensure_texture_class_swizzled(id tex) {
     static const SwizzleJob jobs[] = {
         { @selector(replaceRegion:mipmapLevel:slice:withBytes:bytesPerRow:
                     bytesPerImage:), (IMP)swz_tex_replace6 },
         { @selector(replaceRegion:mipmapLevel:withBytes:bytesPerRow:),
           (IMP)swz_tex_replace4 },
+        { @selector(newTextureViewWithPixelFormat:textureType:levels:slices:
+                    swizzle:), (IMP)swz_tex_new_view },
     };
     static std::atomic<Class> memo{nullptr};
     install_swizzles(tex ? object_getClass(tex) : nil, jobs,

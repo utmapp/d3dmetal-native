@@ -25,6 +25,10 @@
  *      — then exported — the whole pool. A peer reading offset 0 of that gets
  *      the wrong bytes. Lower bounds alone cannot see it (a pool covers any
  *      surface), so the geometry is bounded from above as well.
+ *   5. A view that names a slice the substituted Metal texture lacks (a
+ *      MISC_SHARED array texture is backed single-slice) is clamped, not
+ *      fatal: Metal would otherwise abort the whole process inside the view
+ *      create.
  *
  * Same-process throughout: opening a handle this process exported exercises
  * exactly the consumer path, and none of these assertions are about data
@@ -48,6 +52,8 @@
 #include "d3dmetal_native.h"
 #include "common/check.h"
 #include "common/com.h"
+#include "common/gpu.h"
+#include "common/util.h"
 
 namespace {
 
@@ -263,6 +269,58 @@ int test_export_geometry(ID3D11Device* dev) {
     return 0;
 }
 
+/* 5. A view outside the substituted texture must not abort the process. The
+ * substitution backs a MISC_SHARED array texture with a single-slice linear
+ * texture, so a view of slice 1 — valid for the resource the app created —
+ * names a slice the Metal object lacks. Metal aborts on that; the guard clamps
+ * the view instead, so both view creates return and the process survives. */
+int test_array_view_clamped(ID3D11Device* dev, ID3D11DeviceContext* ctx) {
+    D3D11_TEXTURE2D_DESC td = shared_desc(64, 64, DXGI_FORMAT_B8G8R8A8_UNORM,
+                                          D3D11_BIND_RENDER_TARGET |
+                                              D3D11_BIND_SHADER_RESOURCE);
+    td.ArraySize = 2;
+    Com<ID3D11Texture2D> tex;
+    HRESULT hr = dev->CreateTexture2D(&td, nullptr, &tex);
+    if (FAILED(hr)) {
+        printf(T_TAG ": MISC_SHARED array texture rejected (0x%08x); view "
+               "clamp not exercised\n", (unsigned)hr);
+        return 0;
+    }
+    D3D11_RENDER_TARGET_VIEW_DESC rv{};
+    rv.Format = td.Format;
+    rv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DARRAY;
+    rv.Texture2DArray.FirstArraySlice = 1;
+    rv.Texture2DArray.ArraySize = 1;
+    Com<ID3D11RenderTargetView> rtv;
+    if (FAILED(dev->CreateRenderTargetView(tex.ptr(), &rv, &rtv)) || !rtv) {
+        fprintf(stderr, T_TAG ": RTV of slice 1 on a shared array texture "
+                "FAILED\n");
+        return 1;
+    }
+    const float c[4] = {1.0f, 0.0f, 0.0f, 1.0f};
+    ctx->ClearRenderTargetView(rtv.ptr(), c);
+    D3D11_SHADER_RESOURCE_VIEW_DESC sv{};
+    sv.Format = td.Format;
+    sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+    sv.Texture2DArray.FirstArraySlice = 1;
+    sv.Texture2DArray.ArraySize = 1;
+    sv.Texture2DArray.MipLevels = 1;
+    Com<ID3D11ShaderResourceView> srv;
+    if (FAILED(dev->CreateShaderResourceView(tex.ptr(), &sv, &srv)) || !srv) {
+        fprintf(stderr, T_TAG ": SRV of slice 1 on a shared array texture "
+                "FAILED\n");
+        return 1;
+    }
+    /* Retire the clear rather than merely flushing it: some framework
+     * versions stall process exit for tens of seconds when a flushed command
+     * buffer is never waited on. */
+    if (!t_gpu_queue_alive_d3d11(dev, ctx, 10000))
+        return 1;
+    printf(T_TAG ": out-of-range views on a shared array texture are "
+           "clamped, not fatal: OK\n");
+    return 0;
+}
+
 } // namespace
 
 int main() {
@@ -284,6 +342,8 @@ int main() {
     if (test_import_validation(dev.ptr()) != 0)
         return 1;
     if (test_export_geometry(dev.ptr()) != 0)
+        return 1;
+    if (test_array_view_clamped(dev.ptr(), ctx.ptr()) != 0)
         return 1;
 
     T_PASS();
