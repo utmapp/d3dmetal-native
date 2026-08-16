@@ -1180,13 +1180,31 @@ void install_swizzles(Class cls, const SwizzleJob* jobs, size_t njobs,
  * One line per Metal allocation D3DMetal makes through the hooked creators —
  * what it asked for, whether the arm substituted it, and (for buffers/heaps)
  * where it landed. Cheap when disabled, so it is always compiled in. */
+/* DMN_ALLOC_TRACE=1 emits the allocation trace at info level on its own:
+ * DMN_LOG=trace also logs every GFXT call, far too much for a full run. */
+static bool alloc_trace_forced(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("DMN_ALLOC_TRACE");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v == 1;
+}
+bool alloc_trace_enabled(void) {
+    return alloc_trace_forced() || dmn_log_enabled(DMN_LOG_TRACE);
+}
 void trace_alloc(const char* what, bool substituted, unsigned long long bytes,
                  const char* extra) {
-    if (!dmn_log_enabled(DMN_LOG_TRACE))
+    if (!alloc_trace_enabled())
         return;
-    DMN_TRACE("alloc: %-12s %s %llu bytes%s%s", what,
-              substituted ? "SUBST" : "orig ", bytes, extra ? " " : "",
-              extra ? extra : "");
+    if (alloc_trace_forced())
+        DMN_INFO("alloc: %-12s %s %llu bytes%s%s", what,
+                 substituted ? "SUBST" : "orig ", bytes, extra ? " " : "",
+                 extra ? extra : "");
+    else
+        DMN_TRACE("alloc: %-12s %s %llu bytes%s%s", what,
+                  substituted ? "SUBST" : "orig ", bytes, extra ? " " : "",
+                  extra ? extra : "");
 }
 
 const char* tex_desc_str(MTLTextureDescriptor* d, char* buf, size_t n) {
@@ -1216,8 +1234,10 @@ id swz_dev_newtex(id self, SEL _cmd, MTLTextureDescriptor* desc) {
         DMN_ERROR("share: no original for dev newTextureWithDescriptor:");
         return nil;
     }
-    trace_alloc("dev_newtex", false, 0, tex_desc_str(desc, tb, sizeof tb));
     id tex = ((id (*)(id, SEL, MTLTextureDescriptor*))orig)(self, _cmd, desc);
+    trace_alloc("dev_newtex", false,
+                tex ? (unsigned long long)[(id<MTLTexture>)tex allocatedSize] : 0,
+                tex_desc_str(desc, tb, sizeof tb));
     /* The view guard must be installed before a view is taken of a texture
      * that never went through the share path. Memoized: one atomic load per
      * texture after the first. */
@@ -1247,14 +1267,17 @@ id swz_heap_newtex(id self, SEL _cmd, MTLTextureDescriptor* desc,
         DMN_ERROR("share: no original for heap newTextureWithDescriptor:offset:");
         return nil;
     }
-    if (dmn_log_enabled(DMN_LOG_TRACE)) {
+    id htex = ((id (*)(id, SEL, MTLTextureDescriptor*, NSUInteger))orig)(
+        self, _cmd, desc, offset);
+    if (alloc_trace_enabled()) {
         char eb[220];
         snprintf(eb, sizeof eb, "%s off=%lu heap=%p", tex_desc_str(desc, tb, sizeof tb),
                  (unsigned long)offset, (void*)self);
-        trace_alloc("heap_newtex", false, 0, eb);
+        trace_alloc("heap_newtex", false,
+                    htex ? (unsigned long long)[(id<MTLTexture>)htex allocatedSize] : 0,
+                    eb);
     }
-    return ((id (*)(id, SEL, MTLTextureDescriptor*, NSUInteger))orig)(
-        self, _cmd, desc, offset);
+    return htex;
 }
 
 /* Device buffer path: -[dev newBufferWithLength:options:] */
@@ -1274,7 +1297,7 @@ id swz_dev_newbuf(id self, SEL _cmd, NSUInteger length, MTLResourceOptions opts)
         DMN_ERROR("share: no original for dev newBufferWithLength:options:");
         return nil;
     }
-    if (dmn_log_enabled(DMN_LOG_TRACE)) {
+    if (alloc_trace_enabled()) {
         char eb[64];
         snprintf(eb, sizeof eb, "opts=0x%lx", (unsigned long)opts);
         trace_alloc("dev_newbuf", false, length, eb);
@@ -1304,7 +1327,7 @@ id swz_heap_newbuf(id self, SEL _cmd, NSUInteger length, MTLResourceOptions opts
         DMN_ERROR("share: no original for heap newBufferWithLength:options:offset:");
         return nil;
     }
-    if (dmn_log_enabled(DMN_LOG_TRACE)) {
+    if (alloc_trace_enabled()) {
         char eb[96];
         snprintf(eb, sizeof eb, "opts=0x%lx off=%lu heap=%p", (unsigned long)opts,
                  (unsigned long)offset, (void*)self);
@@ -1337,7 +1360,7 @@ id swz_dev_newheap(id self, SEL _cmd, MTLHeapDescriptor* desc) {
         : nil;
     if (heap)
         ensure_heap_class_swizzled(object_getClass(heap));
-    if (dmn_log_enabled(DMN_LOG_TRACE)) {
+    if (alloc_trace_enabled()) {
         char eb[96];
         snprintf(eb, sizeof eb, "type=%lu storage=%lu heap=%p",
                  (unsigned long)desc.type, (unsigned long)desc.storageMode,

@@ -306,3 +306,10 @@ d3d11_variants = executable('d3d11-variants-test',
   include_directories: test_native_inc,
   link_with: dmn_lib)
 test('d3d11-variants', d3d11_variants, env: ['DMN_LOG=info'], timeout: 300)
+
+# Diagnostic probe (not a test): D3DMetal pool behaviour on release.
+pool_probe = executable('pool-probe',
+  ['pool_probe.cpp', 'metal_alloc_size.mm'],
+  include_directories: [test_native_inc, include_directories('../src')],
+  link_with: dmn_lib,
+  dependencies: [cocoa_deps])
