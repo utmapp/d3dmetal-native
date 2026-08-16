@@ -313,3 +313,10 @@ pool_probe = executable('pool-probe',
   include_directories: [test_native_inc, include_directories('../src')],
   link_with: dmn_lib,
   dependencies: [cocoa_deps])
+
+# Diagnostic probe (not a test): the backend's own tiled-resource support.
+tiled_probe = executable('tiled-probe',
+  ['tiled_probe.cpp', 'metal_alloc_size.mm'],
+  include_directories: [test_native_inc, include_directories('../src')],
+  link_with: dmn_lib,
+  dependencies: [cocoa_deps])
