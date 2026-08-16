@@ -51,6 +51,7 @@
 #include "dmn_log.h"
 #include "dmn_private.h"
 #include "dmn_share.h"
+#include "dmn_sparse.h"
 
 /* == Format-support bit mirrors ============================================ */
 /* dmn_formats.h re-declares the D3D11_FORMAT_SUPPORT bits because its
@@ -243,7 +244,7 @@ HRESULT vend_pod_owned(Pod pod, HANDLE* out) {
  * is validated by the evict-contract meson test against the vendored
  * framework, not re-probed at runtime. */
 
-enum EvictKind { EV_TEX, EV_BUF, EV_FENCE, EV_UNSHARED_PLACED };
+enum EvictKind { EV_TEX, EV_BUF, EV_FENCE, EV_UNSHARED_PLACED, EV_SPARSE };
 
 /* {7D3A1F7B-9C44-4A6E-8F21-5D0E6B3CA942} — private-data slot for the sentinel. */
 const GUID kDmnEvictGuid = {0x7d3a1f7b, 0x9c44, 0x4a6e,
@@ -255,6 +256,7 @@ const char* evict_kind_name(int kind) {
     case EV_BUF:   return "buffer";
     case EV_FENCE: return "fence";
     case EV_UNSHARED_PLACED: return "unshared-placement";
+    case EV_SPARSE: return "sparse-reserved";
     default:       return "?";
     }
 }
@@ -282,6 +284,9 @@ void evict_identity(void* id, int kind) {
             std::lock_guard<std::mutex> lk(g_reg_mtx);
             g_unshared_placed.erase(id);
         }
+        break;
+    case EV_SPARSE:
+        dmn_sparse_unregister(id);
         break;
     }
     close_owned_fd(id);
@@ -706,6 +711,25 @@ HRESULT STDMETHODCALLTYPE hook_d3d12_SetResidencyPriority(ID3D12Device1*, UINT,
     ID3D12Pageable* const*, const D3D12_RESIDENCY_PRIORITY*);
 HRESULT STDMETHODCALLTYPE hook_d3d12_EnqueueMakeResident(ID3D12Device3*, UINT,
     UINT, ID3D12Pageable* const*, ID3D12Fence*, UINT64);
+HRESULT STDMETHODCALLTYPE hook_d3d12_CheckFeatureSupport(ID3D12Device*, D3D12_FEATURE,
+    void*, UINT);
+HRESULT STDMETHODCALLTYPE hook_d3d12_CreateReservedResource(ID3D12Device*,
+        const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE*,
+        REFIID, void**);
+HRESULT STDMETHODCALLTYPE hook_d3d12_CreateReservedResource1(ID3D12Device4*,
+        const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE*,
+        DMN_ID3D12ProtectedResourceSession*, REFIID, void**);
+HRESULT STDMETHODCALLTYPE hook_d3d12_CreateReservedResource2(ID3D12Device10*,
+        const D3D12_RESOURCE_DESC*, DMN_D3D12_BARRIER_LAYOUT, const D3D12_CLEAR_VALUE*,
+        DMN_ID3D12ProtectedResourceSession*, UINT32, const DXGI_FORMAT*, REFIID, void**);
+void STDMETHODCALLTYPE hook_d3d12_GetResourceTiling(ID3D12Device*, ID3D12Resource*,
+        UINT*, D3D12_PACKED_MIP_INFO*, D3D12_TILE_SHAPE*, UINT*, UINT,
+        D3D12_SUBRESOURCE_TILING*);
+HRESULT STDMETHODCALLTYPE hook_d3d12_CreateCommandList(ID3D12Device*, UINT,
+        D3D12_COMMAND_LIST_TYPE, ID3D12CommandAllocator*, ID3D12PipelineState*, REFIID,
+        void**);
+HRESULT STDMETHODCALLTYPE hook_d3d12_CreateCommandList1(ID3D12Device4*, UINT,
+        D3D12_COMMAND_LIST_TYPE, UINT, REFIID, void**);
 HRESULT STDMETHODCALLTYPE hook_d3d12_CreateCommandQueue(ID3D12Device*,
     const D3D12_COMMAND_QUEUE_DESC*, REFIID, void**);
 HRESULT STDMETHODCALLTYPE hook_d3d12_CreateGraphicsPipelineState(ID3D12Device*,
@@ -728,6 +752,14 @@ void STDMETHODCALLTYPE hook_queue_UpdateTileMappings(ID3D12CommandQueue*,
     const D3D12_TILE_REGION_SIZE*, ID3D12Heap*, UINT,
     const D3D12_TILE_RANGE_FLAGS*, const UINT*, const UINT*,
     D3D12_TILE_MAPPING_FLAGS);
+void STDMETHODCALLTYPE hook_queue_CopyTileMappings(ID3D12CommandQueue*,
+    ID3D12Resource*, const D3D12_TILED_RESOURCE_COORDINATE*, ID3D12Resource*,
+    const D3D12_TILED_RESOURCE_COORDINATE*, const D3D12_TILE_REGION_SIZE*,
+    D3D12_TILE_MAPPING_FLAGS);
+/* D3D12 graphics command list. */
+void STDMETHODCALLTYPE hook_cmdlist_CopyTiles(ID3D12GraphicsCommandList*,
+    ID3D12Resource*, const D3D12_TILED_RESOURCE_COORDINATE*,
+    const D3D12_TILE_REGION_SIZE*, ID3D12Resource*, UINT64, D3D12_TILE_COPY_FLAGS);
 UINT64 STDMETHODCALLTYPE hook_f12_GetCompletedValue(ID3D12Fence*);
 HRESULT STDMETHODCALLTYPE hook_f12_SetEventOnCompletion(ID3D12Fence*, UINT64, HANDLE);
 HRESULT STDMETHODCALLTYPE hook_f12_Signal(ID3D12Fence*, UINT64);
@@ -775,12 +807,21 @@ DMN_HOOK_STATE(d3d12_Evict);
 DMN_HOOK_STATE(d3d12_SetResidencyPriority);
 DMN_HOOK_STATE(d3d12_EnqueueMakeResident);
 DMN_HOOK_STATE(d3d12_CreateCommandQueue);
+DMN_HOOK_STATE(d3d12_CreateReservedResource);
+DMN_HOOK_STATE(d3d12_CreateReservedResource1);
+DMN_HOOK_STATE(d3d12_CreateReservedResource2);
+DMN_HOOK_STATE(d3d12_GetResourceTiling);
+DMN_HOOK_STATE(d3d12_CheckFeatureSupport);
+DMN_HOOK_STATE(d3d12_CreateCommandList);
+DMN_HOOK_STATE(d3d12_CreateCommandList1);
 DMN_HOOK_STATE(d3d12_CreateCommandQueue1);
 DMN_HOOK_STATE(d3d12_CreateGraphicsPipelineState);
 DMN_HOOK_STATE(d3d12_SetEventOnMultipleFenceCompletion);
 DMN_HOOK_STATE(queue_Signal);
 DMN_HOOK_STATE(queue_Wait);
 DMN_HOOK_STATE(queue_UpdateTileMappings);
+DMN_HOOK_STATE(queue_CopyTileMappings);
+DMN_HOOK_STATE(cmdlist_CopyTiles);
 DMN_HOOK_STATE(f12_GetCompletedValue);
 DMN_HOOK_STATE(f12_SetEventOnCompletion);
 DMN_HOOK_STATE(f12_Signal);
@@ -2418,6 +2459,21 @@ HRESULT STDMETHODCALLTYPE hook_queue_Wait(
     return orig ? orig(This, fence, value) : E_FAIL;
 }
 
+/* D3D12 tile region -> the sparse module's POD; NULL parts take the D3D12
+ * defaults (start at 0 / one tile). */
+DmnSparseRegion sparse_region(const D3D12_TILED_RESOURCE_COORDINATE* c,
+                              const D3D12_TILE_REGION_SIZE* sz) {
+    DmnSparseRegion g{};
+    if (c) { g.x = c->X; g.y = c->Y; g.z = c->Z; g.subresource = c->Subresource; }
+    if (sz) {
+        g.use_box = sz->UseBox; g.num_tiles = sz->NumTiles;
+        g.width = sz->Width; g.height = sz->Height; g.depth = sz->Depth;
+    } else {
+        g.num_tiles = 1; g.width = g.height = g.depth = 1;
+    }
+    return g;
+}
+
 /* Tile mappings draw pages from a heap, so this is one of the entry points an
  * ID3D12Heap can arrive through (MSDN: pHeap, 5th parameter). A synthetic
  * heap must not reach the framework; there is also nothing it could do with
@@ -2429,6 +2485,35 @@ void STDMETHODCALLTYPE hook_queue_UpdateTileMappings(
         const D3D12_TILE_REGION_SIZE* sizes, ID3D12Heap* heap, UINT num_ranges,
         const D3D12_TILE_RANGE_FLAGS* range_flags, const UINT* range_offsets,
         const UINT* range_counts, D3D12_TILE_MAPPING_FLAGS flags) {
+    if (resource && dmn_sparse_is_registered(dmn_com_identity(resource))) {
+        /* The heap named here IS a tile pool, by definition of the call, and
+         * the app can never map more tiles than the pools it owns -- so its
+         * size is an authoritative ceiling on tile demand, which is what
+         * sizes our sparse chunks.  The pages themselves still come from the
+         * sparse heap, not from this one.  Translate and apply.  NULL
+         * coordinates start at 0; NULL sizes are one tile per region, or --
+         * with NULL coordinates too -- the whole resource, which the sparse
+         * side sizes (regions NULL). */
+        /* A synthetic heap is ours, not a framework object: it has no real
+         * GetDesc to call, and it is not a tile pool. */
+        if (heap && !as_synth_heap(heap)) {
+            D3D12_HEAP_DESC hd = {};
+            heap->GetDesc(&hd);
+            dmn_sparse_note_tile_pool(heap, hd.SizeInBytes);
+        }
+        std::vector<DmnSparseRegion> regs;
+        if (coords || sizes) {
+            regs.resize(num_regions);
+            for (UINT i = 0; i < num_regions; i++)
+                regs[i] = sparse_region(coords ? &coords[i] : nullptr, sizes ? &sizes[i] : nullptr);
+        }
+        static_assert(sizeof(D3D12_TILE_RANGE_FLAGS) == sizeof(uint32_t), "flags size");
+        dmn_sparse_update_mappings(dmn_com_identity(resource), num_regions,
+                                   regs.empty() ? nullptr : regs.data(), num_ranges,
+                                   reinterpret_cast<const uint32_t*>(range_flags),
+                                   range_counts);
+        return;
+    }
     if (as_synth_heap(heap)) {
         DMN_ERROR("hooks: UpdateTileMappings with a SHARED/imported heap as "
                   "the tile pool is not supported — the mappings are DROPPED "
@@ -2441,6 +2526,395 @@ void STDMETHODCALLTYPE hook_queue_UpdateTileMappings(
              range_flags, range_offsets, range_counts, flags);
 }
 
+/* Copying mappings makes the destination tiles share the source tiles'
+ * pages.  Metal cannot alias pages between (or within) sparse textures, so
+ * for a sparse-backed resource there is nothing faithful to do; say so
+ * rather than let the framework's tier-0 no-op pass silently. */
+void STDMETHODCALLTYPE hook_queue_CopyTileMappings(
+        ID3D12CommandQueue* This, ID3D12Resource* dst,
+        const D3D12_TILED_RESOURCE_COORDINATE* dst_start, ID3D12Resource* src,
+        const D3D12_TILED_RESOURCE_COORDINATE* src_start,
+        const D3D12_TILE_REGION_SIZE* size, D3D12_TILE_MAPPING_FLAGS flags) {
+    if ((dst && dmn_sparse_is_registered(dmn_com_identity(dst))) ||
+        (src && dmn_sparse_is_registered(dmn_com_identity(src)))) {
+        static std::atomic<uint32_t> n{0};
+        if (n++ < 4)
+            DMN_ERROR("hooks: CopyTileMappings on a sparse-backed reserved resource is "
+                      "not supported (Metal cannot alias sparse tiles) — the "
+                      "destination's mappings are UNCHANGED");
+        return;
+    }
+    auto orig = DMN_ORIG(queue_CopyTileMappings, This);
+    if (orig)
+        orig(This, dst, dst_start, src, src_start, size, flags);
+}
+
+/* CopyTiles on a sparse-backed resource: the framework has no tiled path, so
+ * each standard tile becomes a CopyTextureRegion between the buffer and the
+ * tile's texels -- CopyTiles' buffer layout is exactly a placed footprint per
+ * tile (linear rows at the full tile pitch, 64 KiB apart).  Packed tiles are
+ * skipped: the spec leaves CopyTiles on them undefined and sends apps to
+ * CopyTextureRegion, which works on these textures as-is. */
+void STDMETHODCALLTYPE hook_cmdlist_CopyTiles(
+        ID3D12GraphicsCommandList* This, ID3D12Resource* tiled,
+        const D3D12_TILED_RESOURCE_COORDINATE* start,
+        const D3D12_TILE_REGION_SIZE* size, ID3D12Resource* buffer,
+        UINT64 buffer_offset, D3D12_TILE_COPY_FLAGS flags) {
+    if (!tiled || !dmn_sparse_is_registered(dmn_com_identity(tiled))) {
+        auto orig = DMN_ORIG(cmdlist_CopyTiles, This);
+        if (orig)
+            orig(This, tiled, start, size, buffer, buffer_offset, flags);
+        return;
+    }
+    static std::atomic<uint32_t> nerr{0};
+    if (!buffer || !size || (buffer_offset % D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT) != 0) {
+        if (nerr++ < 4)
+            DMN_ERROR("hooks: CopyTiles on a sparse-backed reserved resource: buffer %p "
+                      "offset %llu is not %u-aligned (or no size) — copy DROPPED",
+                      (void*)buffer, (unsigned long long)buffer_offset,
+                      (unsigned)D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
+        return;
+    }
+    const D3D12_RESOURCE_DESC rd = tiled->GetDesc();
+    const bool to_buffer = flags & D3D12_TILE_COPY_FLAG_SWIZZLED_TILED_RESOURCE_TO_LINEAR_BUFFER;
+    struct Ctx {
+        ID3D12GraphicsCommandList* cl; ID3D12Resource* tex; ID3D12Resource* buf;
+        UINT64 base; DXGI_FORMAT fmt; UINT16 mips; bool to_buffer;
+    } ctx{This, tiled, buffer, buffer_offset, rd.Format, rd.MipLevels, to_buffer};
+    auto emit = [](void* user, const DmnSparseTileCopy* c) {
+        Ctx& x = *static_cast<Ctx*>(user);
+        D3D12_TEXTURE_COPY_LOCATION tl{};
+        tl.pResource = x.tex;
+        tl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        tl.SubresourceIndex = c->slice * x.mips + c->mip;
+        D3D12_TEXTURE_COPY_LOCATION bl{};
+        bl.pResource = x.buf;
+        bl.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        bl.PlacedFootprint.Offset = x.base + c->buffer_offset;
+        bl.PlacedFootprint.Footprint.Format = x.fmt;
+        bl.PlacedFootprint.Footprint.Width = c->w;
+        bl.PlacedFootprint.Footprint.Height = c->h;
+        bl.PlacedFootprint.Footprint.Depth = 1;
+        bl.PlacedFootprint.Footprint.RowPitch = c->row_pitch;
+        if (x.to_buffer) {
+            D3D12_BOX box{c->x, c->y, 0, c->x + c->w, c->y + c->h, 1};
+            x.cl->CopyTextureRegion(&bl, 0, 0, 0, &tl, &box);
+        } else {
+            x.cl->CopyTextureRegion(&tl, c->x, c->y, 0, &bl, nullptr);
+        }
+    };
+    DmnSparseRegion g = sparse_region(start, size);
+    uint32_t skipped = 0;
+    dmn_sparse_plan_tile_copy(dmn_com_identity(tiled), &g, emit, &ctx, &skipped);
+    if (skipped && nerr++ < 4)
+        DMN_WARN("hooks: CopyTiles touched %u packed-mip tile(s) of a sparse-backed "
+                 "reserved resource — undefined per D3D12, skipped (use CopyTextureRegion "
+                 "for packed mips)", skipped);
+}
+
+/* GetResourceTiling for a sparse-backed resource comes from the tile model
+ * dmn_sparse implements (the framework answers from its tier-0 world);
+ * anything else passes through. */
+void STDMETHODCALLTYPE hook_d3d12_GetResourceTiling(
+        ID3D12Device* This, ID3D12Resource* res, UINT* total_tiles,
+        D3D12_PACKED_MIP_INFO* packed, D3D12_TILE_SHAPE* shape, UINT* num_subs,
+        UINT first_sub, D3D12_SUBRESOURCE_TILING* subs) {
+    DmnSparseTiling t;
+    std::vector<DmnSparseSubTiling> st;
+    uint32_t n = num_subs ? *num_subs : 0;
+    if (n && subs) st.resize(n);
+    if (res && dmn_sparse_query_tiling(dmn_com_identity(res), &t, first_sub, &n,
+                                       st.empty() ? nullptr : st.data())) {
+        if (total_tiles) *total_tiles = t.total_tiles;
+        if (packed) {
+            packed->NumStandardMips = (UINT8)t.standard_mips;
+            packed->NumPackedMips = (UINT8)t.packed_mips;
+            packed->NumTilesForPackedMips = t.packed_tiles;
+            packed->StartTileIndexInOverallResource = t.packed_start_tile;
+        }
+        if (shape) { shape->WidthInTexels = t.tile_w; shape->HeightInTexels = t.tile_h; shape->DepthInTexels = 1; }
+        for (uint32_t i = 0; subs && i < n; i++) {
+            subs[i].WidthInTiles = st[i].width_in_tiles;
+            subs[i].HeightInTiles = (UINT16)st[i].height_in_tiles;
+            subs[i].DepthInTiles = st[i].width_in_tiles ? 1 : 0;
+            subs[i].StartTileIndexInOverallResource = st[i].start_tile;
+        }
+        if (num_subs) *num_subs = n;
+        return;
+    }
+    auto orig = DMN_ORIG(d3d12_GetResourceTiling, This);
+    if (orig)
+        orig(This, res, total_tiles, packed, shape, num_subs, first_sub, subs);
+}
+
+/* D3D12_OPTIONS.TiledResourcesTier: the framework answers 0 (it has no tiled
+ * support); with sparse backing available this library serves tier 2
+ * through hook_d3d12_CreateReservedResource + hook_queue_UpdateTileMappings,
+ * so report it.  The guest driver keys its reserved-resource path on this
+ * (Triton: host tier >= 1 -> forward CreateReservedResource/UpdateTileMappings;
+ * tier 0 -> its committed-backing shim), which keeps an old host safe: an
+ * unhooked CreateReservedResource there returns an unbacked object. */
+HRESULT STDMETHODCALLTYPE hook_d3d12_CheckFeatureSupport(
+        ID3D12Device* This, D3D12_FEATURE feature, void* data, UINT size) {
+    auto orig = DMN_ORIG(d3d12_CheckFeatureSupport, This);
+    HRESULT hr = orig ? orig(This, feature, data, size) : E_FAIL;
+    if (SUCCEEDED(hr) && feature == D3D12_FEATURE_D3D12_OPTIONS && data &&
+        size == sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS) && dmn_sparse_enabled()) {
+        auto* o = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS*>(data);
+        if (o->TiledResourcesTier < D3D12_TILED_RESOURCES_TIER_2)
+            o->TiledResourcesTier = D3D12_TILED_RESOURCES_TIER_2;
+    }
+    return hr;
+}
+
+/* Reserved (tiled) resource: D3DMetal cannot back one (TiledResourcesTier
+ * 0, its CreateReservedResource makes an unbacked object), so create it as
+ * an ordinary framework resource whose Metal texture is substituted with one
+ * from a sparse heap (dmn_sparse) -- no memory until UpdateTileMappings maps
+ * tiles, unmapped tiles read zero.  D3DMetal sees a normal texture for
+ * views, barriers and copies.  Without sparse support (or on a shape the
+ * sparse heap refuses: buffers, 3D, MSAA) the committed create stands, fully
+ * backed -- and fully resident, see dmn_sparse.h.
+ *
+ * The framework object is created PLACED at offset 0 of a dummy heap rather
+ * than committed.  Measured (DMN_ALLOC_TRACE): a committed create -- with or
+ * without HEAP_FLAG_SHARED -- makes D3DMetal reserve the texture's full size
+ * in its 256 MiB pool heaps (heap_newtex on dev_newheap pools), and a pool
+ * heap is resident wholesale, so the substituted sparse texture would sit on
+ * top of a fully-backed pool reservation and save nothing.  Placed,
+ * D3DMetal's bookkeeping allocation is the dummy heap, which every reserved
+ * resource aliases at offset 0 (legal for placed resources); the swizzle
+ * hands D3DMetal the sparse texture before Metal ever sees the placement.
+ * D3DMetal validates offset + size <= heap size, so the dummy is sized to
+ * the largest reserved resource seen and re-created bigger on demand (old
+ * ones stay alive for the resources placed on them).  The committed create
+ * is the fallback when the placed one fails.
+ *
+ * Shared body of the three CreateReservedResource variants: `create_placed`
+ * (heap) and `create_committed` () perform this device tier's create of the
+ * caller's copy of the desc into *out. */
+template <class Placed, class Committed>
+HRESULT d12_create_reserved(ID3D12Device* This, const D3D12_RESOURCE_DESC* desc,
+                            void** out, Placed&& create_placed,
+                            Committed&& create_committed) {
+    const bool sparse = dmn_sparse_enabled() &&
+                        desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+                        desc->SampleDesc.Count <= 1;
+    static ID3D12Device* dummy_dev = nullptr;
+    static ID3D12Heap* dummy_heap = nullptr;
+    static UINT64 dummy_bytes = 0;
+    static std::mutex dummy_mtx;
+    HRESULT hr = E_FAIL;
+    bool did_placed = false;
+    if (sparse) {
+        D3D12_RESOURCE_DESC cd = *desc;
+        cd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        D3D12_RESOURCE_ALLOCATION_INFO ai = This->GetResourceAllocationInfo(0, 1, &cd);
+        UINT64 need = ai.SizeInBytes ? ai.SizeInBytes : (64ull << 20);
+        need = (need + 0xFFFFFull) & ~0xFFFFFull; /* 1 MiB granularity */
+        std::lock_guard<std::mutex> lk(dummy_mtx);
+        if (dummy_heap && dummy_dev != This) {
+            /* A different device: its heaps are not this one's. */
+            dummy_heap->Release();
+            dummy_heap = nullptr;
+            dummy_bytes = 0;
+        }
+        if (!dummy_heap || dummy_bytes < need) {
+            UINT64 want = std::max<UINT64>(need, 64ull << 20);
+            D3D12_HEAP_DESC hd{};
+            hd.SizeInBytes = want;
+            hd.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+            hd.Alignment = 65536;
+            hd.Flags = D3D12_HEAP_FLAG_NONE;
+            ID3D12Heap* nh = nullptr;
+            auto orig_ch = DMN_ORIG(d3d12_CreateHeap, This);
+            HRESULT hh = orig_ch ? orig_ch(This, &hd, __uuidof(ID3D12Heap), (void**)&nh)
+                                 : This->CreateHeap(&hd, __uuidof(ID3D12Heap), (void**)&nh);
+            if (FAILED(hh) || !nh) {
+                DMN_WARN("hooks: sparse dummy heap (%llu MiB) create failed 0x%08x; this reserved "
+                         "resource takes the committed path", (unsigned long long)(want >> 20), (unsigned)hh);
+            } else {
+                /* The previous dummy stays referenced by the resources placed on it
+                 * (D3DMetal holds the heap); our reference can go. */
+                if (dummy_heap) dummy_heap->Release();
+                dummy_heap = nh; dummy_bytes = want; dummy_dev = This;
+                DMN_INFO("hooks: sparse dummy heap now %llu MiB (largest reserved resource %llu MiB)",
+                         (unsigned long long)(want >> 20), (unsigned long long)(need >> 20));
+            }
+        }
+        if (dummy_heap && dummy_bytes >= need) {
+            dmn_sparse_arm();
+            hr = create_placed(dummy_heap);
+            did_placed = true;
+            if (FAILED(hr) || !*out) {
+                void* t = nullptr;
+                if (dmn_sparse_disarm(&t) && t)
+                    dmn_sparse_release_texture(t);
+                static std::atomic<uint32_t> w{0};
+                if (w++ < 4)
+                    DMN_WARN("hooks: reserved resource %llux%u fmt=%u mips=%u: placed-on-dummy-heap create "
+                             "failed 0x%08x; retrying committed", (unsigned long long)desc->Width, desc->Height,
+                             (unsigned)desc->Format, (unsigned)desc->MipLevels, (unsigned)hr);
+                *out = nullptr;
+                did_placed = false;
+            }
+        }
+    }
+    if (!did_placed) {
+        if (sparse)
+            dmn_sparse_arm();
+        hr = create_committed();
+    }
+    void* tex = nullptr;
+    bool captured = sparse && dmn_sparse_disarm(&tex);
+    if (FAILED(hr) || !*out) {
+        DMN_WARN("hooks: reserved resource %llux%u fmt=%u mips=%u: committed create failed 0x%08x",
+                 (unsigned long long)desc->Width, desc->Height, (unsigned)desc->Format,
+                 (unsigned)desc->MipLevels, (unsigned)hr);
+        return hr;
+    }
+    auto* res = reinterpret_cast<IUnknown*>(*out);
+    if (captured) {
+        void* id = dmn_com_identity(res);
+        dmn_sparse_register(id, tex, (uint32_t)desc->Dimension, (uint32_t)desc->Format,
+                            desc->Width, desc->Height, desc->DepthOrArraySize,
+                            desc->MipLevels);
+        attach_evict_sentinel(res, id, EV_SPARSE);
+    } else {
+        static std::atomic<uint32_t> warned{0};
+        if (warned++ < 8)
+            DMN_WARN("hooks: reserved resource %llux%u fmt=%u mips=%u dim=%d is fully backed "
+                     "(committed): sparse %s", (unsigned long long)desc->Width, desc->Height,
+                     (unsigned)desc->Format, (unsigned)desc->MipLevels, (int)desc->Dimension,
+                     sparse ? "capture missed" : "unavailable for this shape");
+    }
+    return hr;
+}
+
+HRESULT STDMETHODCALLTYPE hook_d3d12_CreateReservedResource(
+        ID3D12Device* This, const D3D12_RESOURCE_DESC* desc,
+        D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE* clear,
+        REFIID riid, void** out) {
+    auto orig = DMN_ORIG(d3d12_CreateReservedResource, This);
+    if (!desc || !out)
+        return orig ? orig(This, desc, state, clear, riid, out) : E_FAIL;
+    D3D12_RESOURCE_DESC cd = *desc;
+    cd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    D3D12_HEAP_PROPERTIES hp{};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    auto orig_cp = DMN_ORIG(d3d12_CreatePlacedResource, This);
+    auto orig_cc = DMN_ORIG(d3d12_CreateCommittedResource, This);
+    return d12_create_reserved(This, desc, out,
+        [&](ID3D12Heap* heap) {
+            return orig_cp ? orig_cp(This, heap, 0, &cd, state, clear, riid, out)
+                           : This->CreatePlacedResource(heap, 0, &cd, state, clear, riid, out);
+        },
+        [&] {
+            return orig_cc ? orig_cc(This, &hp, D3D12_HEAP_FLAG_NONE, &cd, state, clear, riid, out)
+                           : This->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &cd,
+                                                           state, clear, riid, out);
+        });
+}
+
+/* ID3D12Device4 variant: same, with a protected session -- which the placed
+ * create has no room for, so a resource in a session keeps the framework's
+ * own path (D3DMetal does not support protected sessions anyway). */
+HRESULT STDMETHODCALLTYPE hook_d3d12_CreateReservedResource1(
+        ID3D12Device4* This, const D3D12_RESOURCE_DESC* desc,
+        D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE* clear,
+        DMN_ID3D12ProtectedResourceSession* session, REFIID riid, void** out) {
+    auto orig = DMN_ORIG(d3d12_CreateReservedResource1, This);
+    if (!desc || !out || session)
+        return orig ? orig(This, desc, state, clear, session, riid, out) : E_FAIL;
+    D3D12_RESOURCE_DESC cd = *desc;
+    cd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    D3D12_HEAP_PROPERTIES hp{};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    auto orig_cp = DMN_ORIG(d3d12_CreatePlacedResource, This);
+    auto orig_cc = DMN_ORIG(d3d12_CreateCommittedResource1, This);
+    return d12_create_reserved(This, desc, out,
+        [&](ID3D12Heap* heap) {
+            return orig_cp ? orig_cp(This, heap, 0, &cd, state, clear, riid, out)
+                           : This->CreatePlacedResource(heap, 0, &cd, state, clear, riid, out);
+        },
+        [&] {
+            return orig_cc ? orig_cc(This, &hp, D3D12_HEAP_FLAG_NONE, &cd, state, clear,
+                                     nullptr, riid, out)
+                           : This->CreateCommittedResource1(&hp, D3D12_HEAP_FLAG_NONE, &cd,
+                                                            state, clear, nullptr, riid, out);
+        });
+}
+
+/* ID3D12Device10 variant: barrier layout + castable formats, forwarded to
+ * this tier's placed/committed creates (DESC1 = DESC + a zero mip region). */
+HRESULT STDMETHODCALLTYPE hook_d3d12_CreateReservedResource2(
+        ID3D12Device10* This, const D3D12_RESOURCE_DESC* desc,
+        DMN_D3D12_BARRIER_LAYOUT layout, const D3D12_CLEAR_VALUE* clear,
+        DMN_ID3D12ProtectedResourceSession* session, UINT32 num_castable,
+        const DXGI_FORMAT* castable, REFIID riid, void** out) {
+    auto orig = DMN_ORIG(d3d12_CreateReservedResource2, This);
+    if (!desc || !out || session)
+        return orig ? orig(This, desc, layout, clear, session, num_castable, castable, riid, out)
+                    : E_FAIL;
+    D3D12_RESOURCE_DESC1 cd{};
+    memcpy(&cd, desc, sizeof(*desc));
+    cd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    D3D12_HEAP_PROPERTIES hp{};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    auto orig_cp = DMN_ORIG(d3d12_CreatePlacedResource2, This);
+    auto orig_cc = DMN_ORIG(d3d12_CreateCommittedResource3, This);
+    return d12_create_reserved(This, desc, out,
+        [&](ID3D12Heap* heap) {
+            return orig_cp ? orig_cp(This, heap, 0, &cd, layout, clear, num_castable, castable,
+                                     riid, out)
+                           : This->CreatePlacedResource2(heap, 0, &cd, layout, clear, num_castable,
+                                                         castable, riid, out);
+        },
+        [&] {
+            return orig_cc ? orig_cc(This, &hp, D3D12_HEAP_FLAG_NONE, &cd, layout, clear, nullptr,
+                                     num_castable, castable, riid, out)
+                           : This->CreateCommittedResource3(&hp, D3D12_HEAP_FLAG_NONE, &cd, layout,
+                                                            clear, nullptr, num_castable, castable,
+                                                            riid, out);
+        });
+}
+
+/* Command lists are hooked for CopyTiles on sparse-backed reserved
+ * resources; the framework has no tiled path (see hook_cmdlist_CopyTiles). */
+void patch_d3d12_cmdlist(IUnknown* obj) {
+    ID3D12GraphicsCommandList* cl = nullptr;
+    if (SUCCEEDED(obj->QueryInterface(__uuidof(ID3D12GraphicsCommandList),
+                                      reinterpret_cast<void**>(&cl))) && cl) {
+        DMN_PATCH(cl, ID3D12GraphicsCommandList, CopyTiles, cmdlist_CopyTiles);
+        cl->Release();
+    }
+}
+
+HRESULT STDMETHODCALLTYPE hook_d3d12_CreateCommandList(
+        ID3D12Device* This, UINT node_mask, D3D12_COMMAND_LIST_TYPE type,
+        ID3D12CommandAllocator* allocator, ID3D12PipelineState* pso, REFIID riid,
+        void** out) {
+    auto orig = DMN_ORIG(d3d12_CreateCommandList, This);
+    if (!orig)
+        return E_FAIL;
+    HRESULT hr = orig(This, node_mask, type, allocator, pso, riid, out);
+    if (SUCCEEDED(hr) && out && *out)
+        patch_d3d12_cmdlist(reinterpret_cast<IUnknown*>(*out));
+    return hr;
+}
+
+HRESULT STDMETHODCALLTYPE hook_d3d12_CreateCommandList1(
+        ID3D12Device4* This, UINT node_mask, D3D12_COMMAND_LIST_TYPE type,
+        UINT flags, REFIID riid, void** out) {
+    auto orig = DMN_ORIG(d3d12_CreateCommandList1, This);
+    if (!orig)
+        return E_FAIL;
+    HRESULT hr = orig(This, node_mask, type, flags, riid, out);
+    if (SUCCEEDED(hr) && out && *out)
+        patch_d3d12_cmdlist(reinterpret_cast<IUnknown*>(*out));
+    return hr;
+}
+
 void patch_d3d12_queue(IUnknown* obj) {
     ID3D12CommandQueue* q = nullptr;
     if (SUCCEEDED(obj->QueryInterface(__uuidof(ID3D12CommandQueue),
@@ -2451,6 +2925,7 @@ void patch_d3d12_queue(IUnknown* obj) {
          * parameter list is not (see the forward declaration). */
         DMN_PATCH(q, ID3D12CommandQueue, UpdateTileMappings,
                   queue_UpdateTileMappings);
+        DMN_PATCH(q, ID3D12CommandQueue, CopyTileMappings, queue_CopyTileMappings);
         q->Release();
     }
 }
@@ -2913,6 +3388,10 @@ extern "C" void dmn_hooks_after_d3d12_device(void* device) {
         DMN_PATCH(d, ID3D12Device, MakeResident, d3d12_MakeResident);
         DMN_PATCH(d, ID3D12Device, Evict, d3d12_Evict);
         DMN_PATCH(d, ID3D12Device, CreateCommandQueue, d3d12_CreateCommandQueue);
+        DMN_PATCH(d, ID3D12Device, CreateReservedResource, d3d12_CreateReservedResource);
+        DMN_PATCH(d, ID3D12Device, GetResourceTiling, d3d12_GetResourceTiling);
+        DMN_PATCH(d, ID3D12Device, CheckFeatureSupport, d3d12_CheckFeatureSupport);
+        DMN_PATCH(d, ID3D12Device, CreateCommandList, d3d12_CreateCommandList);
         DMN_PATCH(d, ID3D12Device, CreateGraphicsPipelineState,
                   d3d12_CreateGraphicsPipelineState);
         d->Release();
@@ -2941,6 +3420,9 @@ extern "C" void dmn_hooks_after_d3d12_device(void* device) {
         DMN_PATCH(d4, ID3D12Device4, CreateCommittedResource1,
                   d3d12_CreateCommittedResource1);
         DMN_PATCH(d4, ID3D12Device4, CreateHeap1, d3d12_CreateHeap1);
+        DMN_PATCH(d4, ID3D12Device4, CreateReservedResource1,
+                  d3d12_CreateReservedResource1);
+        DMN_PATCH(d4, ID3D12Device4, CreateCommandList1, d3d12_CreateCommandList1);
         d4->Release();
     }
     ID3D12Device8* d8 = nullptr;
@@ -2965,6 +3447,8 @@ extern "C" void dmn_hooks_after_d3d12_device(void* device) {
                   d3d12_CreateCommittedResource3);
         DMN_PATCH(d10, ID3D12Device10, CreatePlacedResource2,
                   d3d12_CreatePlacedResource2);
+        DMN_PATCH(d10, ID3D12Device10, CreateReservedResource2,
+                  d3d12_CreateReservedResource2);
         d10->Release();
     }
     DMN_INFO("hooks: patched D3D12 device %p", device);

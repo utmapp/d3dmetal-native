@@ -320,3 +320,51 @@ tiled_probe = executable('tiled-probe',
   include_directories: [test_native_inc, include_directories('../src')],
   link_with: dmn_lib,
   dependencies: [cocoa_deps])
+
+# Diagnostic probe (not a test): what the machine actually holds for committed
+# textures vs how much of them the GPU touches (host-wide page counters), and
+# the A/B of a reserved texture under committed vs sparse backing.
+resident_probe = executable('resident-probe',
+  ['resident_probe.cpp', 'metal_alloc_size.mm'],
+  include_directories: [test_native_inc, include_directories('../src')],
+  link_with: dmn_lib,
+  dependencies: [cocoa_deps])
+# Diagnostic probe (not a test): is an unreferenced D3D12 heap / untouched
+# texture still made resident by the backend on GPU work? (Yes.)
+heapres_probe = executable('heapres-probe',
+  ['heapres_probe.cpp', 'metal_alloc_size.mm'],
+  include_directories: [test_native_inc, include_directories('../src')],
+  link_with: dmn_lib,
+  dependencies: [cocoa_deps])
+
+# Sparse-backed reserved resources: tier-2 content semantics through the
+# hooks (mapped region holds data, unmapped reads zero, unmap reads zero
+# again; BC7 4096^2 chain incl. every packed-tail mip written and read back).
+sparse_tiled = executable('sparse-tiled-test',
+  ['sparse_tiled_test.cpp', 'metal_alloc_size.mm'],
+  include_directories: [test_native_inc, include_directories('../src')],
+  link_with: dmn_lib,
+  dependencies: [cocoa_deps])
+test('sparse-tiled', sparse_tiled, env: ['DMN_LOG=warn'], is_parallel: false, timeout: 120)
+
+# How the sparse module sizes itself: when chunks open, where a texture lands,
+# what the chunks may total.  Each case re-execs this binary in a fresh process
+# (the knobs are read once and the chunks are process-global), so it must not
+# run alongside other GPU tests.
+sparse_sizing = executable('sparse-sizing-test',
+  ['sparse_sizing_test.cpp', 'metal_alloc_size.mm'],
+  include_directories: [test_native_inc, include_directories('../src')],
+  link_with: dmn_lib,
+  dependencies: [cocoa_deps])
+test('sparse-sizing', sparse_sizing, env: ['DMN_LOG=warn'], is_parallel: false, timeout: 300)
+
+# Diagnostic probe (not a test): a streaming title's reserved-resource pattern
+# -- create many tiled resources, then map a fraction of each much later --
+# and whether any sparse chunk runs dry.  Reproduces the shape that stresses
+# placement on the host in under a minute, with no VM.
+sparse_pool_probe = executable('sparse-pool-probe',
+  ['sparse_pool_probe.cpp', 'metal_alloc_size.mm'],
+  include_directories: [test_native_inc, include_directories('../src')],
+  link_with: dmn_lib,
+  dependencies: [cocoa_deps])
+

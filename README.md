@@ -44,6 +44,12 @@ your app ──> libd3dmetal-native.dylib ──> D3DMetal.framework ──> Met
   `dmn_event_wait()`. `dmn_event_create()` mints HANDLEs to pass into those
   APIs yourself, and `dmn_event_dup_fd()` vends a `poll(2)`-compatible fd
   mirroring an event's signaled state (for fd-driven event loops).
+- **D3D12 reserved (tiled) resources** at `TiledResourcesTier 2`. D3DMetal
+  itself has no tiled-resource support, so `CreateReservedResource` textures
+  are placed on sparse Metal heaps and `UpdateTileMappings` maps real tiles:
+  a virtual-texturing app pays RAM for the tiles it maps, not for the
+  textures' virtual size. `GetResourceTiling`, `CopyTiles`, and packed mips
+  follow the D3D12 tile model.
 - **Registry pre-seeding** (`dmn_registry_set_*`) and per-value environment
   overrides for the settings D3DMetal reads.
 - **Executable-path override** (`dmn_set_executable_path`) so D3DMetal's
@@ -123,14 +129,19 @@ over a Unix socket) and write back into the received copy before
 | `DMN_VSYNC` | `0`/`1`: sets `displaySyncEnabled` on the presentation layer. |
 | `DMN_RETINA` | Opt into the window's real backing scale (default is 1x, point == pixel). |
 | `DMN_PRESENT_FALLBACK` | Present the last vended drawable from the host side if D3DMetal's own present path does not. |
+| `DMN_SPARSE` | `0` disables sparse backing of D3D12 reserved (tiled) resources; they are then fully backed committed textures. |
+| `DMN_SPARSE_HEAP_MB` / `DMN_SPARSE_HEAP_MAX_MB` | Size of each sparse heap chunk (default 1024), and the largest chunk that may be opened for a single reserved resource that needs more than that (default 4096). |
+| `DMN_SPARSE_MAX_MB` | A hard cap on the total across sparse chunks; unset, the budget starts at `DMN_SPARSE_BUDGET_FLOOR_MB` (default 6144) and grows with the tile pools the app names, since it cannot map more tiles than it owns. Reserved resources created past the budget are fully backed. |
+| `DMN_SPARSE_OVERSUBSCRIBE` | How much virtual texture a sparse chunk may carry, as a multiple of its size (default 8, i.e. a tile density down to 12.5%). A denser app needs a lower value; the dry-chunk warning reports the value it implies. |
+| `DMN_SPARSE_STATS` | `<n>`: log the sparse module's sizing summary every `n` `UpdateTileMappings` calls at `warn` level (it is logged at `info` regardless). |
 
 ## Tests
 
 `meson test -C build` runs the suite: device bring-up, on-screen triangle and
 cube demos, cross-process shared textures/buffers/fences/keyed mutexes in
 both API directions, GPU waits on imported fences, event-driven waits,
-shared heaps with placed resources, lifecycle/fd-leak churn, and a
-multi-threaded stress test. The windowed demos
+shared heaps with placed resources, sparse-backed reserved resources,
+lifecycle/fd-leak churn, and a multi-threaded stress test. The windowed demos
 (`d3d11-triangle`, `d3d11-cube`, `d3d12-triangle --shared`,
 `shared-compute-triangle` without `DMN_HEADLESS`) can also be run directly as
 on-screen examples.

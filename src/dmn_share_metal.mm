@@ -1216,10 +1216,19 @@ const char* tex_desc_str(MTLTextureDescriptor* d, char* buf, size_t n) {
     return buf;
 }
 
+extern "C" id dmn_sparse_try_substitute(id device, MTLTextureDescriptor* desc);
+extern "C" void dmn_sub_resource_track(id res, unsigned long usage) {
+    sub_resource_track(res, (MTLResourceUsage)usage);
+}
+
 /* Device dedicated path: -[dev newTextureWithDescriptor:] */
 id swz_dev_newtex(id self, SEL _cmd, MTLTextureDescriptor* desc) {
     IMP orig = lookup_orig(object_getClass(self), _cmd);
     char tb[160];
+    if (id sp = dmn_sparse_try_substitute(self, desc)) {
+        trace_alloc("dev_newtex", true, 0, "SPARSE");
+        return sp;
+    }
     if (t_arm.armed && t_arm.kind == DMN_SHARE_TEXTURE) {
         id<MTLTexture> sub = substitute((id<MTLDevice>)self, desc);
         if (sub) {
@@ -1252,6 +1261,10 @@ id swz_heap_newtex(id self, SEL _cmd, MTLTextureDescriptor* desc,
                    NSUInteger offset) {
     IMP orig = lookup_orig(object_getClass(self), _cmd);
     char tb[160];
+    if (id sp = dmn_sparse_try_substitute([(id<MTLHeap>)self device], desc)) {
+        trace_alloc("heap_newtex", true, 0, "SPARSE");
+        return sp;
+    }
     if (t_arm.armed && t_arm.kind == DMN_SHARE_TEXTURE) {
         id<MTLHeap> heap = (id<MTLHeap>)self;
         id<MTLTexture> sub = substitute([heap device], desc);

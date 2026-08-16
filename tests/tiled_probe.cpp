@@ -11,7 +11,9 @@
  * CreateReservedResource logs "Unsupported: Sparse 2D textures" and returns
  * S_OK with an unbacked object; UpdateTileMappings logs "Unsupported" and
  * does nothing (no device removal).  Tiled resources are the guest UMD's
- * committed-backing shim, not something the framework can do.
+ * committed-backing shim, not something the framework can do.  Those are
+ * the framework's own answers; through the hooked device (dmn_sparse) the
+ * probe reports tier 2 and a real tiling.
  *
  * NOTE: the vendored d3d12.h declares ID3D12CommandQueue::UpdateTileMappings
  * WITHOUT the ID3D12Heap* parameter (wine header bug); anything calling it
