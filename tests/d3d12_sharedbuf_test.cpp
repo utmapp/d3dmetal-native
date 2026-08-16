@@ -1,16 +1,13 @@
 /*
- * D3D12 shared-buffer round trip through the STANDARD APIs only: create a buffer
- * with D3D12_HEAP_FLAG_SHARED, export it with ID3D12Device::CreateSharedHandle,
- * and re-import it with ID3D12Device::OpenSharedHandle — confirming the opaque
- * handle round-trips and yields a resource describing the same buffer. No
- * dmn_* sharing calls.
+ * D3D12 shared buffers through the STANDARD APIs only: create with
+ * D3D12_HEAP_FLAG_SHARED, export with ID3D12Device::CreateSharedHandle, re-import
+ * with ID3D12Device::OpenSharedHandle. No dmn_* sharing calls beyond closing the
+ * handle.
  *
- * Data-flow across the handle (GPU writes visible to a peer) is validated
- * end-to-end by the fence tests, whose companion buffer is exactly a D3D12
- * shared buffer written with WriteBufferImmediate and read by the consumer.
- * (A GPU CopyBufferRegion read of the substituted buffer does NOT round-trip
- * under D3DMetal — cross-resource coherence needs a shared GPU fence — so this
- * test does not attempt one.)
+ *  1. The opaque handle round-trips and yields a resource describing the same
+ *     buffer.
+ *  2. Opening a buffer leaves the producer's bytes intact (an import must never
+ *     initialise the memory it aliases).
  *
  * Prints "SHAREDBUF: PASS" and exits 0 on success.
  */
@@ -27,6 +24,89 @@
 
 #define T_TAG "SHAREDBUF"
 #include "common/check.h"
+#include "common/dx12.h"
+#include "common/util.h"
+
+#include <cstring>
+#include <sys/mman.h>
+
+namespace {
+
+/* Submit one CopyBufferRegion and wait for it. */
+struct Copier {
+    Com<ID3D12CommandQueue> queue;
+    Com<ID3D12CommandAllocator> alloc;
+    Com<ID3D12GraphicsCommandList> list;
+    Com<ID3D12Fence> fence;
+    UINT64 fv = 0;
+    bool init(ID3D12Device* dev) {
+        if (FAILED(make_d3d12_queue(dev, queue)))
+            return false;
+        if (FAILED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                               __uuidof(ID3D12CommandAllocator),
+                                               (void**)&alloc)) ||
+            FAILED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                          alloc.ptr(), nullptr,
+                                          __uuidof(ID3D12GraphicsCommandList),
+                                          (void**)&list)))
+            return false;
+        list->Close();
+        return SUCCEEDED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE,
+                                          __uuidof(ID3D12Fence), (void**)&fence));
+    }
+    bool copy(ID3D12Resource* dst, ID3D12Resource* src, uint64_t bytes) {
+        if (FAILED(alloc->Reset()) || FAILED(list->Reset(alloc.ptr(), nullptr)))
+            return false;
+        list->CopyBufferRegion(dst, 0, src, 0, bytes);
+        if (FAILED(list->Close()))
+            return false;
+        ID3D12CommandList* ls[] = {list.ptr()};
+        queue->ExecuteCommandLists(1, ls);
+        const UINT64 want = ++fv;
+        queue->Signal(fence.ptr(), want);
+        const uint64_t t0 = now_ms();
+        while (fence->GetCompletedValue() < want) {
+            if (now_ms() - t0 > 10000)
+                return false;
+            sleep_ms(1);
+        }
+        return true;
+    }
+};
+
+D3D12_RESOURCE_DESC buf_desc(uint64_t w, D3D12_RESOURCE_FLAGS flags) {
+    D3D12_RESOURCE_DESC rd = {};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    rd.Width = w;
+    rd.Height = 1;
+    rd.DepthOrArraySize = 1;
+    rd.MipLevels = 1;
+    rd.SampleDesc.Count = 1;
+    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    rd.Flags = flags;
+    return rd;
+}
+
+uint32_t pattern(uint32_t seed, uint64_t i) {
+    return seed ^ (uint32_t)(i * 2654435761u);
+}
+
+/* Count mismatches against pattern(seed) over a committed buffer's object (a
+ * committed buffer owns its whole object, so it starts at offset 0). */
+int count_bad(const dmn_shared_buffer_handle* pod, uint32_t seed, size_t bytes) {
+    void* m = mmap(nullptr, bytes, PROT_READ, MAP_SHARED, pod->fd, 0);
+    if (m == MAP_FAILED)
+        return -1;
+    int bad = 0;
+    const uint32_t* w = (const uint32_t*)m;
+    for (uint64_t i = 0; i < bytes / 4; i += 61)
+        if (w[i] != pattern(seed, i))
+            bad++;
+    munmap(m, bytes);
+    return bad;
+}
+
+} // namespace
 
 int main() {
     if (dmn_init(nullptr) != DMN_SUCCESS) {
@@ -68,10 +148,69 @@ int main() {
        "dmn_shared_handle_close");
 
     D3D12_RESOURCE_DESC id = imported->GetDesc();
-    bool ok = imported && id.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
-              id.Width == rd.Width;
-    printf("SHAREDBUF: export+import round trip -> %s (imported %llu-byte buffer)\n",
-           ok ? "OK" : "MISMATCH", (unsigned long long)id.Width);
-    printf("SHAREDBUF: %s\n", ok ? "PASS" : "FAIL");
-    return ok ? 0 : 1;
+    EXPECT(imported && id.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
+           id.Width == rd.Width, "imported buffer does not describe the original");
+    printf("SHAREDBUF: export+import round trip ok (%llu-byte buffer)\n",
+           (unsigned long long)id.Width);
+
+    /* 2) GPU data flow through the handle. */
+    {
+        const uint64_t kSz = 1ull << 20;
+        Copier gpu;
+        EXPECT(gpu.init(device.ptr()), "copier init failed");
+        D3D12_HEAP_PROPERTIES up = {};
+        up.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_RESOURCE_DESC srd = buf_desc(kSz, D3D12_RESOURCE_FLAG_NONE);
+        Com<ID3D12Resource> srcA, srcB;
+        CK(device->CreateCommittedResource(&up, D3D12_HEAP_FLAG_NONE, &srd,
+                                           D3D12_RESOURCE_STATE_GENERIC_READ,
+                                           nullptr, __uuidof(ID3D12Resource),
+                                           (void**)&srcA), "upload src A");
+        CK(device->CreateCommittedResource(&up, D3D12_HEAP_FLAG_NONE, &srd,
+                                           D3D12_RESOURCE_STATE_GENERIC_READ,
+                                           nullptr, __uuidof(ID3D12Resource),
+                                           (void**)&srcB), "upload src B");
+        for (int k = 0; k < 2; k++) {
+            ID3D12Resource* src = k ? srcB.ptr() : srcA.ptr();
+            void* p = nullptr;
+            D3D12_RANGE none{0, 0};
+            CK(src->Map(0, &none, &p), "Map(src)");
+            auto* w = (uint32_t*)p;
+            for (uint64_t i = 0; i < kSz / 4; i++)
+                w[i] = pattern(k ? 0xB0B00000u : 0xA0A00000u, i);
+            src->Unmap(0, nullptr);
+        }
+
+        D3D12_RESOURCE_DESC drd = buf_desc(kSz, D3D12_RESOURCE_FLAG_NONE);
+        Com<ID3D12Resource> a, b;
+        CK(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_SHARED, &drd,
+                                           D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                           __uuidof(ID3D12Resource), (void**)&a),
+           "CreateCommittedResource(SHARED A)");
+        CK(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_SHARED, &drd,
+                                           D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                           __uuidof(ID3D12Resource), (void**)&b),
+           "CreateCommittedResource(SHARED B)");
+        HANDLE ha = nullptr, hb = nullptr;
+        CK(device->CreateSharedHandle(a.ptr(), nullptr, 0, nullptr, &ha), "export A");
+        CK(device->CreateSharedHandle(b.ptr(), nullptr, 0, nullptr, &hb), "export B");
+        auto* pa = (const dmn_shared_buffer_handle*)ha;
+        auto* pb = (const dmn_shared_buffer_handle*)hb;
+
+        /* 2) Fill A through the producer, open it, and check the bytes
+         * survived the open. */
+        EXPECT(gpu.copy(a.ptr(), srcA.ptr(), kSz), "GPU copy into A");
+        Com<ID3D12Resource> a2;
+        CK(device->OpenSharedHandle(ha, __uuidof(ID3D12Resource), (void**)&a2),
+           "OpenSharedHandle(A)");
+        EXPECT(count_bad(pa, 0xA0A00000u, (size_t)kSz) == 0,
+               "opening A disturbed the bytes the producer wrote");
+        printf("SHAREDBUF: producer bytes intact across an open\n");
+
+        dmn_shared_handle_close(ha);
+        dmn_shared_handle_close(hb);
+    }
+
+    T_PASS();
+    return 0;
 }

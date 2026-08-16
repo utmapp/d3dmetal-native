@@ -76,6 +76,16 @@ struct DmnShareArm {
                                placed size stays a legal alias of the window
                                instead of an error */
 
+    /* Consumer/window BUFFER captures on a framework that zero-fills new
+     * buffers (GPTk 1.0-3.0 memset the contents synchronously inside the
+     * create; 4.0 does not): the bytes the impostor aliases belong to a
+     * producer, so the swizzle snapshots them at capture — the last instant
+     * they are intact — and dmn_share_disarm restores them once the create has
+     * returned. Owned by the arm; freed at disarm. */
+    void*    restore_dst;
+    void*    restore_copy;
+    size_t   restore_len;
+
     /* Filled by the swizzle on capture. */
     bool     init_dropped;  /* consumer: the sentinel initial-data upload was
                                intercepted and discarded (see

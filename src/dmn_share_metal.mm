@@ -174,6 +174,75 @@ void pin_buffer_to_texture(id<MTLTexture> tex, id<MTLBuffer> buf) {
 /* == Thread-local arm ===================================================== */
 thread_local DmnShareArm t_arm = {};
 
+/* == Create-time zero-fill defence ========================================
+ * GPTk 1.0, 2.1 and 3.0 memset a new buffer's contents to zero synchronously
+ * inside the create; 4.0 does not. For a consumer or window impostor those
+ * contents are a PRODUCER'S bytes — a placed buffer's neighbours in a shared
+ * heap, an imported guest ring, the surface a peer just wrote — so on those
+ * frameworks every import would wipe what it opened. There is nothing to
+ * intercept (an inlined memset), so the bytes are snapshotted at capture and
+ * put back at disarm.
+ *
+ * Self-calibrating: the first DECISIVE observation (a nonzero snapshot that
+ * either was or was not modified by the create) decides for the process. A
+ * framework that does not zero pays for snapshots only until that
+ * observation; one that does pays a copy per import. Residual window on a
+ * zeroing framework: a peer's GPU write landing between snapshot and restore
+ * is reverted — inherent to any CPU-side repair, and far narrower than
+ * losing the whole buffer. */
+enum ZeroFill { ZF_UNKNOWN, ZF_YES, ZF_NO };
+std::atomic<int> g_zero_fill{ZF_UNKNOWN};
+
+void snapshot_for_restore(void* ptr, size_t len) {
+    if (g_zero_fill.load(std::memory_order_acquire) == ZF_NO)
+        return;
+    void* copy = malloc(len);
+    if (!copy)
+        return; /* nothing to do but let the create through unprotected */
+    memcpy(copy, ptr, len);
+    t_arm.restore_dst  = ptr;
+    t_arm.restore_copy = copy;
+    t_arm.restore_len  = len;
+}
+
+/* At disarm: compare, restore, and learn. */
+void restore_after_create() {
+    if (!t_arm.restore_copy)
+        return;
+    void* dst = t_arm.restore_dst;
+    void* copy = t_arm.restore_copy;
+    const size_t len = t_arm.restore_len;
+    t_arm.restore_dst = nullptr;
+    t_arm.restore_copy = nullptr;
+    t_arm.restore_len = 0;
+
+    const bool changed = memcmp(dst, copy, len) != 0;
+    if (changed)
+        memcpy(dst, copy, len);
+    if (g_zero_fill.load(std::memory_order_acquire) == ZF_UNKNOWN) {
+        /* Decisive only if the snapshot had something to lose: an all-zero
+         * snapshot cannot tell a zeroing create from a benign one. */
+        bool nonzero = false;
+        const uint8_t* b = (const uint8_t*)copy;
+        for (size_t i = 0; i < len && !nonzero; i += 64)
+            nonzero = b[i] != 0;
+        if (!nonzero)
+            for (size_t i = 0; i < len && !nonzero; i++)
+                nonzero = b[i] != 0;
+        if (nonzero) {
+            g_zero_fill.store(changed ? ZF_YES : ZF_NO, std::memory_order_release);
+            if (changed)
+                DMN_WARN("share: this D3DMetal zero-fills new buffers on "
+                         "creation; imported/placed buffer contents will be "
+                         "snapshotted and restored around every create");
+            else
+                DMN_INFO("share: this D3DMetal leaves new buffer contents "
+                         "alone; no create-time restore needed");
+        }
+    }
+    free(copy);
+}
+
 /* Register a substituted impostor so it is made GPU-resident on every encoder,
  * declaring exactly `usage` (defined with the residency plumbing below). */
 void sub_resource_track(id res, MTLResourceUsage usage);
@@ -692,6 +761,9 @@ id<MTLBuffer> substitute_buffer(id<MTLDevice> device, NSUInteger length) {
     }
     buf.label = window ? @"dmn-imported-heap-window" : @"dmn-shared-cons-buffer";
     sub_resource_track(buf, both);
+    /* The bytes behind this impostor are somebody's: protect them from a
+     * zero-filling create (see the defence above). */
+    snapshot_for_restore([buf contents], (size_t)[buf length]);
 
     t_arm.captured = true;
     t_arm.out_fd   = fd;
@@ -1187,11 +1259,20 @@ void swizzle_device_class(Class cls) {
 
 } // namespace
 
+namespace {
+/* Fresh arm record; frees a snapshot a never-disarmed arm might still hold. */
+void arm_reset() {
+    if (t_arm.restore_copy)
+        free(t_arm.restore_copy);
+    t_arm = {};
+}
+} // namespace
+
 /* == dmn_share.h entry points ============================================= */
 
 void dmn_share_arm_producer(uint64_t extra_bytes) {
     dmn_dedicated_metal_alloc_begin();
-    t_arm = {};
+    arm_reset();
     t_arm.armed = true;
     t_arm.kind = DMN_SHARE_TEXTURE;
     t_arm.alloc_new = true;
@@ -1200,7 +1281,7 @@ void dmn_share_arm_producer(uint64_t extra_bytes) {
 
 void dmn_share_arm_consumer(int fd, uint64_t stride, uint64_t size) {
     dmn_dedicated_metal_alloc_begin();
-    t_arm = {};
+    arm_reset();
     t_arm.armed = true;
     t_arm.kind = DMN_SHARE_TEXTURE;
     t_arm.alloc_new = false;
@@ -1211,7 +1292,7 @@ void dmn_share_arm_consumer(int fd, uint64_t stride, uint64_t size) {
 
 void dmn_share_arm_producer_buffer(uint64_t size) {
     dmn_dedicated_metal_alloc_begin();
-    t_arm = {};
+    arm_reset();
     t_arm.armed = true;
     t_arm.kind = DMN_SHARE_BUFFER;
     t_arm.alloc_new = true;
@@ -1220,7 +1301,7 @@ void dmn_share_arm_producer_buffer(uint64_t size) {
 
 void dmn_share_arm_consumer_buffer(int fd, uint64_t size) {
     dmn_dedicated_metal_alloc_begin();
-    t_arm = {};
+    arm_reset();
     t_arm.armed = true;
     t_arm.kind = DMN_SHARE_BUFFER;
     t_arm.alloc_new = false;
@@ -1231,7 +1312,7 @@ void dmn_share_arm_consumer_buffer(int fd, uint64_t size) {
 void dmn_share_arm_import_window(int fd, uint64_t offset, uint64_t size,
                                  uint64_t max_size) {
     dmn_dedicated_metal_alloc_begin();
-    t_arm = {};
+    arm_reset();
     t_arm.armed = true;
     t_arm.kind = DMN_SHARE_BUFFER;
     t_arm.alloc_new = false;
@@ -1247,13 +1328,15 @@ const void* dmn_share_init_data_sentinel(void) { return init_sentinel_base(); }
 
 bool dmn_share_disarm(DmnShareArm* out) {
     dmn_dedicated_metal_alloc_end();
+    restore_after_create(); /* the create has returned; put back what a
+                               zero-filling framework wiped */
     bool captured = t_arm.captured;
     if (t_arm.armed && !captured)
         DMN_WARN("share: armed create reached NONE of the hooked Metal entry "
                  "points — resource is not shared (add the missing selector)");
     if (out)
         *out = t_arm;
-    t_arm = {};
+    arm_reset();
     return captured;
 }
 
