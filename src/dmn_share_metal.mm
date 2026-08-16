@@ -471,12 +471,16 @@ MTLResourceUsage residency_usage_for(MTLTextureDescriptor* desc) {
     return r ? r : both;
 }
 
-/* Wrap an already-mapped span in a linear MTLTexture matching `desc`.
+/* Wrap an already-mapped span in a linear MTLTexture matching `desc`, with the
+ * surface's first byte at `buf_offset` inside the buffer (0 for a surface that
+ * owns its whole object; the page-floor delta for a window into a heap's
+ * object).
  *
  * `buf` is consumed: on success the returned texture owns the caller's
  * reference, on failure it is released. Returns +1 or nil. */
 id<MTLTexture> make_linear_texture(id<MTLBuffer> buf, MTLTextureDescriptor* desc,
-                                   const LinearLayout& layout, bool producer) {
+                                   const LinearLayout& layout, size_t buf_offset,
+                                   bool producer) {
     const MTLPixelFormat fmt = desc.pixelFormat;
     const NSUInteger width   = desc.width;
     const NSUInteger height  = desc.height;
@@ -517,15 +521,28 @@ id<MTLTexture> make_linear_texture(id<MTLBuffer> buf, MTLTextureDescriptor* desc
         DMN_WARN("share: descriptor asked for untracked hazards; the impostor "
                  "is tracked");
 
+    /* Metal requires the in-buffer offset aligned like a row start. Placement
+     * offsets are at least 4 KiB-aligned and this alignment is a small power
+     * of two, so a violation is a logic error worth stopping on, not a
+     * surface shape. */
+    NSUInteger off_align =
+        [[buf device] minimumLinearTextureAlignmentForPixelFormat:fmt];
+    if (off_align && (buf_offset % off_align)) {
+        DMN_ERROR("share: texture window offset %zu is not %lu-byte aligned",
+                  buf_offset, (unsigned long)off_align);
+        [buf release];
+        return nil;
+    }
+
     id<MTLTexture> tex = [buf newTextureWithDescriptor:linear
-                                                offset:0
+                                                offset:buf_offset
                                            bytesPerRow:layout.stride];
     if (!tex) {
         DMN_ERROR("share: newTextureWithDescriptor:offset:bytesPerRow: failed "
-                  "(fmt=%lu %lux%lu stride=%zu bufLen=%lu) — under-aligned "
-                  "stride?",
+                  "(fmt=%lu %lux%lu stride=%zu off=%zu bufLen=%lu) — "
+                  "under-aligned stride?",
                   (unsigned long)fmt, (unsigned long)width,
-                  (unsigned long)height, layout.stride,
+                  (unsigned long)height, layout.stride, buf_offset,
                   (unsigned long)[buf length]);
         [buf release];
         return nil;
@@ -653,7 +670,8 @@ id<MTLTexture> substitute_producer(id<MTLDevice> device,
     }
     alias_cache_store(fd, 0, buf); /* same-process opens alias this object */
 
-    id<MTLTexture> tex = make_linear_texture(buf, desc, layout, /*producer=*/true);
+    id<MTLTexture> tex = make_linear_texture(buf, desc, layout, /*buf_offset=*/0,
+                                             /*producer=*/true);
     if (!tex) {
         close(fd);
         return nil;
@@ -709,7 +727,19 @@ id<MTLTexture> substitute_consumer(id<MTLDevice> device,
                   need, layout.logical);
         return nil;
     }
-    layout.mapped = page_align(layout.logical);
+
+    /* A placed texture's POD carries its byte offset within the heap's object.
+     * mmap needs a page-aligned file offset, so map from the page floor and
+     * put the texture at the delta inside the buffer. */
+    const size_t offset = (size_t)t_arm.existing_offset;
+    const size_t floor  = offset & ~(page_align(1) - 1);
+    const size_t delta  = offset - floor;
+    size_t span = 0;
+    if (offset > kMaxSharedBytes || !add_ok(delta, layout.logical, &span)) {
+        DMN_ERROR("share: import window offset %zu out of range", offset);
+        return nil;
+    }
+    layout.mapped = page_align(span);
 
     /* The fd belongs to the caller on this path — never closed here, and never
      * handed to the buffer's deallocator. Reuse a live impostor over the same
@@ -717,27 +747,28 @@ id<MTLTexture> substitute_consumer(id<MTLDevice> device,
      * own MTLTexture, but over the SAME buffer, so Metal orders aliased
      * accesses. */
     const int fd = t_arm.existing_fd;
-    id<MTLBuffer> buf = alias_cache_lookup(device, fd, 0, layout.mapped);
-    void* ptr = nullptr;
+    id<MTLBuffer> buf = alias_cache_lookup(device, fd, floor, layout.mapped);
     if (buf) {
         DMN_INFO("share: consumer texture reuses cached impostor backing");
-    } else if ((ptr = mmap(nullptr, layout.mapped, PROT_READ | PROT_WRITE,
-                           MAP_SHARED, fd, 0)) == MAP_FAILED) {
-        DMN_ERROR("share: consumer mmap(fd=%d, %zu) failed: %s", fd,
-                  layout.mapped, strerror(errno));
-        return nil;
-    }
-    if (!buf) {
+    } else {
+        void* ptr = mmap(nullptr, layout.mapped, PROT_READ | PROT_WRITE,
+                         MAP_SHARED, fd, (off_t)floor);
+        if (ptr == MAP_FAILED) {
+            DMN_ERROR("share: consumer mmap(fd=%d, off=%zu, %zu) failed: %s", fd,
+                      floor, layout.mapped, strerror(errno));
+            return nil;
+        }
         buf = shared_buffer_over(device, ptr, layout.mapped);
         if (!buf) {
             DMN_ERROR("share: consumer newBufferWithBytesNoCopy failed");
             munmap(ptr, layout.mapped);
             return nil;
         }
-        alias_cache_store(fd, 0, buf);
+        alias_cache_store(fd, floor, buf);
     }
 
-    id<MTLTexture> tex = make_linear_texture(buf, desc, layout, /*producer=*/false);
+    id<MTLTexture> tex = make_linear_texture(buf, desc, layout, delta,
+                                             /*producer=*/false);
     if (!tex)
         return nil;
 
@@ -751,11 +782,115 @@ id<MTLTexture> substitute_consumer(id<MTLDevice> device,
     return tex;
 }
 
+/* Texture window: a texture placed in a shared heap. Backed by the heap's
+ * EXISTING object like a consumer, but the layout is DERIVED from the
+ * descriptor like a producer — the placement is the first sight of this
+ * surface, so there is no shipped layout to validate against; the derived one
+ * travels out through the arm and into the export POD instead. Overlapping
+ * placements alias because every window maps the same object at the offsets
+ * the app placed them at. Returns +1, or nil. */
+id<MTLTexture> substitute_texture_window(id<MTLDevice> device,
+                                         MTLTextureDescriptor* desc) {
+    const MTLPixelFormat fmt = desc.pixelFormat;
+    const size_t width  = (size_t)desc.width;
+    const size_t height = (size_t)desc.height;
+
+    const uint32_t bpp = dmn_format_linear_bpp((uint32_t)fmt);
+    if (!bpp) {
+        DMN_ERROR("share: MTLPixelFormat %lu has no linear layout — refusing "
+                  "to window it into a shared heap", (unsigned long)fmt);
+        return nil;
+    }
+    if (!dims_ok(width, height, "heap-window"))
+        return nil;
+
+    NSUInteger row_align =
+        [device minimumLinearTextureAlignmentForPixelFormat:fmt];
+    if (row_align == 0)
+        row_align = 256;
+
+    LinearLayout layout{};
+    size_t row = 0;
+    if (!mul_ok(width, (size_t)bpp, &row)) {
+        DMN_ERROR("share: row bytes overflow (%zu x %u)", width, bpp);
+        return nil;
+    }
+    layout.stride = (row + (size_t)row_align - 1) & ~((size_t)row_align - 1);
+    if (!mul_ok(layout.stride, height, &layout.logical) ||
+        layout.logical > kMaxSharedBytes) {
+        DMN_ERROR("share: surface bytes out of range (stride %zu x height %zu)",
+                  layout.stride, height);
+        return nil;
+    }
+    /* The window is what the heap has left past the placement offset. Our
+     * linear layout can legitimately exceed what the app reserved from
+     * GetResourceAllocationInfo (a wider aligned stride); that must fail the
+     * create rather than run past the heap's object. */
+    const size_t avail = (size_t)t_arm.existing_max;
+    if (layout.logical > avail) {
+        DMN_ERROR("share: placed texture needs %zu bytes but only %zu remain "
+                  "in the heap past its offset", layout.logical, avail);
+        return nil;
+    }
+
+    const size_t offset = (size_t)t_arm.existing_offset;
+    const size_t floor  = offset & ~(page_align(1) - 1);
+    const size_t delta  = offset - floor;
+    size_t span = 0;
+    if (offset > kMaxSharedBytes || !add_ok(delta, layout.logical, &span)) {
+        DMN_ERROR("share: heap-window offset %zu out of range", offset);
+        return nil;
+    }
+    layout.mapped = page_align(span);
+
+    /* The fd is the heap's — borrowed, never closed here; the deallocator
+     * only unmaps this window. Placements at one offset alias, so share the
+     * backing MTLBuffer with any live impostor over the same span (see the
+     * alias cache) — that is also what gives aliased placements hazard
+     * ordering within a process. */
+    const int fd = t_arm.existing_fd;
+    id<MTLBuffer> buf = alias_cache_lookup(device, fd, floor, layout.mapped);
+    if (buf) {
+        DMN_INFO("share: heap-window texture reuses cached impostor backing");
+    } else {
+        void* ptr = mmap(nullptr, layout.mapped, PROT_READ | PROT_WRITE,
+                         MAP_SHARED, fd, (off_t)floor);
+        if (ptr == MAP_FAILED) {
+            DMN_ERROR("share: heap-window mmap(fd=%d, off=%zu, %zu) failed: %s",
+                      fd, floor, layout.mapped, strerror(errno));
+            return nil;
+        }
+        buf = shared_buffer_over(device, ptr, layout.mapped);
+        if (!buf) {
+            DMN_ERROR("share: heap-window newBufferWithBytesNoCopy failed");
+            munmap(ptr, layout.mapped);
+            return nil;
+        }
+        alias_cache_store(fd, floor, buf);
+    }
+
+    id<MTLTexture> tex = make_linear_texture(buf, desc, layout, delta,
+                                             /*producer=*/true);
+    if (!tex)
+        return nil;
+
+    t_arm.captured   = true;
+    t_arm.out_fd     = fd;
+    t_arm.out_stride = layout.stride;
+    t_arm.out_size   = layout.logical;
+    DMN_INFO("share: substituted heap-window texture fmt=%lu %zux%zu stride=%zu "
+             "size=%zu fd=%d off=%zu", (unsigned long)fmt, width, height,
+             layout.stride, layout.logical, fd, offset);
+    return tex;
+}
+
 id<MTLTexture> substitute(id<MTLDevice> device, MTLTextureDescriptor* desc) {
     if (!device || !desc)
         return nil;
-    return t_arm.alloc_new ? substitute_producer(device, desc)
-                           : substitute_consumer(device, desc);
+    if (t_arm.alloc_new)
+        return substitute_producer(device, desc);
+    return t_arm.derive_layout ? substitute_texture_window(device, desc)
+                               : substitute_consumer(device, desc);
 }
 
 /* Build a shared-memory-backed MTLBuffer (forced to StorageModeShared so the
@@ -1412,7 +1547,8 @@ void dmn_share_arm_producer(uint64_t extra_bytes) {
     t_arm.extra_bytes = extra_bytes;
 }
 
-void dmn_share_arm_consumer(int fd, uint64_t stride, uint64_t size) {
+void dmn_share_arm_consumer(int fd, uint64_t stride, uint64_t size,
+                            uint64_t offset) {
     dmn_dedicated_metal_alloc_begin();
     arm_reset();
     t_arm.armed = true;
@@ -1421,6 +1557,19 @@ void dmn_share_arm_consumer(int fd, uint64_t stride, uint64_t size) {
     t_arm.existing_fd = fd;
     t_arm.existing_stride = stride;
     t_arm.existing_size = size;
+    t_arm.existing_offset = offset;
+}
+
+void dmn_share_arm_texture_window(int fd, uint64_t offset, uint64_t max_size) {
+    dmn_dedicated_metal_alloc_begin();
+    arm_reset();
+    t_arm.armed = true;
+    t_arm.kind = DMN_SHARE_TEXTURE;
+    t_arm.alloc_new = false;
+    t_arm.derive_layout = true;
+    t_arm.existing_fd = fd;
+    t_arm.existing_offset = offset;
+    t_arm.existing_max = max_size;
 }
 
 void dmn_share_arm_producer_buffer(uint64_t size) {

@@ -56,7 +56,8 @@ struct dmn_shared_fence {
 
 extern "C" dmn_shared_fence_t dmn_shared_fence_open(
         const dmn_shared_fence_handle* handle) {
-    if (!handle || handle->magic != DMN_SHARED_FENCE_MAGIC || handle->fd < 0) {
+    if (!handle || handle->magic != DMN_SHARED_FENCE_MAGIC ||
+        handle->version != DMN_SHARED_HANDLE_VERSION || handle->fd < 0) {
         DMN_WARN("shared_fence_open: invalid handle");
         return nullptr;
     }

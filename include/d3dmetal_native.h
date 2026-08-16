@@ -309,7 +309,7 @@ dmn_result dmn_shared_handle_close(void* handle);
 
 #define DMN_SHARED_TEXTURE_MAGIC 0x58544D44u /* 'DMTX' */
 #define DMN_SHARED_FENCE_MAGIC   0x4E464D44u /* 'DMFN' */
-#define DMN_SHARED_HANDLE_VERSION 1u
+#define DMN_SHARED_HANDLE_VERSION 2u
 
 typedef struct dmn_shared_texture_handle {
     uint32_t magic;         /* DMN_SHARED_TEXTURE_MAGIC */
@@ -321,6 +321,11 @@ typedef struct dmn_shared_texture_handle {
     uint32_t bind_flags, misc_flags, cpu_access;
     uint64_t stride;        /* bytesPerRow, byte-exact for the consumer */
     uint64_t size;          /* logical stride*height (NOT page-padded) */
+    uint64_t offset;        /* byte offset of the surface within `fd`; 0 for
+                               a committed surface, which owns its whole
+                               object; nonzero for a texture placed in a
+                               shared heap, a window into the heap's one
+                               object. Not necessarily page-aligned. */
 } dmn_shared_texture_handle;
 
 typedef struct dmn_shared_fence_handle {
@@ -344,6 +349,12 @@ typedef struct dmn_shared_buffer_handle {
     int32_t  fd;            /* process-local; send via SCM_RIGHTS, then patch */
     uint32_t bind_flags, misc_flags, cpu_access;
     uint64_t size;          /* logical byte length */
+    uint64_t offset;        /* byte offset of the buffer within `fd`, page-
+                               aligned. 0 for a committed buffer, which owns
+                               its whole object; nonzero for a resource placed
+                               in a shared heap, where one object backs the
+                               whole heap and each placement is a window into
+                               it. A consumer must map at this offset. */
 } dmn_shared_buffer_handle;
 
 /* == Imported placed-buffer heaps ======================================== */

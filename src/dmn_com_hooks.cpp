@@ -110,19 +110,15 @@ namespace {
 std::mutex g_reg_mtx;
 std::unordered_map<void*, dmn_shared_texture_handle> g_tex_reg; /* identity -> POD */
 std::unordered_map<void*, dmn_shared_buffer_handle>  g_buf_reg;
-std::unordered_set<void*> g_shared_heaps; /* identities of SHARED-flag heaps */
 std::unordered_map<void*, int> g_owned_fds; /* identity -> registry-owned dup */
 
-/* Heaps minted by dmn_open_existing_heap_from_fd: a real D3DMetal heap whose
- * placed buffers get their Metal backing substituted with windows into the
- * imported shm object. The fd here is a borrowed view of the g_owned_fds dup
- * (closed by eviction); each placed buffer's mmap window is independent of it. */
-struct DmnImportedHeap {
-    int      fd;
-    uint64_t fd_off; /* window start inside the fd (page-aligned) */
-    uint64_t size;   /* imported window length */
-};
-std::unordered_map<void*, DmnImportedHeap> g_imported_heaps; /* under g_reg_mtx */
+/* Resources placed in a SHARED heap with a dimension the window machinery
+ * cannot back (1D/3D). They are real committed resources — correct memory,
+ * correct lifetime — but they do NOT alias the heap and must not export: a
+ * handle for them would hand a peer memory that is not theirs. Registered so
+ * CreateSharedHandle fails them loudly instead of falling through to
+ * D3DMetal's fake-passthrough handle. */
+std::unordered_set<void*> g_unshared_placed; /* under g_reg_mtx */
 
 /* Every registration stores its OWN duplicate of the backing fd in its POD
  * (closed at eviction). This is what makes re-export from an OPENED resource
@@ -247,7 +243,7 @@ HRESULT vend_pod_owned(Pod pod, HANDLE* out) {
  * is validated by the evict-contract meson test against the vendored
  * framework, not re-probed at runtime. */
 
-enum EvictKind { EV_TEX, EV_BUF, EV_HEAP, EV_FENCE, EV_IMPORTED_HEAP };
+enum EvictKind { EV_TEX, EV_BUF, EV_FENCE, EV_UNSHARED_PLACED };
 
 /* {7D3A1F7B-9C44-4A6E-8F21-5D0E6B3CA942} — private-data slot for the sentinel. */
 const GUID kDmnEvictGuid = {0x7d3a1f7b, 0x9c44, 0x4a6e,
@@ -257,9 +253,8 @@ const char* evict_kind_name(int kind) {
     switch (kind) {
     case EV_TEX:   return "texture";
     case EV_BUF:   return "buffer";
-    case EV_HEAP:  return "heap";
     case EV_FENCE: return "fence";
-    case EV_IMPORTED_HEAP: return "imported-heap";
+    case EV_UNSHARED_PLACED: return "unshared-placement";
     default:       return "?";
     }
 }
@@ -279,19 +274,13 @@ void evict_identity(void* id, int kind) {
             g_buf_reg.erase(id);
         }
         break;
-    case EV_HEAP:
-        {
-            std::lock_guard<std::mutex> lk(g_reg_mtx);
-            g_shared_heaps.erase(id);
-        }
-        break;
     case EV_FENCE:
         dmn_fd3d_fence_destroy(id);
         break;
-    case EV_IMPORTED_HEAP:
+    case EV_UNSHARED_PLACED:
         {
             std::lock_guard<std::mutex> lk(g_reg_mtx);
-            g_imported_heaps.erase(id);
+            g_unshared_placed.erase(id);
         }
         break;
     }
@@ -374,6 +363,255 @@ bool attach_evict_sentinel(IUnknown* obj, void* id, int kind) {
     if (c11) c11->Release();
     if (o12) o12->Release();
     return ok;
+}
+
+/* == The synthetic ID3D12Heap ============================================= */
+/* A SHARED heap (and every heap minted by dmn_open_existing_heap_from_fd) is
+ * OUR COM object, never D3DMetal's, holding nothing but the shm object that
+ * backs it. Placed creates on it are translated into armed
+ * CreateCommittedResource calls whose Metal allocation is substituted with a
+ * window into that object.
+ *
+ * Why the framework must not see the heap: D3DMetal implements an ID3D12Heap
+ * as a buffer over its own MTLHeapTypePlacement heap, and a placed resource as
+ * another view of the SAME allocation. Substituting the placed resource's
+ * backing (which sharing requires) breaks that identity, and the framework's
+ * heap memory becomes a live second copy — every placed byte then costs 2x
+ * resident. With no framework heap there is nothing to double. The framework
+ * also must never RECEIVE this pointer: the placed hooks translate instead of
+ * forwarding, and the residency hooks below filter it out of pageable arrays.
+ *
+ * The one D3D12 fidelity loss: a "placed" resource here is a committed one, so
+ * ID3D12Resource::GetHeapProperties reports the heap's Properties (passed
+ * through) but D3D12_HEAP_FLAG_NONE instead of SHARED. */
+
+struct DmnSynthHeap;
+HRESULT STDMETHODCALLTYPE sheap_QueryInterface(DmnSynthHeap*, REFIID, void**);
+ULONG STDMETHODCALLTYPE sheap_AddRef(DmnSynthHeap*);
+ULONG STDMETHODCALLTYPE sheap_Release(DmnSynthHeap*);
+HRESULT STDMETHODCALLTYPE sheap_GetPrivateData(DmnSynthHeap*, REFGUID, UINT*, void*);
+HRESULT STDMETHODCALLTYPE sheap_SetPrivateData(DmnSynthHeap*, REFGUID, UINT, const void*);
+HRESULT STDMETHODCALLTYPE sheap_SetPrivateDataInterface(DmnSynthHeap*, REFGUID, const IUnknown*);
+HRESULT STDMETHODCALLTYPE sheap_SetName(DmnSynthHeap*, LPCWSTR);
+HRESULT STDMETHODCALLTYPE sheap_GetDevice(DmnSynthHeap*, REFIID, void**);
+D3D12_HEAP_DESC* STDMETHODCALLTYPE sheap_GetDesc(DmnSynthHeap*, D3D12_HEAP_DESC*);
+
+void* g_sheap_vtbl[9] = {
+    (void*)sheap_QueryInterface, (void*)sheap_AddRef, (void*)sheap_Release,
+    (void*)sheap_GetPrivateData, (void*)sheap_SetPrivateData,
+    (void*)sheap_SetPrivateDataInterface, (void*)sheap_SetName,
+    (void*)sheap_GetDevice, (void*)sheap_GetDesc,
+};
+
+struct DmnSynthHeap {
+    void** vtbl;
+    std::atomic<ULONG> refs;
+    D3D12_HEAP_DESC desc; /* what the app asked for; GetDesc answers it as-is */
+    int      fd;          /* owned; closed at destruction */
+    uint64_t fd_off;      /* window start inside fd (page-aligned) */
+    uint64_t size;        /* usable bytes (== desc.SizeInBytes) */
+    bool     imported;    /* dmn_open_existing_heap_from_fd: the pages belong to
+                             the caller, so placements are buffers only and are
+                             not registered for export */
+    IUnknown* device;     /* retained; GetDevice resolves through it */
+    /* Honest private-data storage: D3D releases stored interfaces at object
+     * destruction, and callers (our own eviction machinery included, were it
+     * ever pointed here) rely on that. Linear scan — a handful of entries. */
+    std::mutex pd_mtx;
+    struct PdEntry {
+        GUID guid;
+        std::vector<uint8_t> blob;
+        IUnknown* iface; /* non-null: interface entry; blob unused */
+    };
+    std::vector<PdEntry> pd;
+};
+
+DmnSynthHeap* as_synth_heap(ID3D12Heap* h) {
+    if (!h || *reinterpret_cast<void**>(h) != (void*)g_sheap_vtbl)
+        return nullptr;
+    return reinterpret_cast<DmnSynthHeap*>(h);
+}
+
+HRESULT STDMETHODCALLTYPE sheap_QueryInterface(DmnSynthHeap* self, REFIID riid,
+                                               void** ppv) {
+    if (!ppv)
+        return E_POINTER;
+    if (dmn_iid_eq(riid, __uuidof(IUnknown)) ||
+        dmn_iid_eq(riid, __uuidof(ID3D12Object)) ||
+        dmn_iid_eq(riid, __uuidof(ID3D12DeviceChild)) ||
+        dmn_iid_eq(riid, __uuidof(ID3D12Pageable)) ||
+        dmn_iid_eq(riid, __uuidof(ID3D12Heap))) {
+        self->refs.fetch_add(1, std::memory_order_relaxed);
+        *ppv = self;
+        return S_OK;
+    }
+    *ppv = nullptr;
+    return E_NOINTERFACE;
+}
+
+ULONG STDMETHODCALLTYPE sheap_AddRef(DmnSynthHeap* self) {
+    return self->refs.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
+ULONG STDMETHODCALLTYPE sheap_Release(DmnSynthHeap* self) {
+    ULONG r = self->refs.fetch_sub(1, std::memory_order_acq_rel) - 1;
+    if (r == 0) {
+        /* Placed resources do not hold the heap: each one's MTLBuffer owns its
+         * own mmap window, and a mapping keeps the shm object's pages alive on
+         * its own — so closing the fd here strands nothing even when the heap
+         * is released before its placements. */
+        for (auto& e : self->pd)
+            if (e.iface)
+                e.iface->Release();
+        if (self->device)
+            self->device->Release();
+        if (self->fd >= 0)
+            close(self->fd);
+        DMN_INFO("hooks: synthetic heap %p destroyed", (void*)self);
+        delete self;
+    }
+    return r;
+}
+
+HRESULT STDMETHODCALLTYPE sheap_GetPrivateData(DmnSynthHeap* self, REFGUID guid,
+                                               UINT* size, void* data) {
+    if (!size)
+        return E_INVALIDARG;
+    std::lock_guard<std::mutex> lk(self->pd_mtx);
+    for (auto& e : self->pd) {
+        if (!dmn_iid_eq(e.guid, guid))
+            continue;
+        if (e.iface) {
+            if (!data) {
+                *size = (UINT)sizeof(IUnknown*);
+                return S_OK;
+            }
+            if (*size < sizeof(IUnknown*)) {
+                *size = (UINT)sizeof(IUnknown*);
+                return E_INVALIDARG;
+            }
+            e.iface->AddRef(); /* the caller receives a reference */
+            std::memcpy(data, &e.iface, sizeof(IUnknown*));
+            *size = (UINT)sizeof(IUnknown*);
+            return S_OK;
+        }
+        if (!data) {
+            *size = (UINT)e.blob.size();
+            return S_OK;
+        }
+        if (*size < e.blob.size()) {
+            *size = (UINT)e.blob.size();
+            return E_INVALIDARG;
+        }
+        std::memcpy(data, e.blob.data(), e.blob.size());
+        *size = (UINT)e.blob.size();
+        return S_OK;
+    }
+    *size = 0;
+    return E_FAIL; /* DXGI_ERROR_NOT_FOUND shape; nothing here inspects it */
+}
+
+HRESULT STDMETHODCALLTYPE sheap_SetPrivateData(DmnSynthHeap* self, REFGUID guid,
+                                               UINT size, const void* data) {
+    std::lock_guard<std::mutex> lk(self->pd_mtx);
+    for (size_t i = 0; i < self->pd.size(); i++) {
+        if (!dmn_iid_eq(self->pd[i].guid, guid))
+            continue;
+        if (self->pd[i].iface)
+            self->pd[i].iface->Release();
+        if (!data) {
+            self->pd.erase(self->pd.begin() + (ptrdiff_t)i);
+            return S_OK;
+        }
+        self->pd[i].iface = nullptr;
+        self->pd[i].blob.assign((const uint8_t*)data,
+                                (const uint8_t*)data + size);
+        return S_OK;
+    }
+    if (!data)
+        return S_OK; /* clearing an absent slot */
+    DmnSynthHeap::PdEntry e;
+    e.guid = guid;
+    e.iface = nullptr;
+    e.blob.assign((const uint8_t*)data, (const uint8_t*)data + size);
+    self->pd.push_back(std::move(e));
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE sheap_SetPrivateDataInterface(DmnSynthHeap* self,
+                                                        REFGUID guid,
+                                                        const IUnknown* iface) {
+    auto* unk = const_cast<IUnknown*>(iface);
+    if (unk)
+        unk->AddRef(); /* before dropping any previous holder of the slot */
+    std::lock_guard<std::mutex> lk(self->pd_mtx);
+    for (size_t i = 0; i < self->pd.size(); i++) {
+        if (!dmn_iid_eq(self->pd[i].guid, guid))
+            continue;
+        if (self->pd[i].iface)
+            self->pd[i].iface->Release();
+        if (!unk) {
+            self->pd.erase(self->pd.begin() + (ptrdiff_t)i);
+            return S_OK;
+        }
+        self->pd[i].blob.clear();
+        self->pd[i].iface = unk;
+        return S_OK;
+    }
+    if (!unk)
+        return S_OK;
+    DmnSynthHeap::PdEntry e;
+    e.guid = guid;
+    e.iface = unk;
+    self->pd.push_back(std::move(e));
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE sheap_SetName(DmnSynthHeap*, LPCWSTR) {
+    return S_OK; /* nothing reads names off a heap that never meets a debugger */
+}
+
+HRESULT STDMETHODCALLTYPE sheap_GetDevice(DmnSynthHeap* self, REFIID riid,
+                                          void** ppv) {
+    if (!ppv)
+        return E_POINTER;
+    if (!self->device) {
+        *ppv = nullptr;
+        return E_FAIL;
+    }
+    return self->device->QueryInterface(riid, ppv);
+}
+
+D3D12_HEAP_DESC* STDMETHODCALLTYPE sheap_GetDesc(DmnSynthHeap* self,
+                                                 D3D12_HEAP_DESC* out) {
+    *out = self->desc;
+    return out;
+}
+
+/* Build a synthetic heap over `owned_fd` (consumed — closed here on failure)
+ * and hand back the `riid` view of it, +1. */
+HRESULT synth_heap_new(IUnknown* device_unk, const D3D12_HEAP_DESC& desc,
+                       int owned_fd, uint64_t fd_off, uint64_t size,
+                       bool imported, REFIID riid, void** out) {
+    auto* h = new (std::nothrow) DmnSynthHeap();
+    if (!h) {
+        if (owned_fd >= 0)
+            close(owned_fd);
+        return E_OUTOFMEMORY;
+    }
+    h->vtbl = g_sheap_vtbl;
+    h->refs.store(1, std::memory_order_relaxed);
+    h->desc = desc;
+    h->fd = owned_fd;
+    h->fd_off = fd_off;
+    h->size = size;
+    h->imported = imported;
+    h->device = device_unk;
+    if (h->device)
+        h->device->AddRef();
+    HRESULT hr = sheap_QueryInterface(h, riid, out);
+    sheap_Release(h); /* construction ref; success leaves the QI ref */
+    return hr;
 }
 
 /* == Thunk forward declarations =========================================== */
@@ -460,6 +698,14 @@ HRESULT STDMETHODCALLTYPE hook_d3d12_CreateSharedHandle(ID3D12Device*,
 HRESULT STDMETHODCALLTYPE hook_d3d12_OpenSharedHandle(ID3D12Device*, HANDLE, REFIID, void**);
 HRESULT STDMETHODCALLTYPE hook_d3d12_OpenSharedHandleByName(ID3D12Device*, const WCHAR*,
     DWORD, HANDLE*);
+HRESULT STDMETHODCALLTYPE hook_d3d12_MakeResident(ID3D12Device*, UINT,
+    ID3D12Pageable* const*);
+HRESULT STDMETHODCALLTYPE hook_d3d12_Evict(ID3D12Device*, UINT,
+    ID3D12Pageable* const*);
+HRESULT STDMETHODCALLTYPE hook_d3d12_SetResidencyPriority(ID3D12Device1*, UINT,
+    ID3D12Pageable* const*, const D3D12_RESIDENCY_PRIORITY*);
+HRESULT STDMETHODCALLTYPE hook_d3d12_EnqueueMakeResident(ID3D12Device3*, UINT,
+    UINT, ID3D12Pageable* const*, ID3D12Fence*, UINT64);
 HRESULT STDMETHODCALLTYPE hook_d3d12_CreateCommandQueue(ID3D12Device*,
     const D3D12_COMMAND_QUEUE_DESC*, REFIID, void**);
 HRESULT STDMETHODCALLTYPE hook_d3d12_CreateGraphicsPipelineState(ID3D12Device*,
@@ -472,6 +718,16 @@ HRESULT STDMETHODCALLTYPE hook_d3d12_SetEventOnMultipleFenceCompletion(ID3D12Dev
 /* D3D12 queue + fence object. */
 HRESULT STDMETHODCALLTYPE hook_queue_Signal(ID3D12CommandQueue*, ID3D12Fence*, UINT64);
 HRESULT STDMETHODCALLTYPE hook_queue_Wait(ID3D12CommandQueue*, ID3D12Fence*, UINT64);
+/* Declared with the REAL 10-parameter signature (MSDN: pHeap is the 5th
+ * parameter). The vendored d3d12.h mis-declares this method WITHOUT the heap
+ * parameter — only its slot index is borrowed from that declaration; calling
+ * through the vendored prototype would pass every argument after the fourth
+ * in the wrong register. */
+void STDMETHODCALLTYPE hook_queue_UpdateTileMappings(ID3D12CommandQueue*,
+    ID3D12Resource*, UINT, const D3D12_TILED_RESOURCE_COORDINATE*,
+    const D3D12_TILE_REGION_SIZE*, ID3D12Heap*, UINT,
+    const D3D12_TILE_RANGE_FLAGS*, const UINT*, const UINT*,
+    D3D12_TILE_MAPPING_FLAGS);
 UINT64 STDMETHODCALLTYPE hook_f12_GetCompletedValue(ID3D12Fence*);
 HRESULT STDMETHODCALLTYPE hook_f12_SetEventOnCompletion(ID3D12Fence*, UINT64, HANDLE);
 HRESULT STDMETHODCALLTYPE hook_f12_Signal(ID3D12Fence*, UINT64);
@@ -514,12 +770,17 @@ DMN_HOOK_STATE(d3d12_CreateFence);
 DMN_HOOK_STATE(d3d12_CreateSharedHandle);
 DMN_HOOK_STATE(d3d12_OpenSharedHandle);
 DMN_HOOK_STATE(d3d12_OpenSharedHandleByName);
+DMN_HOOK_STATE(d3d12_MakeResident);
+DMN_HOOK_STATE(d3d12_Evict);
+DMN_HOOK_STATE(d3d12_SetResidencyPriority);
+DMN_HOOK_STATE(d3d12_EnqueueMakeResident);
 DMN_HOOK_STATE(d3d12_CreateCommandQueue);
 DMN_HOOK_STATE(d3d12_CreateCommandQueue1);
 DMN_HOOK_STATE(d3d12_CreateGraphicsPipelineState);
 DMN_HOOK_STATE(d3d12_SetEventOnMultipleFenceCompletion);
 DMN_HOOK_STATE(queue_Signal);
 DMN_HOOK_STATE(queue_Wait);
+DMN_HOOK_STATE(queue_UpdateTileMappings);
 DMN_HOOK_STATE(f12_GetCompletedValue);
 DMN_HOOK_STATE(f12_SetEventOnCompletion);
 DMN_HOOK_STATE(f12_Signal);
@@ -656,10 +917,11 @@ void record_texture_pod(IUnknown* tex, const dmn_shared_texture_handle& pod,
 }
 
 void record_texture(IUnknown* tex, const D3D11_TEXTURE2D_DESC& d,
-                    const DmnShareArm& arm) {
+                    const DmnShareArm& arm, uint64_t offset = 0) {
     dmn_shared_texture_handle pod{};
     pod.magic = DMN_SHARED_TEXTURE_MAGIC;
     pod.version = DMN_SHARED_HANDLE_VERSION;
+    pod.offset = offset;
     pod.fd = arm.out_fd;
     pod.width = d.Width;
     pod.height = d.Height;
@@ -694,7 +956,7 @@ void register_buffer_pod(IUnknown* res, dmn_shared_buffer_handle pod) {
 }
 
 void record_buffer(IUnknown* res, uint64_t size, uint32_t bind, uint32_t misc,
-                   uint32_t cpu, const DmnShareArm& arm) {
+                   uint32_t cpu, const DmnShareArm& arm, uint64_t offset = 0) {
     dmn_shared_buffer_handle pod{};
     pod.magic = DMN_SHARED_BUFFER_MAGIC;
     pod.version = DMN_SHARED_HANDLE_VERSION;
@@ -703,19 +965,20 @@ void record_buffer(IUnknown* res, uint64_t size, uint32_t bind, uint32_t misc,
     pod.bind_flags = bind;
     pod.misc_flags = misc;
     pod.cpu_access = cpu;
+    pod.offset = offset;
     register_buffer_pod(res, pod);
 }
 
-/* Track a SHARED-flag heap so placed creates on it are intercepted. */
-void record_shared_heap(IUnknown* heap) {
-    void* id = dmn_com_identity(heap);
-    {
-        std::lock_guard<std::mutex> lk(g_reg_mtx);
-        g_shared_heaps.insert(id);
-    }
-    attach_evict_sentinel(heap, id, EV_HEAP);
-    DMN_INFO("hooks: tracking SHARED heap %p (placed resources on it will "
-             "each get their own shared backing)", id);
+/* A handle from a peer built against another POD layout must not be parsed:
+ * the fields past the header would be read from wherever that peer's struct
+ * ends. */
+bool pod_version_ok(uint32_t version, const char* what) {
+    if (version == DMN_SHARED_HANDLE_VERSION)
+        return true;
+    DMN_ERROR("hooks: %s handle has POD version %u, this build speaks %u; "
+              "refusing to import it", what, version,
+              (unsigned)DMN_SHARED_HANDLE_VERSION);
+    return false;
 }
 
 /* == Export (handle vending) ============================================== */
@@ -807,6 +1070,8 @@ HRESULT fail_unshared(const char* what, void** out) {
 /* == Import (consumer reconstruction) ===================================== */
 HRESULT import_texture_d3d11(ID3D11Device* dev, const dmn_shared_texture_handle* pod,
                              REFIID iid, void** out) {
+    if (!pod_version_ok(pod->version, "texture"))
+        return E_INVALIDARG;
     D3D11_TEXTURE2D_DESC td{};
     td.Width = pod->width;
     td.Height = pod->height;
@@ -840,7 +1105,7 @@ HRESULT import_texture_d3d11(ID3D11Device* dev, const dmn_shared_texture_handle*
     }
 
     ID3D11Texture2D* tex = nullptr;
-    dmn_share_arm_consumer(pod->fd, pod->stride, pod->size);
+    dmn_share_arm_consumer(pod->fd, pod->stride, pod->size, pod->offset);
     HRESULT hr = dev->CreateTexture2D(&td, init.empty() ? nullptr : init.data(),
                                       &tex);
     DmnShareArm arm{};
@@ -869,6 +1134,8 @@ HRESULT import_texture_d3d11(ID3D11Device* dev, const dmn_shared_texture_handle*
 
 HRESULT import_buffer_d3d11(ID3D11Device* dev, const dmn_shared_buffer_handle* pod,
                             REFIID iid, void** out) {
+    if (!pod_version_ok(pod->version, "buffer"))
+        return E_INVALIDARG;
     D3D11_BUFFER_DESC bd{};
     bd.ByteWidth = (UINT)pod->size;
     bd.Usage = D3D11_USAGE_DEFAULT;
@@ -878,7 +1145,10 @@ HRESULT import_buffer_d3d11(ID3D11Device* dev, const dmn_shared_buffer_handle* p
     bd.MiscFlags = pod->misc_flags;
 
     ID3D11Buffer* buf = nullptr;
-    dmn_share_arm_consumer_buffer(pod->fd, pod->size);
+    if (pod->offset)
+        dmn_share_arm_import_window(pod->fd, pod->offset, pod->size, 0);
+    else
+        dmn_share_arm_consumer_buffer(pod->fd, pod->size);
     HRESULT hr = dev->CreateBuffer(&bd, nullptr, &buf);
     DmnShareArm arm{};
     bool captured = dmn_share_disarm(&arm);
@@ -897,6 +1167,8 @@ HRESULT import_buffer_d3d11(ID3D11Device* dev, const dmn_shared_buffer_handle* p
 
 HRESULT import_texture_d3d12(ID3D12Device* dev, const dmn_shared_texture_handle* pod,
                              REFIID riid, void** out) {
+    if (!pod_version_ok(pod->version, "texture"))
+        return E_INVALIDARG;
     D3D12_RESOURCE_DESC rd{};
     rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     rd.Width = pod->width;
@@ -911,7 +1183,7 @@ HRESULT import_texture_d3d12(ID3D12Device* dev, const dmn_shared_texture_handle*
     D3D12_HEAP_PROPERTIES hp{};
     hp.Type = D3D12_HEAP_TYPE_DEFAULT;
 
-    dmn_share_arm_consumer(pod->fd, pod->stride, pod->size);
+    dmn_share_arm_consumer(pod->fd, pod->stride, pod->size, pod->offset);
     HRESULT hr = dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
                                               D3D12_RESOURCE_STATE_COMMON,
                                               nullptr, riid, out);
@@ -936,6 +1208,8 @@ HRESULT import_texture_d3d12(ID3D12Device* dev, const dmn_shared_texture_handle*
 
 HRESULT import_buffer_d3d12(ID3D12Device* dev, const dmn_shared_buffer_handle* pod,
                             REFIID riid, void** out) {
+    if (!pod_version_ok(pod->version, "buffer"))
+        return E_INVALIDARG;
     D3D12_RESOURCE_DESC rd{};
     rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
     rd.Width = pod->size;
@@ -950,7 +1224,10 @@ HRESULT import_buffer_d3d12(ID3D12Device* dev, const dmn_shared_buffer_handle* p
     D3D12_HEAP_PROPERTIES hp{};
     hp.Type = D3D12_HEAP_TYPE_DEFAULT;
 
-    dmn_share_arm_consumer_buffer(pod->fd, pod->size);
+    if (pod->offset)
+        dmn_share_arm_import_window(pod->fd, pod->offset, pod->size, 0);
+    else
+        dmn_share_arm_consumer_buffer(pod->fd, pod->size);
     HRESULT hr = dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
                                               D3D12_RESOURCE_STATE_COMMON,
                                               nullptr, riid, out);
@@ -1567,9 +1844,23 @@ HRESULT STDMETHODCALLTYPE hook_f11_SetEventOnCompletion(
 }
 
 /* == D3D12 committed/placed creates ======================================== */
+
+/* Flatten a D3D12 texture desc into the POD's D3D11 shape. `DescT` is
+ * D3D12_RESOURCE_DESC or D3D12_RESOURCE_DESC1 (layout-compatible here). */
+template <class DescT>
+D3D11_TEXTURE2D_DESC d12_desc_to_11(const DescT& desc) {
+    D3D11_TEXTURE2D_DESC d{};
+    d.Width = (UINT)desc.Width;
+    d.Height = desc.Height;
+    d.MipLevels = desc.MipLevels ? desc.MipLevels : 1;
+    d.ArraySize = desc.DepthOrArraySize ? desc.DepthOrArraySize : 1;
+    d.Format = desc.Format;
+    d.SampleDesc.Count = desc.SampleDesc.Count ? desc.SampleDesc.Count : 1;
+    return d;
+}
+
 /* Common shared-create wrapper: arm by dimension, run the actual create, and
- * record what the swizzle captured. `DescT` is D3D12_RESOURCE_DESC or
- * D3D12_RESOURCE_DESC1 (layout-compatible for the fields used here). */
+ * record what the swizzle captured. */
 template <class DescT, class OrigCall>
 HRESULT d12_create_shared(const DescT* desc, void** out, OrigCall&& call) {
     if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
@@ -1603,15 +1894,8 @@ HRESULT d12_create_shared(const DescT* desc, void** out, OrigCall&& call) {
         }
         if (!captured)
             return fail_unshared("D3D12 SHARED texture create", out);
-        /* Flatten the D3D12 desc into the POD's D3D11 shape. */
-        D3D11_TEXTURE2D_DESC d{};
-        d.Width = (UINT)desc->Width;
-        d.Height = desc->Height;
-        d.MipLevels = desc->MipLevels ? desc->MipLevels : 1;
-        d.ArraySize = desc->DepthOrArraySize ? desc->DepthOrArraySize : 1;
-        d.Format = desc->Format;
-        d.SampleDesc.Count = desc->SampleDesc.Count ? desc->SampleDesc.Count : 1;
-        record_texture(reinterpret_cast<IUnknown*>(*out), d, arm);
+        record_texture(reinterpret_cast<IUnknown*>(*out), d12_desc_to_11(*desc),
+                       arm);
         arm_fd_close(arm);
         return hr;
     }
@@ -1620,60 +1904,131 @@ HRESULT d12_create_shared(const DescT* desc, void** out, OrigCall&& call) {
     return call();
 }
 
-bool heap_is_shared(ID3D12Heap* heap) {
-    if (!heap)
-        return false;
-    void* id = dmn_com_identity(reinterpret_cast<IUnknown*>(heap));
-    std::lock_guard<std::mutex> lk(g_reg_mtx);
-    return g_shared_heaps.count(id) != 0;
+/* Heap properties for a placed->committed translation.
+ *
+ * dmn_open_existing_heap_from_fd clamps an imported heap's type to UPLOAD, but
+ * D3D12 forbids ALLOW_UNORDERED_ACCESS and the render-target/depth-stencil
+ * flags on UPLOAD and READBACK heaps, so a placement carrying one of them
+ * cannot be committed against those properties. Promote to DEFAULT: the Metal
+ * allocation is substituted with a window into the heap's shm object either
+ * way, so these properties only have to satisfy the framework's validation.
+ * GetHeapProperties fidelity is already approximate here by design. */
+D3D12_HEAP_PROPERTIES commit_props_for(const D3D12_HEAP_PROPERTIES& hp,
+                                       D3D12_RESOURCE_FLAGS flags) {
+    const bool cpu_heap = hp.Type == D3D12_HEAP_TYPE_UPLOAD ||
+                          hp.Type == D3D12_HEAP_TYPE_READBACK;
+    const D3D12_RESOURCE_FLAGS illegal_on_cpu_heap =
+        (D3D12_RESOURCE_FLAGS)(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS |
+                               D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+                               D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+    if (!cpu_heap || !(flags & illegal_on_cpu_heap))
+        return hp;
+    D3D12_HEAP_PROPERTIES out = hp;
+    out.Type = D3D12_HEAP_TYPE_DEFAULT;
+    out.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+    out.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+    /* Per-create path with a uniform outcome: one line, not one per resource. */
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true, std::memory_order_relaxed))
+        DMN_INFO("hooks: placed create needs flags 0x%x illegal on heap type "
+                 "%u; committing as DEFAULT. Logged once.",
+                 (unsigned)flags, (unsigned)hp.Type);
+    return out;
 }
 
-bool heap_import_lookup(ID3D12Heap* heap, DmnImportedHeap* out) {
-    if (!heap)
-        return false;
-    void* id = dmn_com_identity(reinterpret_cast<IUnknown*>(heap));
-    std::lock_guard<std::mutex> lk(g_reg_mtx);
-    auto it = g_imported_heaps.find(id);
-    if (it == g_imported_heaps.end())
-        return false;
-    *out = it->second;
-    return true;
-}
+/* A placed create on a synthetic heap. The heap is ours, so the framework can
+ * neither validate nor allocate for it — the create is translated into an
+ * armed CreateCommittedResource (`commit`, built by the hook for its device
+ * tier with the heap's Properties and D3D12_HEAP_FLAG_NONE) whose Metal
+ * allocation is substituted with a window into the heap's shm object:
+ *
+ *   BUFFER    -> buffer window at the placement offset (page-aligned by
+ *                D3D12's own 64 KiB placement rule);
+ *   TEXTURE2D -> linear texture window at the placement offset, layout derived
+ *                from the descriptor;
+ *   1D/3D     -> no window machinery exists: the resource is created UNSHARED
+ *                (correct memory, correct lifetime, loud warning) and
+ *                registered so exporting it FAILS instead of vending a handle
+ *                to memory a peer cannot see. Imported heaps refuse instead —
+ *                their pages are the caller's, buffers only.
+ *
+ * Overlapping placements alias because every window maps the same object. */
+template <class DescT, class CommitFn>
+HRESULT d12_place_on_synth(DmnSynthHeap* sh, UINT64 offset, const DescT* desc,
+                           void** out, CommitFn&& commit) {
+    if (!desc || offset >= sh->size)
+        return E_INVALIDARG;
 
-/* A placed buffer on an imported heap: arm the window substitution and forward
- * the create to D3DMetal unchanged, so its suballocation bookkeeping (GetDesc,
- * GetGPUVirtualAddress, offset validation against the real heap) stays
- * consistent while the swizzle swaps the Metal backing for a
- * newBufferWithBytesNoCopy view of the guest's pages at heap_offset. */
-template <class DescT, class OrigCall>
-HRESULT d12_create_placed_imported(const DmnImportedHeap& rec, UINT64 offset,
-                                   const DescT* desc, void** out,
-                                   OrigCall&& call) {
-    if (desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
+    if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+        UINT64 end = 0;
+        if (__builtin_add_overflow(offset, desc->Width, &end) ||
+            end > sh->size) {
+            DMN_ERROR("hooks: placed buffer [%llu, +%llu) exceeds heap size "
+                      "%llu", (unsigned long long)offset,
+                      (unsigned long long)desc->Width,
+                      (unsigned long long)sh->size);
+            return E_INVALIDARG;
+        }
+        DMN_INFO("hooks: placed buffer on %s heap offset=%llu size=%llu",
+                 sh->imported ? "imported" : "shared",
+                 (unsigned long long)offset, (unsigned long long)desc->Width);
+        dmn_share_arm_import_window(sh->fd, sh->fd_off + offset, desc->Width,
+                                    sh->size - offset);
+        HRESULT hr = commit();
+        DmnShareArm arm{};
+        bool captured = dmn_share_disarm(&arm);
+        if (FAILED(hr) || !out || !*out)
+            return hr; /* validation call or failed create: nothing was made */
+        if (!captured)
+            return fail_unshared("placed buffer on synthetic heap", out);
+        /* A resource placed in a SHARED heap must still be exportable; the POD
+         * carries the window so a consumer maps the same bytes. Imported
+         * heaps' placements are not registered: their pages belong to the
+         * caller, who already has its own handle to them. */
+        if (!sh->imported)
+            record_buffer(reinterpret_cast<IUnknown*>(*out), desc->Width,
+                          0, 0, 0, arm, sh->fd_off + offset);
+        return hr;
+    }
+
+    if (sh->imported) {
         DMN_ERROR("hooks: non-buffer placed on an imported heap (dim=%d) — "
                   "imported heaps alias guest CPU pages and back buffers only",
                   (int)desc->Dimension);
         return E_INVALIDARG;
     }
-    UINT64 end = 0;
-    if (__builtin_add_overflow(offset, desc->Width, &end) || end > rec.size) {
-        DMN_ERROR("hooks: placed buffer [%llu, +%llu) exceeds imported heap "
-                  "size %llu", (unsigned long long)offset,
-                  (unsigned long long)desc->Width,
-                  (unsigned long long)rec.size);
-        return E_INVALIDARG;
+
+    if (desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
+        DMN_INFO("hooks: placed texture on shared heap offset=%llu %llux%u "
+                 "fmt=%u", (unsigned long long)offset,
+                 (unsigned long long)desc->Width, desc->Height, desc->Format);
+        dmn_share_arm_texture_window(sh->fd, sh->fd_off + offset,
+                                     sh->size - offset);
+        HRESULT hr = commit();
+        DmnShareArm arm{};
+        bool captured = dmn_share_disarm(&arm);
+        if (FAILED(hr) || !out || !*out)
+            return hr;
+        if (!captured)
+            return fail_unshared("placed texture on synthetic heap", out);
+        record_texture(reinterpret_cast<IUnknown*>(*out), d12_desc_to_11(*desc),
+                       arm, sh->fd_off + offset);
+        return hr;
     }
-    DMN_INFO("hooks: placed buffer on imported heap offset=%llu size=%llu",
-             (unsigned long long)offset, (unsigned long long)desc->Width);
-    dmn_share_arm_import_window(rec.fd, rec.fd_off + offset, desc->Width,
-                                rec.size - offset);
-    HRESULT hr = call();
-    DmnShareArm arm{};
-    bool captured = dmn_share_disarm(&arm);
-    if (FAILED(hr) || !out || !*out)
-        return hr; /* validation call or failed create: nothing was made */
-    if (!captured)
-        return fail_unshared("placed buffer on imported heap", out);
+
+    DMN_WARN("hooks: dimension-%d resource placed in a SHARED heap has no "
+             "window backing; it is created UNSHARED (does not alias the heap, "
+             "cannot be exported)", (int)desc->Dimension);
+    HRESULT hr = commit(); /* unarmed: a plain private committed resource */
+    if (SUCCEEDED(hr) && out && *out) {
+        auto* res = reinterpret_cast<IUnknown*>(*out);
+        void* id = dmn_com_identity(res);
+        {
+            std::lock_guard<std::mutex> lk(g_reg_mtx);
+            g_unshared_placed.insert(id);
+        }
+        attach_evict_sentinel(res, id, EV_UNSHARED_PLACED);
+    }
     return hr;
 }
 
@@ -1737,16 +2092,39 @@ HRESULT STDMETHODCALLTYPE hook_d3d12_CreateCommittedResource3(
     return d12_create_shared(desc, out, call);
 }
 
+/* CreateHeap(SHARED): mint a synthetic heap; the framework never sees it, so
+ * its own heap allocation (whose memory a substituted placement would turn
+ * into a live second copy) never exists. */
+HRESULT d12_create_heap_shared(IUnknown* device, const D3D12_HEAP_DESC* desc,
+                               REFIID riid, void** out) {
+    if (!desc->SizeInBytes)
+        return E_INVALIDARG;
+    const int fd = dmn_share_anon_file((size_t)desc->SizeInBytes);
+    if (fd < 0) {
+        DMN_ERROR("hooks: SHARED heap backing (%llu bytes) could not be "
+                  "allocated", (unsigned long long)desc->SizeInBytes);
+        return E_OUTOFMEMORY;
+    }
+    HRESULT hr = synth_heap_new(device, *desc, fd, /*fd_off=*/0,
+                                desc->SizeInBytes, /*imported=*/false, riid,
+                                out);
+    if (SUCCEEDED(hr))
+        DMN_INFO("hooks: SHARED heap %p is synthetic, size=%llu fd=%d",
+                 out ? *out : nullptr, (unsigned long long)desc->SizeInBytes,
+                 fd);
+    return hr;
+}
+
 HRESULT STDMETHODCALLTYPE hook_d3d12_CreateHeap(
         ID3D12Device* This, const D3D12_HEAP_DESC* desc, REFIID riid, void** out) {
     auto orig = DMN_ORIG(d3d12_CreateHeap, This);
     if (!orig)
         return E_FAIL;
-    HRESULT hr = orig(This, desc, riid, out);
-    if (SUCCEEDED(hr) && desc && (desc->Flags & D3D12_HEAP_FLAG_SHARED) &&
-        out && *out)
-        record_shared_heap(reinterpret_cast<IUnknown*>(*out));
-    return hr;
+    /* A null `out` is a parameter-validation call; let the framework judge. */
+    if (!desc || !out || !(desc->Flags & D3D12_HEAP_FLAG_SHARED))
+        return orig(This, desc, riid, out);
+    return d12_create_heap_shared(reinterpret_cast<IUnknown*>(This), desc, riid,
+                                  out);
 }
 
 HRESULT STDMETHODCALLTYPE hook_d3d12_CreateHeap1(
@@ -1755,11 +2133,10 @@ HRESULT STDMETHODCALLTYPE hook_d3d12_CreateHeap1(
     auto orig = DMN_ORIG(d3d12_CreateHeap1, This);
     if (!orig)
         return E_FAIL;
-    HRESULT hr = orig(This, desc, session, riid, out);
-    if (SUCCEEDED(hr) && desc && (desc->Flags & D3D12_HEAP_FLAG_SHARED) &&
-        out && *out)
-        record_shared_heap(reinterpret_cast<IUnknown*>(*out));
-    return hr;
+    if (!desc || !out || !(desc->Flags & D3D12_HEAP_FLAG_SHARED))
+        return orig(This, desc, session, riid, out);
+    return d12_create_heap_shared(reinterpret_cast<IUnknown*>(This), desc, riid,
+                                  out);
 }
 
 HRESULT STDMETHODCALLTYPE hook_d3d12_CreatePlacedResource(
@@ -1769,14 +2146,19 @@ HRESULT STDMETHODCALLTYPE hook_d3d12_CreatePlacedResource(
     auto orig = DMN_ORIG(d3d12_CreatePlacedResource, This);
     if (!orig)
         return E_FAIL;
-    auto call = [&] { return orig(This, heap, offset, desc, state, clear,
-                                  riid, out); };
-    DmnImportedHeap rec;
-    if (!dmn_share_is_armed() && desc && heap_import_lookup(heap, &rec))
-        return d12_create_placed_imported(rec, offset, desc, out, call);
-    if (dmn_share_is_armed() || !desc || !heap_is_shared(heap))
-        return call();
-    return d12_create_shared(desc, out, call);
+    /* A synthetic heap must never reach the framework — it is our COM object,
+     * not one of D3DMetal's. Translate the placed create into a committed one
+     * whose Metal backing becomes a window into the heap's shm object. The
+     * committed call goes through the public (hooked) vtable slot: the arm set
+     * by the translation makes that hook pass straight through. */
+    if (DmnSynthHeap* sh = as_synth_heap(heap))
+        return d12_place_on_synth(sh, offset, desc, out, [&] {
+            D3D12_HEAP_PROPERTIES hp =
+                commit_props_for(sh->desc.Properties, desc->Flags);
+            return This->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE,
+                                                 desc, state, clear, riid, out);
+        });
+    return orig(This, heap, offset, desc, state, clear, riid, out);
 }
 
 HRESULT STDMETHODCALLTYPE hook_d3d12_CreatePlacedResource1(
@@ -1786,14 +2168,17 @@ HRESULT STDMETHODCALLTYPE hook_d3d12_CreatePlacedResource1(
     auto orig = DMN_ORIG(d3d12_CreatePlacedResource1, This);
     if (!orig)
         return E_FAIL;
-    auto call = [&] { return orig(This, heap, offset, desc, state, clear,
-                                  riid, out); };
-    DmnImportedHeap rec;
-    if (!dmn_share_is_armed() && desc && heap_import_lookup(heap, &rec))
-        return d12_create_placed_imported(rec, offset, desc, out, call);
-    if (dmn_share_is_armed() || !desc || !heap_is_shared(heap))
-        return call();
-    return d12_create_shared(desc, out, call);
+    /* Same synthetic-heap translation as hook_d3d12_CreatePlacedResource,
+     * through this device tier's committed create. */
+    if (DmnSynthHeap* sh = as_synth_heap(heap))
+        return d12_place_on_synth(sh, offset, desc, out, [&] {
+            D3D12_HEAP_PROPERTIES hp =
+                commit_props_for(sh->desc.Properties, desc->Flags);
+            return This->CreateCommittedResource2(&hp, D3D12_HEAP_FLAG_NONE,
+                                                  desc, state, clear, nullptr,
+                                                  riid, out);
+        });
+    return orig(This, heap, offset, desc, state, clear, riid, out);
 }
 
 HRESULT STDMETHODCALLTYPE hook_d3d12_CreatePlacedResource2(
@@ -1804,14 +2189,120 @@ HRESULT STDMETHODCALLTYPE hook_d3d12_CreatePlacedResource2(
     auto orig = DMN_ORIG(d3d12_CreatePlacedResource2, This);
     if (!orig)
         return E_FAIL;
-    auto call = [&] { return orig(This, heap, offset, desc, layout, clear,
-                                  num_castable, castable, riid, out); };
-    DmnImportedHeap rec;
-    if (!dmn_share_is_armed() && desc && heap_import_lookup(heap, &rec))
-        return d12_create_placed_imported(rec, offset, desc, out, call);
-    if (dmn_share_is_armed() || !desc || !heap_is_shared(heap))
-        return call();
-    return d12_create_shared(desc, out, call);
+    /* Same synthetic-heap translation as hook_d3d12_CreatePlacedResource,
+     * through this device tier's committed create. One repair on the way: a
+     * BUFFER must carry D3D12_BARRIER_LAYOUT_UNDEFINED (~0u) into
+     * CreateCommittedResource3 — the layout is meaningless for buffers and
+     * UNDEFINED is the only value its validation accepts, while
+     * CreatePlacedResource2 tolerated whatever the app passed. */
+    if (DmnSynthHeap* sh = as_synth_heap(heap))
+        return d12_place_on_synth(sh, offset, desc, out, [&] {
+            D3D12_HEAP_PROPERTIES hp =
+                commit_props_for(sh->desc.Properties, desc->Flags);
+            const DMN_D3D12_BARRIER_LAYOUT lay =
+                (desc && desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+                    ? (DMN_D3D12_BARRIER_LAYOUT)~0u
+                    : layout;
+            return This->CreateCommittedResource3(&hp, D3D12_HEAP_FLAG_NONE,
+                                                  desc, lay, clear, nullptr,
+                                                  num_castable, castable, riid,
+                                                  out);
+        });
+    return orig(This, heap, offset, desc, layout, clear, num_castable,
+                castable, riid, out);
+}
+
+/* == Residency calls ====================================================== */
+/* A synthetic heap handed to the framework's MakeResident/Evict family would
+ * be dereferenced as a D3DMetal object. Filter it out: its backing is plain
+ * shared memory, always "resident" as far as D3D12 semantics can observe, so
+ * dropping it from the array is the correct answer, not a shortcut. */
+
+bool pageables_contain_synth(UINT count, ID3D12Pageable* const* objects) {
+    for (UINT i = 0; i < count; i++)
+        if (as_synth_heap(reinterpret_cast<ID3D12Heap*>(objects[i])))
+            return true;
+    return false;
+}
+
+HRESULT STDMETHODCALLTYPE hook_d3d12_MakeResident(
+        ID3D12Device* This, UINT count, ID3D12Pageable* const* objects) {
+    auto orig = DMN_ORIG(d3d12_MakeResident, This);
+    if (!orig)
+        return E_FAIL;
+    if (!objects || !pageables_contain_synth(count, objects))
+        return orig(This, count, objects);
+    std::vector<ID3D12Pageable*> kept;
+    kept.reserve(count);
+    for (UINT i = 0; i < count; i++)
+        if (!as_synth_heap(reinterpret_cast<ID3D12Heap*>(objects[i])))
+            kept.push_back(objects[i]);
+    if (kept.empty())
+        return S_OK;
+    return orig(This, (UINT)kept.size(), kept.data());
+}
+
+HRESULT STDMETHODCALLTYPE hook_d3d12_Evict(
+        ID3D12Device* This, UINT count, ID3D12Pageable* const* objects) {
+    auto orig = DMN_ORIG(d3d12_Evict, This);
+    if (!orig)
+        return E_FAIL;
+    if (!objects || !pageables_contain_synth(count, objects))
+        return orig(This, count, objects);
+    std::vector<ID3D12Pageable*> kept;
+    kept.reserve(count);
+    for (UINT i = 0; i < count; i++)
+        if (!as_synth_heap(reinterpret_cast<ID3D12Heap*>(objects[i])))
+            kept.push_back(objects[i]);
+    if (kept.empty())
+        return S_OK;
+    return orig(This, (UINT)kept.size(), kept.data());
+}
+
+HRESULT STDMETHODCALLTYPE hook_d3d12_SetResidencyPriority(
+        ID3D12Device1* This, UINT count, ID3D12Pageable* const* objects,
+        const D3D12_RESIDENCY_PRIORITY* priorities) {
+    auto orig = DMN_ORIG(d3d12_SetResidencyPriority, This);
+    if (!orig)
+        return E_FAIL;
+    if (!objects || !priorities || !pageables_contain_synth(count, objects))
+        return orig(This, count, objects, priorities);
+    std::vector<ID3D12Pageable*> kept;
+    std::vector<D3D12_RESIDENCY_PRIORITY> kept_prio;
+    kept.reserve(count);
+    kept_prio.reserve(count);
+    for (UINT i = 0; i < count; i++) {
+        if (as_synth_heap(reinterpret_cast<ID3D12Heap*>(objects[i])))
+            continue;
+        kept.push_back(objects[i]);
+        kept_prio.push_back(priorities[i]);
+    }
+    if (kept.empty())
+        return S_OK;
+    return orig(This, (UINT)kept.size(), kept.data(), kept_prio.data());
+}
+
+HRESULT STDMETHODCALLTYPE hook_d3d12_EnqueueMakeResident(
+        ID3D12Device3* This, UINT flags, UINT count,
+        ID3D12Pageable* const* objects, ID3D12Fence* fence, UINT64 value) {
+    auto orig = DMN_ORIG(d3d12_EnqueueMakeResident, This);
+    if (!orig)
+        return E_FAIL;
+    if (!objects || !pageables_contain_synth(count, objects))
+        return orig(This, flags, count, objects, fence, value);
+    std::vector<ID3D12Pageable*> kept;
+    kept.reserve(count);
+    for (UINT i = 0; i < count; i++)
+        if (!as_synth_heap(reinterpret_cast<ID3D12Heap*>(objects[i])))
+            kept.push_back(objects[i]);
+    if (kept.empty()) {
+        /* Everything is already resident, but the API's contract — the fence
+         * signals when the work completes — must still be honoured. */
+        if (fence)
+            fence->Signal(value);
+        return S_OK;
+    }
+    return orig(This, flags, (UINT)kept.size(), kept.data(), fence, value);
 }
 
 /* == D3D12 fences ========================================================== */
@@ -1891,12 +2382,39 @@ HRESULT STDMETHODCALLTYPE hook_queue_Wait(
     return orig ? orig(This, fence, value) : E_FAIL;
 }
 
+/* Tile mappings draw pages from a heap, so this is one of the entry points an
+ * ID3D12Heap can arrive through (MSDN: pHeap, 5th parameter). A synthetic
+ * heap must not reach the framework; there is also nothing it could do with
+ * one — its tile pool is its own placement heap, not our shm object. Tiled
+ * resources are exotic enough here that a loud drop is the whole story. */
+void STDMETHODCALLTYPE hook_queue_UpdateTileMappings(
+        ID3D12CommandQueue* This, ID3D12Resource* resource, UINT num_regions,
+        const D3D12_TILED_RESOURCE_COORDINATE* coords,
+        const D3D12_TILE_REGION_SIZE* sizes, ID3D12Heap* heap, UINT num_ranges,
+        const D3D12_TILE_RANGE_FLAGS* range_flags, const UINT* range_offsets,
+        const UINT* range_counts, D3D12_TILE_MAPPING_FLAGS flags) {
+    if (as_synth_heap(heap)) {
+        DMN_ERROR("hooks: UpdateTileMappings with a SHARED/imported heap as "
+                  "the tile pool is not supported — the mappings are DROPPED "
+                  "(the heap is synthetic and has no framework tile pool)");
+        return;
+    }
+    auto orig = DMN_ORIG(queue_UpdateTileMappings, This);
+    if (orig)
+        orig(This, resource, num_regions, coords, sizes, heap, num_ranges,
+             range_flags, range_offsets, range_counts, flags);
+}
+
 void patch_d3d12_queue(IUnknown* obj) {
     ID3D12CommandQueue* q = nullptr;
     if (SUCCEEDED(obj->QueryInterface(__uuidof(ID3D12CommandQueue),
                                       reinterpret_cast<void**>(&q))) && q) {
         DMN_PATCH(q, ID3D12CommandQueue, Signal, queue_Signal);
         DMN_PATCH(q, ID3D12CommandQueue, Wait, queue_Wait);
+        /* The vendored declaration's slot index is right even though its
+         * parameter list is not (see the forward declaration). */
+        DMN_PATCH(q, ID3D12CommandQueue, UpdateTileMappings,
+                  queue_UpdateTileMappings);
         q->Release();
     }
 }
@@ -2024,6 +2542,23 @@ HRESULT STDMETHODCALLTYPE hook_d3d12_CreateSharedHandle(
             return S_OK;
         if (SUCCEEDED(return_buffer_pod(unk, out, /*nt=*/true)))
             return S_OK;
+        /* A 1D/3D resource placed in a SHARED heap has no shared backing (see
+         * d12_place_on_synth). A handle for it would point a peer at memory
+         * that is not the resource's — fail here, where the app can see it,
+         * instead of at first use of a blank surface. */
+        void* id = dmn_com_identity(unk);
+        bool unshared;
+        {
+            std::lock_guard<std::mutex> lk(g_reg_mtx);
+            unshared = g_unshared_placed.count(id) != 0;
+        }
+        if (unshared) {
+            DMN_ERROR("hooks: CreateSharedHandle on a 1D/3D resource placed in "
+                      "a SHARED heap — no shared backing exists for that "
+                      "dimension, refusing to vend a handle");
+            *out = nullptr;
+            return E_INVALIDARG;
+        }
     }
     DMN_WARN("hooks: CreateSharedHandle on an object that never went through "
              "the shared create path; falling through to D3DMetal (stubbed)");
@@ -2135,13 +2670,14 @@ extern "C" int32_t dmn_open_existing_heap_from_fd(void* device, int fd,
         return E_NOINTERFACE;
     }
 
-    /* A real D3DMetal heap backs the import so the returned pointer is a
-     * genuine heap everywhere it can travel (MakeResident, Evict, ...); the
-     * reservation stays untouched — placed buffers get their Metal backing
-     * substituted with windows into the shm object instead. The guest's flags
-     * are deliberately dropped: SHARED would misroute placed creates into the
-     * per-resource shared backing path, and only buffers may alias the
-     * window. heap_type is advisory (the guest answers GetDesc locally). */
+    /* A synthetic heap backs the import (see DmnSynthHeap): a framework heap
+     * would allocate heap-size memory that a placed buffer's substituted
+     * backing can only duplicate. The synthetic heap holds a dup of the fd;
+     * placed buffers get their Metal backing substituted with windows into
+     * the shm object, and the residency hooks keep the pointer away from
+     * D3DMetal. The guest's flags are deliberately dropped (only buffers may
+     * alias the window); heap_type is advisory (the guest answers GetDesc
+     * locally). */
     D3D12_HEAP_DESC hd{};
     hd.SizeInBytes = size;
     hd.Properties.Type = (heap_type >= (uint32_t)D3D12_HEAP_TYPE_DEFAULT &&
@@ -2151,28 +2687,26 @@ extern "C" int32_t dmn_open_existing_heap_from_fd(void* device, int fd,
     hd.Alignment = 0;
     hd.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
 
-    HRESULT hr = dev->CreateHeap(&hd, *reinterpret_cast<const IID*>(iid),
-                                 out_heap);
+    const int owned = fcntl(fd, F_DUPFD_CLOEXEC, 0); /* fd is borrowed */
+    if (owned < 0) {
+        DMN_ERROR("hooks: heap import dup(fd=%d) failed", fd);
+        dev->Release();
+        return E_FAIL;
+    }
+    HRESULT hr = synth_heap_new(reinterpret_cast<IUnknown*>(dev), hd, owned,
+                                offset, size, /*imported=*/true,
+                                *reinterpret_cast<const IID*>(iid), out_heap);
     dev->Release();
     if (FAILED(hr) || !*out_heap) {
-        DMN_ERROR("hooks: heap import CreateHeap(size=%llu type=%u) failed "
-                  "0x%08x", (unsigned long long)size,
-                  (unsigned)hd.Properties.Type, (unsigned)hr);
+        DMN_ERROR("hooks: heap import (size=%llu type=%u) failed 0x%08x",
+                  (unsigned long long)size, (unsigned)hd.Properties.Type,
+                  (unsigned)hr);
         return FAILED(hr) ? hr : E_FAIL;
     }
-
-    auto* heap_unk = reinterpret_cast<IUnknown*>(*out_heap);
-    void* id = dmn_com_identity(heap_unk);
-    int owned = register_owned_fd(id, fd); /* fd is borrowed; this dups */
-    {
-        std::lock_guard<std::mutex> lk(g_reg_mtx);
-        g_imported_heaps[id] = DmnImportedHeap{owned, offset, size};
-    }
-    attach_evict_sentinel(heap_unk, id, EV_IMPORTED_HEAP);
     DMN_INFO("hooks: imported shm window fd=%d off=%llu size=%llu app_type=%u "
-             "app_flags=0x%x as heap identity=%p", fd,
+             "app_flags=0x%x as synthetic heap %p", fd,
              (unsigned long long)offset, (unsigned long long)size, heap_type,
-             heap_flags, id);
+             heap_flags, *out_heap);
     return S_OK;
 }
 
@@ -2313,6 +2847,9 @@ extern "C" void dmn_hooks_after_d3d12_device(void* device) {
         DMN_PATCH(d, ID3D12Device, CreateCommittedResource, d3d12_CreateCommittedResource);
         DMN_PATCH(d, ID3D12Device, CreateHeap, d3d12_CreateHeap);
         DMN_PATCH(d, ID3D12Device, CreatePlacedResource, d3d12_CreatePlacedResource);
+        /* Synthetic heaps must never reach the framework's residency paths. */
+        DMN_PATCH(d, ID3D12Device, MakeResident, d3d12_MakeResident);
+        DMN_PATCH(d, ID3D12Device, Evict, d3d12_Evict);
         DMN_PATCH(d, ID3D12Device, CreateCommandQueue, d3d12_CreateCommandQueue);
         DMN_PATCH(d, ID3D12Device, CreateGraphicsPipelineState,
                   d3d12_CreateGraphicsPipelineState);
@@ -2325,7 +2862,16 @@ extern "C" void dmn_hooks_after_d3d12_device(void* device) {
                                       reinterpret_cast<void**>(&d1))) && d1) {
         DMN_PATCH(d1, ID3D12Device1, SetEventOnMultipleFenceCompletion,
                   d3d12_SetEventOnMultipleFenceCompletion);
+        DMN_PATCH(d1, ID3D12Device1, SetResidencyPriority,
+                  d3d12_SetResidencyPriority);
         d1->Release();
+    }
+    ID3D12Device3* dv3 = nullptr;
+    if (SUCCEEDED(dev->QueryInterface(__uuidof(ID3D12Device3),
+                                      reinterpret_cast<void**>(&dv3))) && dv3) {
+        DMN_PATCH(dv3, ID3D12Device3, EnqueueMakeResident,
+                  d3d12_EnqueueMakeResident);
+        dv3->Release();
     }
     ID3D12Device4* d4 = nullptr;
     if (SUCCEEDED(dev->QueryInterface(__uuidof(ID3D12Device4),

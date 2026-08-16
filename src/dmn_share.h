@@ -32,6 +32,7 @@ struct DmnShareTexPOD {
     uint32_t bind_flags, misc_flags, cpu_access;
     uint64_t stride;
     uint64_t size;
+    uint64_t offset;
 };
 
 struct DmnShareFencePOD {
@@ -53,6 +54,12 @@ struct DmnShareArm {
     int      kind;          /* DmnShareKind; texture and buffer swizzles ignore
                                an arm whose kind isn't theirs */
     bool     alloc_new;     /* true: producer allocates; false: consumer reuses fd */
+    bool     derive_layout; /* texture window into an existing fd: the layout is
+                               DERIVED from the descriptor (producer-style)
+                               rather than shipped, because the placement is the
+                               first sight of this surface — there is no
+                               producer POD to validate against. alloc_new is
+                               false: the backing is the heap's existing object */
 
     /* Producer inputs (alloc_new == true). */
     uint64_t extra_bytes;   /* extra shm past the page-aligned payload (e.g. the
@@ -68,7 +75,10 @@ struct DmnShareArm {
                                closed here and never handed to a deallocator */
     uint64_t existing_stride;
     uint64_t existing_size;
-    uint64_t existing_offset; /* page-aligned mmap offset into existing_fd */
+    uint64_t existing_offset; /* byte offset into existing_fd. Buffer windows
+                               need it page-aligned (an MTLBuffer starts at its
+                               mapping); texture windows map from the page floor
+                               and place the texture at the in-buffer delta */
     uint64_t existing_max;  /* bytes available at existing_offset. 0 means a
                                plain import: existing_size is a hard ceiling.
                                Nonzero lets the substitution grow to whatever
@@ -110,7 +120,16 @@ extern "C" {
  * requests additional shared memory past the page-aligned texture bytes
  * (found by a consumer at page_align(pod.size)); 0 for none. */
 void dmn_share_arm_producer(uint64_t extra_bytes);
-void dmn_share_arm_consumer(int fd, uint64_t stride, uint64_t size);
+/* `offset` is the byte offset of the surface within `fd` (a texture placed in
+ * a shared heap); 0 for a committed surface, which owns its whole object. */
+void dmn_share_arm_consumer(int fd, uint64_t stride, uint64_t size,
+                            uint64_t offset);
+/* Arm for the next Metal texture creation, backing it with the window of `fd`
+ * at byte `offset` (need not be page-aligned): the layout is derived from the
+ * descriptor and must fit in the max_size bytes available there. The fd is
+ * BORROWED (the heap owns it); the substituted texture's backing only munmaps
+ * its own window. Used for a texture placed in a shared heap. */
+void dmn_share_arm_texture_window(int fd, uint64_t offset, uint64_t max_size);
 /* Arm the calling thread for the next raw MTLBuffer creation (device
  * newBufferWithLength:options: or heap newBufferWithLength:options:offset:).
  * `size` is the byte length to back with shared memory. */

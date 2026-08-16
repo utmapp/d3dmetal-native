@@ -12,6 +12,8 @@
  *     caller's pages, not a shadow.
  *  3. GPU->CPU: a copy into a buffer placed on a DEFAULT-typed import lands
  *     in the caller's mmap, and the first heap's window is untouched.
+ *  3b. A buffer with ALLOW_UNORDERED_ACCESS places on the UPLOAD-typed import
+ *     (a flag D3D12 forbids on CPU heaps) and still aliases the window.
  *  4. Releasing the heap does not tear down a live placed buffer's backing
  *     (the copy still round-trips), matching the guest-side pin semantics.
  *  5. Validation refuses: unaligned offset, window past EOF, zero/huge size,
@@ -229,6 +231,30 @@ int main() {
     EXPECT(check_pattern(win + kPlaceOff, kBufSize, 0xA11A5EDu),
            "first window disturbed by a copy into the second");
     printf("HEAPIMP: GPU->CPU alias ok, windows independent\n");
+
+    /* 3b) A UAV buffer placed on the UPLOAD-typed import. D3D12 forbids
+     * ALLOW_UNORDERED_ACCESS on UPLOAD/READBACK heaps, but the guest may
+     * place one on a CUSTOM heap that arrives here clamped to UPLOAD; the
+     * create must still succeed and the placement must still alias. */
+    {
+        D3D12_RESOURCE_DESC ud = buf_desc(kBufSize);
+        ud.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        Com<ID3D12Resource> uav;
+        CK(dev->CreatePlacedResource(heap.ptr(), kPlaceOff, &ud,
+                                     D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                     __uuidof(ID3D12Resource), (void**)&uav),
+           "CreatePlacedResource(UAV buffer on UPLOAD-typed import)");
+        fill_pattern(win + kPlaceOff, kBufSize, 0x0AF0AF00u);
+        EXPECT(gpu.copy(readback.ptr(), uav.ptr(), kBufSize), "copy out (UAV) failed");
+        void* rb = nullptr;
+        D3D12_RANGE all{0, (SIZE_T)kBufSize};
+        CK(readback->Map(0, &all, &rb), "Map(readback UAV)");
+        EXPECT(check_pattern(rb, kBufSize, 0x0AF0AF00u),
+               "UAV placement on the imported heap does not alias the window");
+        D3D12_RANGE none{0, 0};
+        readback->Unmap(0, &none);
+        printf("HEAPIMP: UAV placement on a CPU-typed import ok\n");
+    }
 
     /* 4) Heap released first: the placed buffer's backing must survive. */
     heap = nullptr;
