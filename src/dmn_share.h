@@ -81,11 +81,15 @@ struct DmnShareArm {
                                intercepted and discarded (see
                                dmn_share_init_data_sentinel) */
     bool     captured;
-    int      out_fd;        /* the fd backing the substitution. Producer: newly
-                               created, and OWNED by the substituted resource's
-                               MTLBuffer deallocator — the caller must dup it to
-                               keep it. Consumer: existing_fd echoed back, still
-                               owned by the caller. */
+    int      out_fd;        /* the fd backing the substitution. Producer
+                               (alloc_new): newly created, and OWNED BY THE
+                               CALLER from here — the registration dups it and
+                               the hook closes it (or closes it on a failed
+                               create); the substituted MTLBuffer owns only the
+                               mapping, so fd reclamation is eviction-time
+                               exact instead of riding D3DMetal's deferred
+                               Metal releases. Consumer/window: existing_fd
+                               echoed back, still owned by the caller. */
     uint64_t out_stride;
     uint64_t out_size;
 };

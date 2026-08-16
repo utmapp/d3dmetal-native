@@ -775,6 +775,17 @@ HRESULT return_fence_pod(IUnknown* fenceObj, HANDLE* out) {
     return hr;
 }
 
+/* Close a PRODUCER arm's fd. The producer substitution hands its fd's
+ * ownership out through the arm (the impostor MTLBuffer owns only the
+ * mapping), so every producer create site must sink it exactly once: after
+ * the registration has taken its dup, or when the create failed with a
+ * capture. Consumer/window arms borrow their fd and are excluded by
+ * alloc_new. */
+void arm_fd_close(const DmnShareArm& arm) {
+    if (arm.captured && arm.alloc_new && arm.out_fd >= 0)
+        close(arm.out_fd);
+}
+
 /* A shared create that did not route through the Metal swizzle produced an
  * ordinary, process-private resource. Returning it with a success HRESULT
  * hands the app a valid-looking handle whose peer can never see anything, and
@@ -997,12 +1008,15 @@ HRESULT STDMETHODCALLTYPE hook_d3d11_CreateTexture2D(
     bool captured = dmn_share_disarm(&arm);
     /* A null `out` is a parameter-validation call: nothing was allocated, so
      * there is nothing to have shared and nothing to fail. */
-    if (FAILED(hr) || !out || !*out)
+    if (FAILED(hr) || !out || !*out) {
+        arm_fd_close(arm);
         return hr;
+    }
     if (!captured)
         return fail_unshared("CreateTexture2D MISC_SHARED",
                              reinterpret_cast<void**>(out));
     record_texture(*out, *desc, arm);
+    arm_fd_close(arm);
     return hr;
 }
 
@@ -1021,8 +1035,10 @@ HRESULT STDMETHODCALLTYPE hook_d3d11_CreateTexture2D1(
     HRESULT hr = orig(This, desc, init, out);
     DmnShareArm arm{};
     bool captured = dmn_share_disarm(&arm);
-    if (FAILED(hr) || !out || !*out)
+    if (FAILED(hr) || !out || !*out) {
+        arm_fd_close(arm);
         return hr;
+    }
     if (!captured)
         return fail_unshared("CreateTexture2D1 MISC_SHARED",
                              reinterpret_cast<void**>(out));
@@ -1034,6 +1050,7 @@ HRESULT STDMETHODCALLTYPE hook_d3d11_CreateTexture2D1(
     d.Usage = desc->Usage; d.BindFlags = desc->BindFlags;
     d.CPUAccessFlags = desc->CPUAccessFlags; d.MiscFlags = desc->MiscFlags;
     record_texture(*out, d, arm);
+    arm_fd_close(arm);
     return hr;
 }
 
@@ -1291,13 +1308,16 @@ HRESULT STDMETHODCALLTYPE hook_d3d11_CreateBuffer(
     HRESULT hr = orig(This, desc, init, out);
     DmnShareArm arm{};
     bool captured = dmn_share_disarm(&arm);
-    if (FAILED(hr) || !out || !*out)
+    if (FAILED(hr) || !out || !*out) {
+        arm_fd_close(arm);
         return hr;
+    }
     if (!captured)
         return fail_unshared("CreateBuffer MISC_SHARED",
                              reinterpret_cast<void**>(out));
     record_buffer(reinterpret_cast<IUnknown*>(*out), desc->ByteWidth,
                   desc->BindFlags, desc->MiscFlags, desc->CPUAccessFlags, arm);
+    arm_fd_close(arm);
     return hr;
 }
 
@@ -1559,12 +1579,15 @@ HRESULT d12_create_shared(const DescT* desc, void** out, OrigCall&& call) {
         HRESULT hr = call();
         DmnShareArm arm{};
         bool captured = dmn_share_disarm(&arm);
-        if (FAILED(hr) || !out || !*out)
+        if (FAILED(hr) || !out || !*out) {
+            arm_fd_close(arm);
             return hr;
+        }
         if (!captured)
             return fail_unshared("D3D12 SHARED buffer create", out);
         record_buffer(reinterpret_cast<IUnknown*>(*out), desc->Width,
                       0, 0, 0, arm);
+        arm_fd_close(arm);
         return hr;
     }
     if (desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
@@ -1574,8 +1597,10 @@ HRESULT d12_create_shared(const DescT* desc, void** out, OrigCall&& call) {
         HRESULT hr = call();
         DmnShareArm arm{};
         bool captured = dmn_share_disarm(&arm);
-        if (FAILED(hr) || !out || !*out)
+        if (FAILED(hr) || !out || !*out) {
+            arm_fd_close(arm);
             return hr;
+        }
         if (!captured)
             return fail_unshared("D3D12 SHARED texture create", out);
         /* Flatten the D3D12 desc into the POD's D3D11 shape. */
@@ -1587,6 +1612,7 @@ HRESULT d12_create_shared(const DescT* desc, void** out, OrigCall&& call) {
         d.Format = desc->Format;
         d.SampleDesc.Count = desc->SampleDesc.Count ? desc->SampleDesc.Count : 1;
         record_texture(reinterpret_cast<IUnknown*>(*out), d, arm);
+        arm_fd_close(arm);
         return hr;
     }
     DMN_WARN("hooks: D3D12 SHARED create with unsupported dimension %d passes "

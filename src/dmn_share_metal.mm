@@ -145,21 +145,19 @@ struct LinearLayout {
     size_t mapped;
 };
 
-/* Shared backing is reclaimed when the MTLBuffer dies: the deallocator block
- * munmaps the mapping and closes the fd we own (producer side; a consumer's fd
- * belongs to the app, so only the mapping goes). Metal copies the block, so
- * cleanup runs whenever the last reference goes. In-flight command buffers are
- * NOT among those references — D3DMetal's are unretained — so a buffer still
- * referencing this one is kept alive by sub_resources_make_resident() instead. */
-id<MTLBuffer> shared_buffer_over(id<MTLDevice> device, void* ptr, size_t aligned,
-                                 int owned_fd) {
+/* The mapping is reclaimed when the MTLBuffer dies: the deallocator block
+ * munmaps it (the fd is never the buffer's to close: producer fds belong to
+ * the COM layer, consumer fds to the app). Metal copies the block, so cleanup
+ * runs whenever the last reference goes. In-flight command buffers are NOT
+ * among those references — D3DMetal's are unretained — so a buffer still
+ * referencing this one is kept alive by sub_resources_make_resident()
+ * instead. */
+id<MTLBuffer> shared_buffer_over(id<MTLDevice> device, void* ptr, size_t aligned) {
     return [device newBufferWithBytesNoCopy:ptr
                                      length:aligned
                                     options:MTLResourceStorageModeShared
                                 deallocator:^(void* p, NSUInteger len) {
                                     munmap(p, len);
-                                    if (owned_fd >= 0)
-                                        close(owned_fd);
                                 }];
 }
 
@@ -464,10 +462,13 @@ id<MTLTexture> substitute_producer(id<MTLDevice> device,
         return nil;
     }
 
-    /* The buffer takes ownership of both the mapping and the fd from here, so
-     * everything past this point unwinds by releasing the buffer alone —
-     * including make_linear_texture's own failure path. */
-    id<MTLBuffer> buf = shared_buffer_over(device, ptr, layout.mapped, fd);
+    /* The buffer owns the MAPPING only; the fd travels out through the arm and
+     * is closed by the COM layer once the registry holds its dup (or the
+     * create fails). Tying it to the deallocator would make fd reclamation
+     * wait for D3DMetal's deferred destruction to drop the last Metal
+     * reference, which is GPU-timing-dependent. The mapping alone keeps the
+     * shm object's pages alive. */
+    id<MTLBuffer> buf = shared_buffer_over(device, ptr, layout.mapped);
     if (!buf) {
         DMN_ERROR("share: newBufferWithBytesNoCopy failed");
         munmap(ptr, layout.mapped);
@@ -476,8 +477,10 @@ id<MTLTexture> substitute_producer(id<MTLDevice> device,
     }
 
     id<MTLTexture> tex = make_linear_texture(buf, desc, layout, /*producer=*/true);
-    if (!tex)
+    if (!tex) {
+        close(fd);
         return nil;
+    }
 
     t_arm.captured   = true;
     t_arm.out_fd     = fd;
@@ -541,8 +544,7 @@ id<MTLTexture> substitute_consumer(id<MTLDevice> device,
                   layout.mapped, strerror(errno));
         return nil;
     }
-    id<MTLBuffer> buf = shared_buffer_over(device, ptr, layout.mapped,
-                                           /*owned_fd=*/-1);
+    id<MTLBuffer> buf = shared_buffer_over(device, ptr, layout.mapped);
     if (!buf) {
         DMN_ERROR("share: consumer newBufferWithBytesNoCopy failed");
         munmap(ptr, layout.mapped);
@@ -610,7 +612,9 @@ id<MTLBuffer> substitute_buffer(id<MTLDevice> device, NSUInteger length) {
             close(fd);
             return nil;
         }
-        id<MTLBuffer> buf = shared_buffer_over(device, ptr, mapped, fd);
+        /* Mapping-only ownership; the fd goes out through the arm — see the
+         * producer texture path for why. */
+        id<MTLBuffer> buf = shared_buffer_over(device, ptr, mapped);
         if (!buf) {
             DMN_ERROR("share: buffer newBufferWithBytesNoCopy failed");
             munmap(ptr, mapped);
@@ -680,7 +684,7 @@ id<MTLBuffer> substitute_buffer(id<MTLDevice> device, NSUInteger length) {
                   strerror(errno));
         return nil;
     }
-    id<MTLBuffer> buf = shared_buffer_over(device, ptr, mapped, /*owned_fd=*/-1);
+    id<MTLBuffer> buf = shared_buffer_over(device, ptr, mapped);
     if (!buf) {
         DMN_ERROR("share: consumer buffer newBufferWithBytesNoCopy failed");
         munmap(ptr, mapped);
