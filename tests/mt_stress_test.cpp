@@ -34,6 +34,8 @@
 #define T_TAG "MT-STRESS"
 #include "common/skip.h"
 #include "common/com.h"
+#include "common/gpu.h"
+#include "common/util.h"
 
 namespace {
 
@@ -69,6 +71,14 @@ uint32_t tex_width(int tid)             { return 32u * (uint32_t)(tid + 1); }
 uint32_t tex_height(int iter)           { return 16u + 16u * (uint32_t)(iter & 7); }
 uint32_t buf_bytes(int tid, int iter)   { return 1024u * (uint32_t)(tid + 1) +
                                                  256u * (uint32_t)(iter & 3); }
+
+/* Leave the immediate context's work retired, not merely flushed: some
+ * D3DMetal versions stall process exit for tens of seconds (or hang in the
+ * kernel) when a flushed command buffer is never waited on. */
+void retire_d3d11(ID3D11Device* dev, ID3D11DeviceContext* ctx) {
+    if (!t_gpu_queue_alive_d3d11(dev, ctx, 20000))
+        g_fail.fetch_add(1);
+}
 
 /* == Phase 1: concurrent device creation ================================== */
 
@@ -213,7 +223,7 @@ void phase_same_device_d3d11() {
         ts.emplace_back(churn_d3d11, dev.ptr(), &b, t);
     for (auto& t : ts)
         t.join();
-    ctx->Flush();
+    retire_d3d11(dev.ptr(), ctx.ptr());
 }
 
 /* == Phase 3: one D3D12 device, N threads, NT-handle round trips ========== */
@@ -352,7 +362,7 @@ void phase_fences() {
         ts.emplace_back(churn_fences, dev5.ptr(), d12.ptr(), &b, t);
     for (auto& t : ts)
         t.join();
-    ctx->Flush();
+    retire_d3d11(dev.ptr(), ctx.ptr());
 }
 
 } // namespace
