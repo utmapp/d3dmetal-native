@@ -274,6 +274,31 @@ heap_import = executable('heap-import-test',
   link_with: dmn_lib)
 test('heap-import', heap_import, env: ['DMN_LOG=info'], timeout: 300)
 
+# Windowless: how much memory does each shared path actually cost? Holds N large
+# resources down every hooked producer/export/import entry point, with an
+# unshared control beside each, and measures both the bytes RESERVED and the
+# bytes the machine is actually HOLDING. Catches paths where the substitution is
+# additive rather than substitutive (one resource, two allocations) and paths
+# where placed resources fail to alias — neither of which any other test can
+# see, since they all check the bytes and never how many allocations hold them.
+#
+# Slow by construction: each case is measured twice in-process for the reserved
+# figure, and once more in a FRESH CHILD process for the resident figure,
+# because freed pages are not reclaimed until something needs them and only
+# process exit returns them unconditionally. Hence the long timeout.
+#
+# FAILS on resident memory (DMN_FP_MAX_RESIDENT, default 1.6x) and on a
+# non-aliasing import; over-reservation that stays virtual is reported, not
+# fatal. DMN_FP_REPORT=1 downgrades to report-only, DMN_FP_STRICT=1 also fails
+# on warnings.
+shared_footprint = executable('shared-footprint-test',
+  ['shared_footprint_test.cpp', 'metal_alloc_size.mm'],
+  include_directories: [test_native_inc, include_directories('../src')],
+  link_with: dmn_lib,
+  dependencies: [cocoa_deps])
+test('shared-footprint', shared_footprint, env: ['DMN_LOG=error'],
+     is_parallel: false, timeout: 2400)
+
 # Windowless: D3D11 variant shared entry points (CreateTexture2D1 producer,
 # OpenSharedResource1 consumer).
 d3d11_variants = executable('d3d11-variants-test',
