@@ -455,10 +455,9 @@ int main(int argc, char** argv) {
     /* Per-kind, so a failure names the resource kind that grew rather than
      * leaving the total to be bisected by hand.
      *
-     * Opt-in: it repeats the churn once per kind, which multiplies the runtime
-     * and, on GPTk 4.0b1, the exposure to the shared-D3D11-fence wedge this
-     * suite has an open issue for. It is the tool for attributing the aggregate
-     * number above, not something every run needs. */
+     * Opt-in: it repeats the churn once per kind, which multiplies the runtime.
+     * It is the tool for attributing the aggregate number above, not something
+     * every run needs. */
     int kind_failed = 0;
     if (getenv("CHURN_PER_KIND")) {
         int krc = measure_per_kind();

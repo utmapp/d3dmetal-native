@@ -33,7 +33,12 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdlib>
+#include <deque>
+#include <functional>
 #include <mutex>
 #include <new>
 #include <thread>
@@ -81,6 +86,16 @@ struct GpuFence {
     ID3D12GraphicsCommandList2* helperList = nullptr;
     uint64_t                    seq = 0;
 
+    /* Every gpufence_signal_d3d12 ends with helperQ->Signal(drainF, ++drainSeq),
+     * and the keepalive refuses to release the real fence until drainF has
+     * reached drainSeq. That one condition rules out two hazards: the helper
+     * queue cannot still hold a Wait on a fence the framework is freeing,
+     * and — because Metal's completion queue is serial and the drain signal
+     * completes after the real fence's — the real fence's own completion
+     * callback has already run, so freeing it cannot race that callback. */
+    ID3D12Fence*                drainF = nullptr;
+    std::atomic<uint64_t>       drainSeq{0};
+
     /* D3D11: the slot is a plain page of shared memory, written from the CPU
      * on completion; nothing on the GPU side refers to it. */
     int                         d11slot_fd = -1; /* owned */
@@ -125,38 +140,38 @@ void register_producer(IUnknown* fence, GpuFence* gf) {
              (unsigned long long)gf->initial);
 }
 
-/* Free everything a GpuFence owns. The D3D12 helper queue is drained first —
- * bounded, since a pending Wait whose value never arrives (app destroyed the
- * fence early) must not hang the app's Release call. */
+/* Free everything a GpuFence owns. Runs off the app thread (see
+ * dmn_fd3d_fence_destroy), so it may block: the D3D12 helper queue must be
+ * idle before its objects go — a fence released under a pending signal, or a
+ * command list under an in-flight execution, takes the Metal queue down with
+ * it. drainF is signalled after every helper submission, and the keepalive
+ * holds the producer until the drain has caught up, so by the time the fence
+ * can be destroyed the wait below is normally already satisfied. If it is
+ * not, the helper objects are leaked rather than released under work. */
 void gpufence_teardown(GpuFence* gf) {
-    if (gf->is_d3d12 && gf->helperQ) {
-        ID3D12Device* dev = nullptr;
-        if (SUCCEEDED(gf->helperQ->GetDevice(__uuidof(ID3D12Device),
-                                             reinterpret_cast<void**>(&dev))) && dev) {
-            ID3D12Fence* drain = nullptr;
-            if (SUCCEEDED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE,
-                                           __uuidof(ID3D12Fence),
-                                           reinterpret_cast<void**>(&drain))) && drain) {
-                std::lock_guard<std::mutex> lk(gf->mtx);
-                gf->helperQ->Signal(drain, 1);
-                void* ev = dmn_event_create(1, 0);
-                if (ev && SUCCEEDED(drain->SetEventOnCompletion(1, ev))) {
-                    if (dmn_event_wait(ev, 250ull * 1000 * 1000) != DMN_WAIT_SIGNALED)
-                        DMN_WARN("fence: helper-queue drain timed out on "
-                                 "teardown (pending Wait never satisfied?)");
-                }
-                if (ev)
-                    dmn_event_close(ev);
-                drain->Release();
-            }
-            dev->Release();
+    bool helper_idle = true;
+    if (gf->is_d3d12 && gf->drainF) {
+        const uint64_t want = gf->drainSeq.load(std::memory_order_acquire);
+        void* ev = dmn_event_create(1, 0);
+        if (dmn_hooks_f12_completed_orig(gf->drainF) < want) {
+            if (ev && SUCCEEDED(dmn_hooks_f12_seoc_orig(gf->drainF, want, ev)))
+                dmn_event_wait(ev, 5000ull * 1000 * 1000);
+            helper_idle = dmn_hooks_f12_completed_orig(gf->drainF) >= want;
         }
+        if (ev)
+            dmn_event_close(ev);
+        if (!helper_idle)
+            DMN_WARN("fence: helper queue still busy at teardown; leaking its "
+                     "objects rather than releasing them under pending work");
     }
-    if (gf->helperList) gf->helperList->Release();
-    for (int i = 0; i < GpuFence::kRing; i++)
-        if (gf->helperAlloc[i]) gf->helperAlloc[i]->Release();
-    if (gf->helperQ) gf->helperQ->Release();
-    if (gf->d12buf) gf->d12buf->Release();
+    if (helper_idle) {
+        if (gf->helperList) gf->helperList->Release();
+        for (int i = 0; i < GpuFence::kRing; i++)
+            if (gf->helperAlloc[i]) gf->helperAlloc[i]->Release();
+        if (gf->drainF) gf->drainF->Release();
+        if (gf->helperQ) gf->helperQ->Release();
+        if (gf->d12buf) gf->d12buf->Release();
+    }
     if (gf->d11slot_fd >= 0) close(gf->d11slot_fd);
     if (gf->view) dmn_shared_fence_close(gf->view);
     delete gf;
@@ -202,32 +217,77 @@ bool gpufence_setup_d3d12(ID3D12Device* dev, GpuFence* gf) {
         return false;
     }
     gf->gpuVA = gf->d12buf->GetGPUVirtualAddress();
+    return true;
+}
 
-    /* Helper queue + allocator ring + list for the Wait + timed write. */
+/* The helper queue, allocator ring, list and drain fence behind a D3D12
+ * producer's stores. Built on the first Signal, not at create: a fence that is
+ * exported and never signalled from this process (a consumer's signal-back
+ * fence, say) then costs no Metal command queue — and command queues are what
+ * make process teardown slow or fragile on some framework versions. */
+bool gpufence_helper_ensure(GpuFence* gf) {
+    if (gf->helperQ)
+        return true;
+    ID3D12Device* dev = nullptr;
+    auto* rf = reinterpret_cast<ID3D12Fence*>(gf->realFence);
+    if (FAILED(rf->GetDevice(__uuidof(ID3D12Device),
+                             reinterpret_cast<void**>(&dev))) || !dev)
+        return false;
     D3D12_COMMAND_QUEUE_DESC qd{};
     qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-    hr = dev->CreateCommandQueue(&qd, __uuidof(ID3D12CommandQueue),
-                                 reinterpret_cast<void**>(&gf->helperQ));
-    if (FAILED(hr)) { DMN_ERROR("fence: helper queue 0x%08x", (unsigned)hr); return false; }
-    for (int i = 0; i < GpuFence::kRing; i++) {
+    HRESULT hr = dev->CreateCommandQueue(&qd, __uuidof(ID3D12CommandQueue),
+                                         reinterpret_cast<void**>(&gf->helperQ));
+    if (FAILED(hr)) { DMN_ERROR("fence: helper queue 0x%08x", (unsigned)hr); }
+    for (int i = 0; SUCCEEDED(hr) && i < GpuFence::kRing; i++) {
         hr = dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
                                          __uuidof(ID3D12CommandAllocator),
                                          reinterpret_cast<void**>(&gf->helperAlloc[i]));
-        if (FAILED(hr)) { DMN_ERROR("fence: helper alloc 0x%08x", (unsigned)hr); return false; }
+        if (FAILED(hr)) { DMN_ERROR("fence: helper alloc 0x%08x", (unsigned)hr); }
     }
-    ID3D12GraphicsCommandList* l0 = nullptr;
-    hr = dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, gf->helperAlloc[0],
-                                nullptr, __uuidof(ID3D12GraphicsCommandList),
-                                reinterpret_cast<void**>(&l0));
-    if (FAILED(hr) || !l0) { DMN_ERROR("fence: helper list 0x%08x", (unsigned)hr); return false; }
-    hr = l0->QueryInterface(__uuidof(ID3D12GraphicsCommandList2),
-                            reinterpret_cast<void**>(&gf->helperList));
-    l0->Release();
-    if (FAILED(hr) || !gf->helperList) {
-        DMN_ERROR("fence: GraphicsCommandList2 unavailable 0x%08x", (unsigned)hr);
+    if (SUCCEEDED(hr)) {
+        ID3D12GraphicsCommandList* l0 = nullptr;
+        hr = dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                    gf->helperAlloc[0], nullptr,
+                                    __uuidof(ID3D12GraphicsCommandList),
+                                    reinterpret_cast<void**>(&l0));
+        if (FAILED(hr) || !l0) {
+            DMN_ERROR("fence: helper list 0x%08x", (unsigned)hr);
+            hr = FAILED(hr) ? hr : E_FAIL;
+        } else {
+            hr = l0->QueryInterface(__uuidof(ID3D12GraphicsCommandList2),
+                                    reinterpret_cast<void**>(&gf->helperList));
+            l0->Release();
+            if (FAILED(hr) || !gf->helperList) {
+                DMN_ERROR("fence: GraphicsCommandList2 unavailable 0x%08x",
+                          (unsigned)hr);
+                hr = FAILED(hr) ? hr : E_FAIL;
+            } else {
+                gf->helperList->Close(); /* created open; each signal resets it */
+            }
+        }
+    }
+    if (SUCCEEDED(hr)) {
+        hr = dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence),
+                              reinterpret_cast<void**>(&gf->drainF));
+        if (FAILED(hr) || !gf->drainF) {
+            DMN_ERROR("fence: drain fence 0x%08x", (unsigned)hr);
+            hr = FAILED(hr) ? hr : E_FAIL;
+        }
+    }
+    dev->Release();
+    if (FAILED(hr)) {
+        /* Nothing was submitted; releasing the partial set is safe. */
+        if (gf->helperList) gf->helperList->Release();
+        for (int i = 0; i < GpuFence::kRing; i++)
+            if (gf->helperAlloc[i]) gf->helperAlloc[i]->Release();
+        if (gf->drainF) gf->drainF->Release();
+        if (gf->helperQ) gf->helperQ->Release();
+        gf->helperList = nullptr;
+        for (int i = 0; i < GpuFence::kRing; i++) gf->helperAlloc[i] = nullptr;
+        gf->drainF = nullptr;
+        gf->helperQ = nullptr;
         return false;
     }
-    gf->helperList->Close(); /* created open; each signal resets it */
     return true;
 }
 
@@ -236,6 +296,11 @@ bool gpufence_setup_d3d12(ID3D12Device* dev, GpuFence* gf) {
  * value crossing a 32-bit boundary under-reports rather than over-reports). */
 void gpufence_signal_d3d12(GpuFence* gf, UINT64 value) {
     std::lock_guard<std::mutex> lk(gf->mtx);
+    if (!gpufence_helper_ensure(gf)) {
+        DMN_ERROR("fence: no helper queue; value %llu is not published to "
+                  "peers", (unsigned long long)value);
+        return;
+    }
     auto* rf = reinterpret_cast<ID3D12Fence*>(gf->realFence);
     ID3D12CommandAllocator* alloc = gf->helperAlloc[gf->seq++ % GpuFence::kRing];
     HRESULT hrw = gf->helperQ->Wait(rf, value);
@@ -250,6 +315,10 @@ void gpufence_signal_d3d12(GpuFence* gf, UINT64 value) {
     HRESULT hrc = gf->helperList->Close();
     ID3D12CommandList* lists[] = {gf->helperList};
     gf->helperQ->ExecuteCommandLists(1, lists);
+    /* Drain marker AFTER the store: the keepalive holds the real fence until
+     * this value is observed (see GpuFence::drainF). */
+    gf->helperQ->Signal(gf->drainF,
+                        gf->drainSeq.fetch_add(1, std::memory_order_acq_rel) + 1);
     if (FAILED(hrw) || FAILED(hra) || FAILED(hrr) || FAILED(hrc))
         DMN_WARN("fence: D3D12 slot store for value=%llu: Wait=0x%08x "
                  "allocReset=0x%08x listReset=0x%08x Close=0x%08x",
@@ -395,6 +464,51 @@ void arm_signal_store(dmn_shared_fence_t view, FenceT* f, UINT64 value) {
     }).detach();
 }
 
+/* == Teardown reaper ======================================================
+ * One thread runs every fence teardown, in order. A thread per teardown would
+ * let hundreds of Metal queue finalizations run concurrently and, at process
+ * exit, leave some of them half done when the process is torn down — which
+ * some framework versions turn into a multi-second or indefinite kernel-side
+ * exit. The atexit hook waits (bounded) for the reaper to drain first. */
+std::mutex g_reaper_mtx;
+std::condition_variable g_reaper_cv;
+std::deque<std::function<void()>> g_reaper_q;
+bool g_reaper_started = false;
+bool g_reaper_busy = false;
+
+void reaper_main() {
+    std::unique_lock<std::mutex> lk(g_reaper_mtx);
+    for (;;) {
+        g_reaper_cv.wait(lk, [] { return !g_reaper_q.empty(); });
+        std::function<void()> job = std::move(g_reaper_q.front());
+        g_reaper_q.pop_front();
+        g_reaper_busy = true;
+        lk.unlock();
+        job();
+        lk.lock();
+        g_reaper_busy = false;
+        g_reaper_cv.notify_all();
+    }
+}
+
+void reaper_drain_at_exit() {
+    std::unique_lock<std::mutex> lk(g_reaper_mtx);
+    g_reaper_cv.wait_for(lk, std::chrono::seconds(5), [] {
+        return g_reaper_q.empty() && !g_reaper_busy;
+    });
+}
+
+void reaper_enqueue(std::function<void()> job) {
+    std::lock_guard<std::mutex> lk(g_reaper_mtx);
+    if (!g_reaper_started) {
+        g_reaper_started = true;
+        std::thread(reaper_main).detach();
+        atexit(reaper_drain_at_exit);
+    }
+    g_reaper_q.push_back(std::move(job));
+    g_reaper_cv.notify_all();
+}
+
 } // namespace
 
 /* == Producer API ========================================================== */
@@ -447,19 +561,29 @@ void dmn_fd3d_fence_destroy(void* identity) {
             g_import_reg.erase(ii);
         }
     }
-    if (gf) {
-        gpufence_teardown(gf);
-        DMN_INFO("fence: destroyed producer identity=%p", identity);
-    }
-    if (imp) {
-        if (imp->d11mt)
-            imp->d11mt->Release();
-        dmn_shared_fence_close(imp->view);
-        if (imp->pod.fd >= 0)
-            close(imp->pod.fd);
-        delete imp;
-        DMN_INFO("fence: destroyed import identity=%p", identity);
-    }
+    if (!gf && !imp)
+        return;
+    /* Only the unlink above may run on this thread. This is called from the
+     * eviction sentinel, whose final Release happens inside the framework's
+     * fence destructor with the fence's own lock held; the teardown releases
+     * D3D objects whose destruction can wait on Metal's serial completion
+     * queue, whose current callback may itself be waiting for that lock.
+     * The reaper does the real work outside every framework lock. */
+    reaper_enqueue([gf, imp, identity]() {
+        if (gf) {
+            gpufence_teardown(gf);
+            DMN_INFO("fence: destroyed producer identity=%p", identity);
+        }
+        if (imp) {
+            if (imp->d11mt)
+                imp->d11mt->Release();
+            dmn_shared_fence_close(imp->view);
+            if (imp->pod.fd >= 0)
+                close(imp->pod.fd);
+            delete imp;
+            DMN_INFO("fence: destroyed import identity=%p", identity);
+        }
+    });
 }
 
 /* The slot pod + live view of a fence that is a producer or an import; false
@@ -512,6 +636,10 @@ struct PendingSignal {
     IUnknown* fence;   /* +1 held here */
     UINT64    value;
     bool      is_d3d12;
+    GpuFence* gf;      /* producer state, or null. Valid for as long as the
+                          entry holds `fence`: destruction-driven eviction (the
+                          only thing that frees a GpuFence) cannot run while
+                          this reference is outstanding. */
 };
 
 /* A D3D11 context batches commands, so a signalled value only retires once the
@@ -531,10 +659,29 @@ std::mutex g_keep_mtx;
 std::vector<PendingSignal> g_keep; /* oldest first */
 bool g_keep_complained = false;
 
+/* The fence's OWN completed value — deliberately not the hooked, slot-merged
+ * one: the slot can hold V (a peer's signal-back) while the fence's own signal
+ * command is still queued, and releasing on that reading destroys the fence
+ * under a pending signal. */
 UINT64 pending_completed(const PendingSignal& p) {
     return p.is_d3d12
-        ? reinterpret_cast<ID3D12Fence*>(p.fence)->GetCompletedValue()
-        : reinterpret_cast<ID3D11Fence*>(p.fence)->GetCompletedValue();
+        ? dmn_hooks_f12_completed_orig(reinterpret_cast<ID3D12Fence*>(p.fence))
+        : dmn_hooks_f11_completed_orig(reinterpret_cast<ID3D11Fence*>(p.fence));
+}
+
+/* May the fence's last reference be dropped for this signal? The value being
+ * observed is NOT enough for a shared D3D12 producer: the helper queue may
+ * still hold a Wait on the fence, and the fence's own completion callback may
+ * still be queued. The drain fence proves both are past (see
+ * GpuFence::drainF). */
+bool pending_done(const PendingSignal& p) {
+    if (pending_completed(p) < p.value)
+        return false;
+    if (p.gf && p.gf->drainF &&
+        p.gf->drainF->GetCompletedValue() <
+            p.gf->drainSeq.load(std::memory_order_acquire))
+        return false;
+    return true;
 }
 
 /* Reap entries the GPU has caught up with, oldest-first order preserved.
@@ -543,7 +690,7 @@ UINT64 pending_completed(const PendingSignal& p) {
 void reap_locked(std::vector<IUnknown*>& done) {
     size_t keep = 0;
     for (size_t i = 0; i < g_keep.size(); i++) {
-        if (pending_completed(g_keep[i]) >= g_keep[i].value)
+        if (pending_done(g_keep[i]))
             done.push_back(g_keep[i].fence);
         else
             g_keep[keep++] = g_keep[i];
@@ -558,13 +705,14 @@ void reap_locked(std::vector<IUnknown*>& done) {
 }
 
 size_t keepalive_add(IUnknown* fence, UINT64 value, bool is_d3d12) {
+    GpuFence* gf = lookup_producer(fence); /* stays valid while we hold +1 */
     std::vector<IUnknown*> done;
     size_t pending;
     {
         std::lock_guard<std::mutex> lk(g_keep_mtx);
         reap_locked(done);
         fence->AddRef();
-        g_keep.push_back({fence, value, is_d3d12});
+        g_keep.push_back({fence, value, is_d3d12, gf});
         pending = g_keep.size();
     }
     for (IUnknown* f : done)

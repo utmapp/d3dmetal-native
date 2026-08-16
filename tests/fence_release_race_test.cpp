@@ -24,14 +24,11 @@
  *      "hold until the GPU catches up" must not become "hold forever". Measured
  *      as fd growth across rounds, which is where an unbounded hold shows up.
  *
- * The shared-D3D11-fence variant is NOT asserted by default, and that is a
- * finding rather than an omission: with the keepalive in place it still wedges
- * GPTk 4.0b1 (uninterruptible, no Metal error logged), which is the open
- * impostor-lifetime problem — a shared producer fence's companion buffer is
- * shared memory this library owns, and the GPU still has work referencing it.
- * lifecycle-churn covers shared fences in a pattern that does survive. Set
- * FENCERACE_SHARED_D3D11=1 to run it as a reproducer; it is kept here so
- * whoever fixes that has one ready.
+ * Both are run for plain and SHARED fences on both APIs. Shared producer fences
+ * add their own hazards to the same rule: their teardown must run outside the
+ * framework's fence lock, a D3D12 producer's helper queue must be idle before
+ * the fence goes, and completion must be judged by the fence's OWN value (the
+ * shared slot can read V while the fence's signal is still queued).
  *
  * Windowless, single process. Prints "FENCERACE: PASS".
  */
@@ -202,13 +199,13 @@ int run() {
        "D3D11CreateDevice");
     if (race_d3d11(dev.ptr(), ctx.ptr(), /*shared=*/false) != 0)
         return 1;
-    if (getenv("FENCERACE_SHARED_D3D11")) {
+    /* FENCERACE_SKIP_SHARED_D3D11=1 stands this leg down if a framework ever
+     * needs that while its own fix is pending. */
+    if (!getenv("FENCERACE_SKIP_SHARED_D3D11")) {
         if (race_d3d11(dev.ptr(), ctx.ptr(), /*shared=*/true) != 0)
             return 1;
     } else {
-        printf(T_TAG ": D3D11 shared fences not run (set "
-               "FENCERACE_SHARED_D3D11=1; still wedges GPTk 4.0b1 — see the "
-               "header)\n");
+        printf(T_TAG ": D3D11 shared fences skipped by request\n");
     }
 
     T_PASS();
