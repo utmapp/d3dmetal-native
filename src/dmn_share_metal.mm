@@ -24,11 +24,15 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/posix_shm.h>
+#include <sys/proc_info.h>
+#include <sys/stat.h>
+#include <libproc.h>
 #include <unistd.h>
 
 #include <atomic>
 #include <mutex>
 #include <set>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -173,6 +177,109 @@ void pin_buffer_to_texture(id<MTLTexture> tex, id<MTLBuffer> buf) {
 
 /* == Thread-local arm ===================================================== */
 thread_local DmnShareArm t_arm = {};
+
+/* == Same-process buffer alias cache ======================================
+ * Two MTLBuffers over the same shm pages are invisible to Metal's hazard
+ * tracking: a GPU write through one and a GPU read through the other have no
+ * dependency edge, so Metal may reorder them, and a same-process
+ * OpenSharedResource + CopyResource can read the bytes from before the
+ * producer's write. D3D11 promises in-order execution on the immediate
+ * context, so aliased backings must be ONE Metal object.
+ *
+ * Every buffer substitution over shared memory therefore registers itself
+ * here under (shm object identity, byte offset), and a later substitution of
+ * the same window returns the SAME MTLBuffer (+1) when the device matches and
+ * the cached mapping covers the requested span. References are weak
+ * (objc_storeWeak works without ARC), so the cache never extends a backing's
+ * lifetime — a dead entry reads back nil and is replaced.
+ *
+ * Identity is the pshm_name from proc_pidfdinfo(PROC_PIDFDPSHMINFO): on macOS
+ * every POSIX shm fd fstat()s as st_dev=0 st_ino=0, so an inode key would
+ * hand unrelated objects at equal offsets the same MTLBuffer. The name
+ * survives the immediate shm_unlink and is shared by every dup and every fd
+ * received over SCM_RIGHTS. An fd that is neither a POSIX shm object nor a
+ * real file (dmn_open_existing_heap_from_fd takes what it is given) is not
+ * cached at all: a private mapping per substitution, never a wrong alias. */
+struct AliasKey {
+    std::string name; /* pshm_name, or "ino:<dev>:<ino>" for a real file */
+    uint64_t    off;
+    bool operator==(const AliasKey& o) const {
+        return off == o.off && name == o.name;
+    }
+};
+struct AliasKeyHash {
+    size_t operator()(const AliasKey& k) const {
+        return std::hash<std::string>()(k.name) * 31u ^
+               std::hash<uint64_t>()(k.off);
+    }
+};
+struct AliasSlot {
+    id weak_buf = nil; /* managed via objc_storeWeak / objc_loadWeak */
+};
+std::mutex g_alias_mtx;
+std::unordered_map<AliasKey, AliasSlot*, AliasKeyHash> g_alias_cache;
+
+bool alias_key_of(int fd, uint64_t off, AliasKey* out) {
+    struct pshm_fdinfo pi;
+    const int n = proc_pidfdinfo(getpid(), fd, PROC_PIDFDPSHMINFO, &pi,
+                                 sizeof pi);
+    if (n >= (int)sizeof pi && pi.pshminfo.pshm_name[0]) {
+        out->name.assign(pi.pshminfo.pshm_name,
+                         strnlen(pi.pshminfo.pshm_name,
+                                 sizeof pi.pshminfo.pshm_name));
+        out->off = off;
+        return true;
+    }
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_ino == 0)
+        return false; /* no usable identity: do not cache */
+    char b[64];
+    snprintf(b, sizeof b, "ino:%llu:%llu", (unsigned long long)st.st_dev,
+             (unsigned long long)st.st_ino);
+    out->name = b;
+    out->off = off;
+    return true;
+}
+
+/* A live cached buffer for the window, +1, or nil. `need_len` is the mapped
+ * span the caller would otherwise create — the cached object must cover it. */
+id<MTLBuffer> alias_cache_lookup(id<MTLDevice> device, int fd, uint64_t off,
+                                 size_t need_len) {
+    AliasKey key;
+    if (!alias_key_of(fd, off, &key))
+        return nil;
+    AliasSlot* slot;
+    {
+        std::lock_guard<std::mutex> lk(g_alias_mtx);
+        auto it = g_alias_cache.find(key);
+        if (it == g_alias_cache.end())
+            return nil;
+        slot = it->second;
+    }
+    id buf;
+    @autoreleasepool { /* objc_loadWeak returns +0 autoreleased; pin it */
+        buf = [objc_loadWeak(&slot->weak_buf) retain];
+    }
+    if (!buf)
+        return nil;
+    id<MTLBuffer> b = (id<MTLBuffer>)buf;
+    if ([b device] != device || [b length] < need_len) {
+        [b release];
+        return nil;
+    }
+    return b; /* +1 */
+}
+
+void alias_cache_store(int fd, uint64_t off, id<MTLBuffer> buf) {
+    AliasKey key;
+    if (!alias_key_of(fd, off, &key))
+        return;
+    std::lock_guard<std::mutex> lk(g_alias_mtx);
+    AliasSlot*& slot = g_alias_cache[key];
+    if (!slot)
+        slot = new AliasSlot();
+    objc_storeWeak(&slot->weak_buf, buf);
+}
 
 /* == Create-time zero-fill defence ========================================
  * GPTk 1.0, 2.1 and 3.0 memset a new buffer's contents to zero synchronously
@@ -544,6 +651,7 @@ id<MTLTexture> substitute_producer(id<MTLDevice> device,
         close(fd);
         return nil;
     }
+    alias_cache_store(fd, 0, buf); /* same-process opens alias this object */
 
     id<MTLTexture> tex = make_linear_texture(buf, desc, layout, /*producer=*/true);
     if (!tex) {
@@ -604,20 +712,29 @@ id<MTLTexture> substitute_consumer(id<MTLDevice> device,
     layout.mapped = page_align(layout.logical);
 
     /* The fd belongs to the caller on this path — never closed here, and never
-     * handed to the buffer's deallocator. */
+     * handed to the buffer's deallocator. Reuse a live impostor over the same
+     * span when one exists (see the alias cache): each import still gets its
+     * own MTLTexture, but over the SAME buffer, so Metal orders aliased
+     * accesses. */
     const int fd = t_arm.existing_fd;
-    void* ptr = mmap(nullptr, layout.mapped, PROT_READ | PROT_WRITE, MAP_SHARED,
-                     fd, 0);
-    if (ptr == MAP_FAILED) {
+    id<MTLBuffer> buf = alias_cache_lookup(device, fd, 0, layout.mapped);
+    void* ptr = nullptr;
+    if (buf) {
+        DMN_INFO("share: consumer texture reuses cached impostor backing");
+    } else if ((ptr = mmap(nullptr, layout.mapped, PROT_READ | PROT_WRITE,
+                           MAP_SHARED, fd, 0)) == MAP_FAILED) {
         DMN_ERROR("share: consumer mmap(fd=%d, %zu) failed: %s", fd,
                   layout.mapped, strerror(errno));
         return nil;
     }
-    id<MTLBuffer> buf = shared_buffer_over(device, ptr, layout.mapped);
     if (!buf) {
-        DMN_ERROR("share: consumer newBufferWithBytesNoCopy failed");
-        munmap(ptr, layout.mapped);
-        return nil;
+        buf = shared_buffer_over(device, ptr, layout.mapped);
+        if (!buf) {
+            DMN_ERROR("share: consumer newBufferWithBytesNoCopy failed");
+            munmap(ptr, layout.mapped);
+            return nil;
+        }
+        alias_cache_store(fd, 0, buf);
     }
 
     id<MTLTexture> tex = make_linear_texture(buf, desc, layout, /*producer=*/false);
@@ -692,6 +809,8 @@ id<MTLBuffer> substitute_buffer(id<MTLDevice> device, NSUInteger length) {
         }
         buf.label = @"dmn-shared-prod-buffer";
         sub_resource_track(buf, both);
+        alias_cache_store(fd, 0, buf); /* a same-process import must alias
+                                          THIS object, not a second mapping */
 
         t_arm.captured = true;
         t_arm.out_fd   = fd;
@@ -738,31 +857,45 @@ id<MTLBuffer> substitute_buffer(id<MTLDevice> device, NSUInteger length) {
     }
     const int fd = t_arm.existing_fd;
 
-    /* Deliberately NOT served from the shared-mapping cache. For a texture the
-     * cache hands back a shared MTLBuffer and each import still gets its own
-     * MTLTexture on top; here the MTLBuffer *is* the resource, so a cache hit
-     * would give two D3D buffers the same Metal object and alias whatever
-     * per-resource state D3DMetal keeps on it. Buffer imports are rare (fence
-     * pages) and do not churn per frame, so a private mapping each time is the
-     * right trade. */
-    void* ptr = mmap(nullptr, mapped, PROT_READ | PROT_WRITE, MAP_SHARED, fd,
-                     (off_t)t_arm.existing_offset);
-    if (ptr == MAP_FAILED) {
-        DMN_ERROR("share: consumer buffer mmap(fd=%d, off=%llu, %zu) failed: "
-                  "%s", fd, (unsigned long long)t_arm.existing_offset, mapped,
-                  strerror(errno));
-        return nil;
+    /* Reuse a live impostor over the same window: two D3D buffers fronting
+     * ONE MTLBuffer is what lets Metal's hazard tracking order a write through
+     * one against a read through the other (see the alias cache above). A
+     * fresh private mapping is the fallback, with the hazard hole it implies —
+     * cross-process aliases always take it, and their ordering is the
+     * exporting app's business (fences, keyed mutex). */
+    id<MTLBuffer> buf =
+        alias_cache_lookup(device, fd, t_arm.existing_offset, mapped);
+    if (buf) {
+        DMN_INFO("share: consumer buffer reuses cached impostor (off=%llu "
+                 "len=%zu)", (unsigned long long)t_arm.existing_offset, mapped);
+        /* The cached object may have been created as a TEXTURE backing, whose
+         * residency rides the texture — as a standalone buffer resource it
+         * must be tracked itself. Idempotent for an already-tracked buffer. */
+        sub_resource_track(buf, both);
+    } else {
+        void* ptr = mmap(nullptr, mapped, PROT_READ | PROT_WRITE, MAP_SHARED,
+                         fd, (off_t)t_arm.existing_offset);
+        if (ptr == MAP_FAILED) {
+            DMN_ERROR("share: consumer buffer mmap(fd=%d, off=%llu, %zu) "
+                      "failed: %s", fd,
+                      (unsigned long long)t_arm.existing_offset, mapped,
+                      strerror(errno));
+            return nil;
+        }
+        buf = shared_buffer_over(device, ptr, mapped);
+        if (!buf) {
+            DMN_ERROR("share: consumer buffer newBufferWithBytesNoCopy failed");
+            munmap(ptr, mapped);
+            return nil;
+        }
+        buf.label = window ? @"dmn-imported-heap-window"
+                           : @"dmn-shared-cons-buffer";
+        sub_resource_track(buf, both);
+        alias_cache_store(fd, t_arm.existing_offset, buf);
     }
-    id<MTLBuffer> buf = shared_buffer_over(device, ptr, mapped);
-    if (!buf) {
-        DMN_ERROR("share: consumer buffer newBufferWithBytesNoCopy failed");
-        munmap(ptr, mapped);
-        return nil;
-    }
-    buf.label = window ? @"dmn-imported-heap-window" : @"dmn-shared-cons-buffer";
-    sub_resource_track(buf, both);
     /* The bytes behind this impostor are somebody's: protect them from a
-     * zero-filling create (see the defence above). */
+     * zero-filling create (see the defence above). [buf contents] is the
+     * mapping either way — a fresh one, or the cached impostor's. */
     snapshot_for_restore([buf contents], (size_t)[buf length]);
 
     t_arm.captured = true;

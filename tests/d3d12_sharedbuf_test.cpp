@@ -8,6 +8,9 @@
  *     buffer.
  *  2. Opening a buffer leaves the producer's bytes intact (an import must never
  *     initialise the memory it aliases).
+ *  3. Two shared buffers opened in one process stay distinct: a GPU write
+ *     through one import lands in that buffer's memory and in no other's, and
+ *     is visible through the producer's own view of the same buffer.
  *
  * Prints "SHAREDBUF: PASS" and exits 0 on success.
  */
@@ -153,7 +156,7 @@ int main() {
     printf("SHAREDBUF: export+import round trip ok (%llu-byte buffer)\n",
            (unsigned long long)id.Width);
 
-    /* 2) GPU data flow through the handle. */
+    /* 2 + 3: GPU data flow through the handles. */
     {
         const uint64_t kSz = 1ull << 20;
         Copier gpu;
@@ -207,8 +210,42 @@ int main() {
                "opening A disturbed the bytes the producer wrote");
         printf("SHAREDBUF: producer bytes intact across an open\n");
 
+        /* 3) Write B THROUGH its import; only B's memory may change, and A's
+         * own view must still see A's bytes. */
+        Com<ID3D12Resource> b2;
+        CK(device->OpenSharedHandle(hb, __uuidof(ID3D12Resource), (void**)&b2),
+           "OpenSharedHandle(B)");
+        EXPECT(gpu.copy(b2.ptr(), srcB.ptr(), kSz), "GPU copy into B via import");
+        EXPECT(count_bad(pb, 0xB0B00000u, (size_t)kSz) == 0,
+               "GPU write through B's import did not reach B's memory");
+        EXPECT(count_bad(pa, 0xA0A00000u, (size_t)kSz) == 0,
+               "GPU write through B's import changed A — two shared buffers "
+               "share one Metal backing");
+        /* And back through the producer's own resource: copy B into a
+         * readback via the producer-side object. */
+        D3D12_HEAP_PROPERTIES rb = {};
+        rb.Type = D3D12_HEAP_TYPE_READBACK;
+        Com<ID3D12Resource> read;
+        CK(device->CreateCommittedResource(&rb, D3D12_HEAP_FLAG_NONE, &drd,
+                                           D3D12_RESOURCE_STATE_COPY_DEST,
+                                           nullptr, __uuidof(ID3D12Resource),
+                                           (void**)&read), "readback");
+        EXPECT(gpu.copy(read.ptr(), b.ptr(), kSz), "GPU copy B -> readback");
+        {
+            void* p = nullptr;
+            CK(read->Map(0, nullptr, &p), "Map(readback)");
+            int bad = 0;
+            const uint32_t* w = (const uint32_t*)p;
+            for (uint64_t i = 0; i < kSz / 4; i += 61)
+                if (w[i] != pattern(0xB0B00000u, i))
+                    bad++;
+            D3D12_RANGE none{0, 0};
+            read->Unmap(0, &none);
+            EXPECT(bad == 0, "producer view of B does not see the import's write");
+        }
         dmn_shared_handle_close(ha);
         dmn_shared_handle_close(hb);
+        printf("SHAREDBUF: GPU write via import lands in its own object only\n");
     }
 
     T_PASS();
