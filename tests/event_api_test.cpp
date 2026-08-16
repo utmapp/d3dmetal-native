@@ -7,8 +7,9 @@
  * handles. Covers Win32 CreateEvent semantics (manual/auto reset, initial
  * state, auto-reset consuming exactly one waiter), the pollable dup_fd view
  * (readability tracking signal/clear transitions, fds surviving
- * dmn_event_close, auto-reset waits clearing readability), and the
- * non-event-handle failure paths.
+ * dmn_event_close, auto-reset waits clearing readability, a pre-signaled
+ * auto-reset event priming a later dup_fd), and the non-event-handle failure
+ * paths.
  *
  * Prints "EVENTS: PASS" and exits 0.
  */
@@ -169,7 +170,32 @@ int main() {
         printf("EVENTS: dup_fd survives close ok\n");
     }
 
-    /* 8) Non-event handles: rejected without crashing. */
+    /* 8) An already-signaled AUTO-reset event dup'd afterwards primes the fd:
+     * the peek that seeds the pipe must not consume the trigger, so a later
+     * wait still sees the signal — and a second signal that lands right after
+     * a wait consumed the first keeps the fd readable. */
+    {
+        void* ev = dmn_event_create(0, 0);
+        EXPECT(ev, "create failed");
+        dmn_event_signal(ev);
+        int fd = dmn_event_dup_fd(ev);
+        EXPECT(fd >= 0, "dup_fd failed");
+        EXPECT(fd_readable(fd, 1000), "fd not primed for a pre-signaled auto-reset event");
+        EXPECT(dmn_event_wait(ev, kShortNs) == DMN_WAIT_SIGNALED,
+               "priming the fd consumed the auto-reset trigger");
+        EXPECT(!fd_readable(fd, 0), "fd readable after the wait consumed the trigger");
+        dmn_event_signal(ev);
+        dmn_event_signal(ev); /* second signal while still signaled */
+        EXPECT(dmn_event_wait(ev, kShortNs) == DMN_WAIT_SIGNALED, "wait after double signal");
+        EXPECT(dmn_event_wait(ev, kShortNs) == DMN_WAIT_TIMEOUT,
+               "auto-reset released a second waiter for one signaled state");
+        EXPECT(!fd_readable(fd, 0), "fd readable after the state was consumed");
+        close(fd);
+        dmn_event_close(ev);
+        printf("EVENTS: auto-reset peek/dup_fd priming ok\n");
+    }
+
+    /* 9) Non-event handles: rejected without crashing. */
     {
         uint32_t bogus = 0;
         EXPECT(dmn_event_dup_fd(&bogus) == -1, "dup_fd accepted a non-event");

@@ -131,15 +131,24 @@ void set_cloexec_nonblock(int fd) {
         fcntl(fd, F_SETFL, stflags | O_NONBLOCK);
 }
 
-/* Non-consuming peek for whether the trigger is pending.  Only valid for
- * manual-reset events: their registration has no EV_CLEAR, so a zero-timeout
- * kevent read does not consume the trigger.  Auto-reset would be consumed. */
+/* Peek at the signaled state (kept in lockstep with dxmt_native_event.c).
+ * Manual-reset: a zero-timeout read is non-consuming (no EV_CLEAR).
+ * Auto-reset: the read consumes the trigger, so re-arm it with NOTE_TRIGGER
+ * -- a waiter whose wakeup this stole is re-woken by the re-trigger, and the
+ * state stays signaled throughout. Without the auto-reset peek, an
+ * already-signaled auto-reset event dup'd afterwards would prime no pipe
+ * token. */
 bool event_peek_signaled(DmnEventCore* c) {
-    if (!c->manual_reset)
-        return false;
     struct kevent out;
     struct timespec zero = {0, 0};
-    return kevent(c->kq, nullptr, 0, &out, 1, &zero) > 0;
+    if (kevent(c->kq, nullptr, 0, &out, 1, &zero) <= 0)
+        return false;
+    if (!c->manual_reset) {
+        struct kevent ev;
+        EV_SET(&ev, 1, EVFILT_USER, 0, NOTE_TRIGGER, 0, nullptr);
+        kevent(c->kq, &ev, 1, nullptr, 0, nullptr);
+    }
+    return true;
 }
 
 void pipe_write_token(int w) {
@@ -295,10 +304,16 @@ dmn_wait_status event_wait(DmnEvent* e, uint64_t timeout_ns) {
              * trigger, so the pollable pipe must clear too — this waiter is the
              * consumer that won the race (Win32 semantics; see the header's
              * dmn_event_dup_fd caveat). Manual-reset events stay signaled until
-             * an explicit clear, so their pipe is left alone. */
+             * an explicit clear, so their pipe is left alone.
+             * The drain can also eat the token of a SECOND signal that landed
+             * after our kevent consumed the trigger; if the event is signaled
+             * again already, put a token back so the exported fd stays in sync
+             * with the kqueue state. */
             if (!e->core->manual_reset) {
                 std::lock_guard<std::mutex> lk(e->core->pipe_mtx);
                 pipe_drain(e->core->pipe_r);
+                if (event_peek_signaled(e->core))
+                    pipe_write_token(e->core->pipe_w);
             }
             return DMN_WAIT_SIGNALED;
         }
