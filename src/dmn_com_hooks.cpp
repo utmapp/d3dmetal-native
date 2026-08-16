@@ -1526,10 +1526,17 @@ UINT64 STDMETHODCALLTYPE hook_f11_GetCompletedValue(ID3D11Fence* This) {
 HRESULT STDMETHODCALLTYPE hook_f11_SetEventOnCompletion(
         ID3D11Fence* This, UINT64 value, HANDLE ev) {
     auto orig = DMN_ORIG(f11_SetEventOnCompletion, This);
+    /* Pin ev BEFORE the registration: the moment orig registers it,
+     * D3DMetal's completion (fired on its own safe duplicate) can land and
+     * the caller may close ev in response -- while the slot watcher below
+     * still has to signal it.  The watcher owns and closes the pin. */
+    void* pin = ev ? dmn_event_duplicate(ev) : nullptr;
     HRESULT hr = orig ? orig(This, value, ev) : E_FAIL;
     /* Also watch the shared slot so consumer signal-back releases waiters. */
-    if (SUCCEEDED(hr))
-        dmn_fd3d_watch_slot(This, value, ev);
+    if (SUCCEEDED(hr) && pin)
+        dmn_fd3d_watch_slot(This, value, pin);
+    else if (pin)
+        dmn_event_close(pin);
     return hr;
 }
 
@@ -1811,9 +1818,13 @@ UINT64 STDMETHODCALLTYPE hook_f12_GetCompletedValue(ID3D12Fence* This) {
 HRESULT STDMETHODCALLTYPE hook_f12_SetEventOnCompletion(
         ID3D12Fence* This, UINT64 value, HANDLE ev) {
     auto orig = DMN_ORIG(f12_SetEventOnCompletion, This);
+    /* Same pin-before-registration as hook_f11_SetEventOnCompletion. */
+    void* pin = ev ? dmn_event_duplicate(ev) : nullptr;
     HRESULT hr = orig ? orig(This, value, ev) : E_FAIL;
-    if (SUCCEEDED(hr))
-        dmn_fd3d_watch_slot(This, value, ev);
+    if (SUCCEEDED(hr) && pin)
+        dmn_fd3d_watch_slot(This, value, pin);
+    else if (pin)
+        dmn_event_close(pin);
     return hr;
 }
 

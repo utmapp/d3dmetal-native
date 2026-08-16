@@ -8,8 +8,8 @@
  * state, auto-reset consuming exactly one waiter), the pollable dup_fd view
  * (readability tracking signal/clear transitions, fds surviving
  * dmn_event_close, auto-reset waits clearing readability, a pre-signaled
- * auto-reset event priming a later dup_fd), and the non-event-handle failure
- * paths.
+ * auto-reset event priming a later dup_fd), dmn_event_duplicate, and the
+ * non-event-handle failure paths.
  *
  * Prints "EVENTS: PASS" and exits 0.
  */
@@ -195,7 +195,35 @@ int main() {
         printf("EVENTS: auto-reset peek/dup_fd priming ok\n");
     }
 
-    /* 9) Non-event handles: rejected without crashing. */
+    /* 9) dmn_event_duplicate: a second handle onto the same state. Signals
+     * through either are seen by both, and the state (and a dup_fd of it)
+     * survives closing the original — the property that lets a completion
+     * path pin an event the owner may close as soon as it fires. */
+    {
+        void* ev = dmn_event_create(1, 0);
+        EXPECT(ev, "create failed");
+        void* dup = dmn_event_duplicate(ev);
+        EXPECT(dup && dup != ev, "duplicate failed");
+        dmn_event_signal(dup);
+        EXPECT(dmn_event_wait(ev, kShortNs) == DMN_WAIT_SIGNALED,
+               "signal through the duplicate not seen by the original");
+        dmn_event_clear(ev);
+        EXPECT(dmn_event_wait(dup, kShortNs) == DMN_WAIT_TIMEOUT,
+               "clear through the original not seen by the duplicate");
+        int fd = dmn_event_dup_fd(ev);
+        dmn_event_close(ev); /* the owner is done with it */
+        dmn_event_signal(dup);
+        EXPECT(dmn_event_wait(dup, kShortNs) == DMN_WAIT_SIGNALED,
+               "duplicate dead after the original was closed");
+        EXPECT(fd_readable(fd, 1000), "fd taken from the original missed a signal via the duplicate");
+        close(fd);
+        dmn_event_close(dup);
+        uint32_t bogus = 0;
+        EXPECT(dmn_event_duplicate(&bogus) == nullptr, "duplicate accepted a non-event");
+        printf("EVENTS: duplicate ok\n");
+    }
+
+    /* 10) Non-event handles: rejected without crashing. */
     {
         uint32_t bogus = 0;
         EXPECT(dmn_event_dup_fd(&bogus) == -1, "dup_fd accepted a non-event");

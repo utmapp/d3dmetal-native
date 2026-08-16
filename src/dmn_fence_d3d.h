@@ -90,7 +90,13 @@ UINT64 dmn_fd3d_completed_merge(IUnknown* fence, UINT64 from_fence);
 
 /* SetEventOnCompletion companion: also release `event` when the shared slot
  * reaches `value` (covers cross-process progress the local fence never
- * sees). Returns false (and does nothing) for foreign fences. */
+ * sees). Returns false for foreign fences.
+ *
+ * Takes ownership of `event` on every path and closes it when done.  Pass a
+ * dmn_event_duplicate taken BEFORE the real SetEventOnCompletion registered
+ * the original handle: once any registration on the event fires, its owner
+ * may close the original, and this watcher signals strictly later than
+ * that. */
 bool dmn_fd3d_watch_slot(IUnknown* fence, UINT64 value, HANDLE event);
 
 /* == Consumer side ======================================================== */

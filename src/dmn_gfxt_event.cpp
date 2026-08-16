@@ -600,16 +600,7 @@ void* DmnGFXTEvent::DuplicateEvent(void* handle) {
      * so a signal on the duplicate is visible both to an in-process waiter and
      * to a poller that dup'd the original's fd — the property D3DMetal's
      * version-3 duplicate-then-signal-async completion path relies on. */
-    DmnEvent* e = as_event(handle);
-    if (!e)
-        return nullptr;
-    auto* d = static_cast<DmnEvent*>(::malloc(sizeof(DmnEvent)));
-    if (!d)
-        return nullptr;
-    core_ref(e->core);
-    d->magic = kEventMagic;
-    d->core  = e->core;
-    return d;
+    return dmn_event_duplicate(handle);
 }
 
 void* DmnGFXTEvent::DuplicateSemaphore(void* handle) {
@@ -665,6 +656,19 @@ extern "C" void dmn_event_close(void* handle) {
     core_unref(e->core);
     e->magic = 0;
     ::free(e);
+}
+
+extern "C" void* dmn_event_duplicate(void* handle) {
+    DmnEvent* e = as_event(handle);
+    if (!e)
+        return nullptr;
+    auto* d = static_cast<DmnEvent*>(::malloc(sizeof(DmnEvent)));
+    if (!d)
+        return nullptr;
+    core_ref(e->core);
+    d->magic = kEventMagic;
+    d->core  = e->core;
+    return d;
 }
 
 extern "C" int dmn_event_dup_fd(void* handle) {

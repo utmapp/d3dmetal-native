@@ -689,21 +689,29 @@ UINT64 dmn_fd3d_completed_merge(IUnknown* fence, UINT64 from_fence) {
 bool dmn_fd3d_watch_slot(IUnknown* fence, UINT64 value, HANDLE event) {
     dmn_shared_fence_handle pod{};
     dmn_shared_fence_t view = nullptr;
-    if (!event || !fence_slot(fence, &pod, &view) || !view)
+    if (!event)
         return false;
+    if (!fence_slot(fence, &pod, &view) || !view) {
+        dmn_event_close(event);
+        return false;
+    }
     if (dmn_shared_fence_get_completed(view) >= value) {
         dmn_event_signal(event);
+        dmn_event_close(event);
         return true;
     }
     /* The watcher gets its own mapping of the slot: the registered view is
      * torn down when the fence is destroyed, which must not yank the mapping
      * from under a thread that legitimately outlives it. */
     dmn_shared_fence_t watch = dmn_shared_fence_open(&pod);
-    if (!watch)
+    if (!watch) {
+        dmn_event_close(event);
         return false;
+    }
     std::thread([watch, value, event]() {
         dmn_shared_fence_wait(watch, value, DMN_WAIT_INFINITE);
         dmn_event_signal(event);
+        dmn_event_close(event);
         dmn_shared_fence_close(watch);
     }).detach();
     return true;

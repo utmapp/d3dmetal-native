@@ -194,6 +194,15 @@ void dmn_event_clear(void* handle);
  * fds returned by dmn_event_dup_fd survive the close. */
 void dmn_event_close(void* handle);
 
+/* Second, independent HANDLE onto the same event (DuplicateHandle analog):
+ * signal/clear/dup_fd through either act on the one shared state, which
+ * lives until every handle onto it is closed.  Use it to pin an event
+ * across a deferred signal: the moment any completion registered on the
+ * event fires, its owner may close the original handle, and a signal path
+ * still holding that original would then touch freed state.  NULL if
+ * handle is not an event. */
+void* dmn_event_duplicate(void* handle);
+
 /* Pollable view of an event: returns a NEW fd (caller owns; close(2) it)
  * that polls readable (POLLIN) while the event is signaled and unreadable
  * while it is clear. Backed by a pipe whose readable state mirrors the

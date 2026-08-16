@@ -19,6 +19,9 @@
  *     the duplicate; the pollable fd (a cross-process pipe, unlike the in-proc
  *     kqueue wait of (3)) must still become readable. Regression guard: the
  *     duplicate has to carry the same exported pipe as the original.
+ *  7. The event is closed by its owner as soon as D3DMetal's completion fires,
+ *     while this library's slot watcher for the same registration is still
+ *     pending: the watcher must own its own handle onto the event.
  *
  * Prints "FEVENTS: PASS" and exits 0 on success.
  */
@@ -262,6 +265,35 @@ after_xapi:
             printf("FEVENTS: ID3D12Device1 unavailable; pollable multi-wait "
                    "skipped\n");
         }
+    }
+
+    /* 7) The event's owner may close it the moment ANY registration on it
+     *    fires. D3DMetal's own completion fires first; the slot watcher this
+     *    library adds fires strictly later, so it must be holding its own
+     *    handle onto the event rather than the caller's. Repeated to give a
+     *    stale-handle signal every chance to hit freed state. */
+    {
+        for (int i = 0; i < 100; i++) {
+            void* ev = dmn_event_create(0, 0);
+            EXPECT(ev, "event create failed");
+            v++;
+            ID3D12Fence* f = (i & 1) ? imp.ptr() : prod.ptr();
+            CK(f->SetEventOnCompletion(v, ev), "SetEventOnCompletion(close-race)");
+            CK(queue->Signal(prod.ptr(), v), "queue Signal(close-race)");
+            EXPECT(dmn_event_wait(ev, kLongNs) == DMN_WAIT_SIGNALED,
+                   "close-race event did not fire");
+            dmn_event_close(ev); /* watcher may not have signaled yet */
+        }
+        /* Let every pending watcher run against the closed handles. */
+        {
+            void* ev = dmn_event_create(1, 0);
+            v++;
+            CK(prod->SetEventOnCompletion(v, ev), "SetEventOnCompletion(drain)");
+            CK(queue->Signal(prod.ptr(), v), "queue Signal(drain)");
+            EXPECT(dmn_event_wait(ev, kLongNs) == DMN_WAIT_SIGNALED, "drain event");
+            dmn_event_close(ev);
+        }
+        printf("FEVENTS: event closed right after completion, %d rounds ok\n", 100);
     }
 
     CK(dmn_shared_handle_close(h) == DMN_SUCCESS ? S_OK : E_FAIL,
