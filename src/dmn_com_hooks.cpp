@@ -1396,7 +1396,15 @@ HRESULT STDMETHODCALLTYPE hook_d3d11_CreateFence(
     auto orig = DMN_ORIG(d3d11_CreateFence, This);
     if (!orig)
         return E_FAIL;
-    HRESULT hr = orig(This, initial, flags, iid, out);
+    /* The framework never sees the SHARED flag: sharing is implemented
+     * entirely here (companion slot), so D3DMetal's own D3D11 shared-fence
+     * machinery would only add an unused second mechanism with its own
+     * failure modes. The fence is created PLAIN and our sharing is layered on
+     * top, exactly as imports already do (dmn_fd3d_import_d3d11 creates with
+     * FLAG_NONE). */
+    const D3D11_FENCE_FLAG fwd =
+        (D3D11_FENCE_FLAG)(flags & ~D3D11_FENCE_FLAG_SHARED);
+    HRESULT hr = orig(This, initial, fwd, iid, out);
     if (FAILED(hr) || !out || !*out)
         return hr;
     /* Only shared fences get a companion buffer; leave plain fences alone. */
