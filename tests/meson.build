@@ -52,6 +52,16 @@ format_caps_test = executable('format-caps-test',
   link_with: dmn_lib)
 test('format-caps', format_caps_test, env: ['DMN_LOG=info'], timeout: 300)
 
+# What container shapes does D3DMetal accept for SM 6.0 DXIL shaders?  The
+# guest UMD receives BARE DXIL program parts from the Windows runtime and must
+# re-wrap them; this measures how much container that wrapper needs.
+dxil_container_probe = executable('dxil-container-probe',
+  'dxil_container_probe.cpp',
+  include_directories: test_native_inc,
+  link_with: dmn_lib)
+test('dxil-container-probe', dxil_container_probe, env: ['DMN_LOG=info'],
+     timeout: 300)
+
 # Windowless: CreateBlendState1 must hand back a usable blend state. Also
 # reports what the framework does unaided, so an upstream fix — after which the
 # dmn_com_hooks repair is dead code — shows up in the test log.
