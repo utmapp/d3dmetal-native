@@ -1176,13 +1176,37 @@ void install_swizzles(Class cls, const SwizzleJob* jobs, size_t njobs,
                  class_getName(cls));
 }
 
+/* == Allocation trace (DMN_LOG=trace) =====================================
+ * One line per Metal allocation D3DMetal makes through the hooked creators —
+ * what it asked for, whether the arm substituted it, and (for buffers/heaps)
+ * where it landed. Cheap when disabled, so it is always compiled in. */
+void trace_alloc(const char* what, bool substituted, unsigned long long bytes,
+                 const char* extra) {
+    if (!dmn_log_enabled(DMN_LOG_TRACE))
+        return;
+    DMN_TRACE("alloc: %-12s %s %llu bytes%s%s", what,
+              substituted ? "SUBST" : "orig ", bytes, extra ? " " : "",
+              extra ? extra : "");
+}
+
+const char* tex_desc_str(MTLTextureDescriptor* d, char* buf, size_t n) {
+    snprintf(buf, n, "tex %lux%lu fmt=%lu type=%lu mips=%lu usage=0x%lx "
+             "storage=%lu", (unsigned long)d.width, (unsigned long)d.height,
+             (unsigned long)d.pixelFormat, (unsigned long)d.textureType,
+             (unsigned long)d.mipmapLevelCount, (unsigned long)d.usage,
+             (unsigned long)d.storageMode);
+    return buf;
+}
+
 /* Device dedicated path: -[dev newTextureWithDescriptor:] */
 id swz_dev_newtex(id self, SEL _cmd, MTLTextureDescriptor* desc) {
     IMP orig = lookup_orig(object_getClass(self), _cmd);
+    char tb[160];
     if (t_arm.armed && t_arm.kind == DMN_SHARE_TEXTURE) {
         id<MTLTexture> sub = substitute((id<MTLDevice>)self, desc);
         if (sub) {
             t_arm.armed = false; /* disarm on first hit */
+            trace_alloc("dev_newtex", true, 0, tex_desc_str(desc, tb, sizeof tb));
             return sub;
         }
         DMN_WARN("share: armed dev newTextureWithDescriptor: not substituted; "
@@ -1192,6 +1216,7 @@ id swz_dev_newtex(id self, SEL _cmd, MTLTextureDescriptor* desc) {
         DMN_ERROR("share: no original for dev newTextureWithDescriptor:");
         return nil;
     }
+    trace_alloc("dev_newtex", false, 0, tex_desc_str(desc, tb, sizeof tb));
     return ((id (*)(id, SEL, MTLTextureDescriptor*))orig)(self, _cmd, desc);
 }
 
@@ -1200,11 +1225,13 @@ id swz_dev_newtex(id self, SEL _cmd, MTLTextureDescriptor* desc) {
 id swz_heap_newtex(id self, SEL _cmd, MTLTextureDescriptor* desc,
                    NSUInteger offset) {
     IMP orig = lookup_orig(object_getClass(self), _cmd);
+    char tb[160];
     if (t_arm.armed && t_arm.kind == DMN_SHARE_TEXTURE) {
         id<MTLHeap> heap = (id<MTLHeap>)self;
         id<MTLTexture> sub = substitute([heap device], desc);
         if (sub) {
             t_arm.armed = false;
+            trace_alloc("heap_newtex", true, 0, tex_desc_str(desc, tb, sizeof tb));
             return sub;
         }
         DMN_WARN("share: armed heap newTextureWithDescriptor:offset: not "
@@ -1213,6 +1240,12 @@ id swz_heap_newtex(id self, SEL _cmd, MTLTextureDescriptor* desc,
     if (!orig) {
         DMN_ERROR("share: no original for heap newTextureWithDescriptor:offset:");
         return nil;
+    }
+    if (dmn_log_enabled(DMN_LOG_TRACE)) {
+        char eb[220];
+        snprintf(eb, sizeof eb, "%s off=%lu heap=%p", tex_desc_str(desc, tb, sizeof tb),
+                 (unsigned long)offset, (void*)self);
+        trace_alloc("heap_newtex", false, 0, eb);
     }
     return ((id (*)(id, SEL, MTLTextureDescriptor*, NSUInteger))orig)(
         self, _cmd, desc, offset);
@@ -1225,6 +1258,7 @@ id swz_dev_newbuf(id self, SEL _cmd, NSUInteger length, MTLResourceOptions opts)
         id<MTLBuffer> sub = substitute_buffer((id<MTLDevice>)self, length);
         if (sub) {
             t_arm.armed = false;
+            trace_alloc("dev_newbuf", true, length, nullptr);
             return sub;
         }
         DMN_WARN("share: armed dev newBufferWithLength:options: not "
@@ -1233,6 +1267,11 @@ id swz_dev_newbuf(id self, SEL _cmd, NSUInteger length, MTLResourceOptions opts)
     if (!orig) {
         DMN_ERROR("share: no original for dev newBufferWithLength:options:");
         return nil;
+    }
+    if (dmn_log_enabled(DMN_LOG_TRACE)) {
+        char eb[64];
+        snprintf(eb, sizeof eb, "opts=0x%lx", (unsigned long)opts);
+        trace_alloc("dev_newbuf", false, length, eb);
     }
     return ((id (*)(id, SEL, NSUInteger, MTLResourceOptions))orig)(
         self, _cmd, length, opts);
@@ -1249,6 +1288,7 @@ id swz_heap_newbuf(id self, SEL _cmd, NSUInteger length, MTLResourceOptions opts
         id<MTLBuffer> sub = substitute_buffer([heap device], length);
         if (sub) {
             t_arm.armed = false;
+            trace_alloc("heap_newbuf", true, length, nullptr);
             return sub;
         }
         DMN_WARN("share: armed heap newBufferWithLength:options:offset: not "
@@ -1257,6 +1297,12 @@ id swz_heap_newbuf(id self, SEL _cmd, NSUInteger length, MTLResourceOptions opts
     if (!orig) {
         DMN_ERROR("share: no original for heap newBufferWithLength:options:offset:");
         return nil;
+    }
+    if (dmn_log_enabled(DMN_LOG_TRACE)) {
+        char eb[96];
+        snprintf(eb, sizeof eb, "opts=0x%lx off=%lu heap=%p", (unsigned long)opts,
+                 (unsigned long)offset, (void*)self);
+        trace_alloc("heap_newbuf", false, length, eb);
     }
     return ((id (*)(id, SEL, NSUInteger, MTLResourceOptions, NSUInteger))orig)(
         self, _cmd, length, opts, offset);
@@ -1285,6 +1331,13 @@ id swz_dev_newheap(id self, SEL _cmd, MTLHeapDescriptor* desc) {
         : nil;
     if (heap)
         ensure_heap_class_swizzled(object_getClass(heap));
+    if (dmn_log_enabled(DMN_LOG_TRACE)) {
+        char eb[96];
+        snprintf(eb, sizeof eb, "type=%lu storage=%lu heap=%p",
+                 (unsigned long)desc.type, (unsigned long)desc.storageMode,
+                 (void*)heap);
+        trace_alloc("dev_newheap", false, (unsigned long long)desc.size, eb);
+    }
     return heap;
 }
 
