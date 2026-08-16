@@ -1240,6 +1240,42 @@ HRESULT import_buffer_d3d12(ID3D12Device* dev, const dmn_shared_buffer_handle* p
     return hr;
 }
 
+/* Open a shared-heap handle (a buffer-magic POD carrying the heap's whole
+ * window; see hook_d3d12_CreateSharedHandle) as a synthetic heap of our own.
+ * The framework is never involved, and placements on the opened heap window
+ * the same shm object as the exporter's, so cross-process placements at one
+ * offset alias exactly like local ones. */
+HRESULT import_heap_d3d12(ID3D12Device* dev, const dmn_shared_buffer_handle* pod,
+                          REFIID riid, void** out) {
+    if (!pod_version_ok(pod->version, "heap"))
+        return E_INVALIDARG;
+    if (!pod->size || pod->size > (1ull << 32) ||
+        (pod->offset & (dmn_share_page_align(1) - 1))) {
+        DMN_ERROR("hooks: shared-heap import geometry out of range "
+                  "(size=%llu offset=%llu)", (unsigned long long)pod->size,
+                  (unsigned long long)pod->offset);
+        return E_INVALIDARG;
+    }
+    const int owned = pod->fd >= 0 ? fcntl(pod->fd, F_DUPFD_CLOEXEC, 0) : -1;
+    if (owned < 0) {
+        DMN_ERROR("hooks: shared-heap import dup(fd=%d) failed", pod->fd);
+        return E_FAIL;
+    }
+    D3D12_HEAP_DESC hd{};
+    hd.SizeInBytes = pod->size;
+    hd.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+    hd.Alignment = 0;
+    hd.Flags = D3D12_HEAP_FLAG_SHARED;
+    HRESULT hr = synth_heap_new(reinterpret_cast<IUnknown*>(dev), hd, owned,
+                                pod->offset, pod->size, /*imported=*/false,
+                                riid, out);
+    if (SUCCEEDED(hr))
+        DMN_INFO("hooks: opened shared heap size=%llu off=%llu as %p",
+                 (unsigned long long)pod->size,
+                 (unsigned long long)pod->offset, *out);
+    return hr;
+}
+
 /* Shared import dispatch for the D3D11 OpenSharedResource variants.
  *
  * Returns false when `handle` is not one of ours, which is the caller's cue to
@@ -2534,6 +2570,27 @@ HRESULT STDMETHODCALLTYPE hook_d3d12_CreateSharedHandle(
         ID3D12Device* This, ID3D12DeviceChild* object,
         const SECURITY_ATTRIBUTES* attr, DWORD access, const WCHAR* name,
         HANDLE* out) {
+    /* A heap is a legal argument here (MSDN: heap, resource, or fence) and
+     * SHARED heaps are synthetic — D3DMetal must never receive one, so this
+     * check runs before every fall-through, including the null-out one. The
+     * handle is a buffer-magic POD carrying the heap's whole window;
+     * OpenSharedHandle with IID_ID3D12Heap turns it back into a synthetic
+     * heap. */
+    if (DmnSynthHeap* sh = as_synth_heap(reinterpret_cast<ID3D12Heap*>(object))) {
+        if (!out)
+            return E_INVALIDARG;
+        dmn_shared_buffer_handle pod{};
+        pod.magic = DMN_SHARED_BUFFER_MAGIC;
+        pod.version = DMN_SHARED_HANDLE_VERSION;
+        pod.fd = sh->fd; /* vend_pod_owned dups it */
+        pod.size = sh->size;
+        pod.offset = sh->fd_off;
+        HRESULT hr = vend_pod_owned(pod, out);
+        if (SUCCEEDED(hr))
+            DMN_INFO("hooks: exported NT heap handle %p (size=%llu)", *out,
+                     (unsigned long long)sh->size);
+        return hr;
+    }
     if (object && out) {
         auto* unk = reinterpret_cast<IUnknown*>(object);
         if (SUCCEEDED(return_fence_pod(unk, out)))
@@ -2584,9 +2641,14 @@ HRESULT STDMETHODCALLTYPE hook_d3d12_OpenSharedHandle(
         if (magic == DMN_SHARED_TEXTURE_MAGIC)
             return import_texture_d3d12(
                 This, reinterpret_cast<dmn_shared_texture_handle*>(handle), riid, out);
-        if (magic == DMN_SHARED_BUFFER_MAGIC)
-            return import_buffer_d3d12(
-                This, reinterpret_cast<dmn_shared_buffer_handle*>(handle), riid, out);
+        if (magic == DMN_SHARED_BUFFER_MAGIC) {
+            auto* pod = reinterpret_cast<dmn_shared_buffer_handle*>(handle);
+            /* The riid says what the handle referred to: a heap handle is
+             * opened as a (synthetic) heap, anything else as a buffer. */
+            if (dmn_iid_eq(riid, __uuidof(ID3D12Heap)))
+                return import_heap_d3d12(This, pod, riid, out);
+            return import_buffer_d3d12(This, pod, riid, out);
+        }
     }
     auto orig = DMN_ORIG(d3d12_OpenSharedHandle, This);
     return orig ? orig(This, handle, riid, out) : E_NOTIMPL;

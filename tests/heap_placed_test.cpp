@@ -10,6 +10,8 @@
  *     readable through a re-export from the OPENED resource (same memory).
  *  3b. Buffers placed at one nonzero offset alias each other; the exported POD
  *     carries the placement offset and an opened copy maps the same window.
+ *  3c. The heap itself is shareable: a placement in the OPENED heap aliases
+ *     the exporter's placement at the same offset.
  *  3d. A GPU write through a placed buffer lands in the heap's object and in
  *     no other live shared object's.
  *  3e. A texture placed at a nonzero offset exports/opens with that offset.
@@ -248,6 +250,57 @@ int main() {
         dmn_shared_handle_close(ha);
         printf("HEAP: placed buffers alias at offset %llu\n",
                (unsigned long long)kOff);
+    }
+
+    /* 3c) The heap ITSELF is shareable (MSDN: CreateSharedHandle takes a
+     * heap, resource, or fence). A buffer placed in the OPENED heap at the
+     * same offset must alias the original heap's placements — what sharing a
+     * heap means. */
+    {
+        const uint64_t kOff = 64 * 1024, kSz = 64 * 1024;
+        HANDLE hh = nullptr;
+        CK(dev->CreateSharedHandle(heap.ptr(), nullptr, 0, nullptr, &hh),
+           "CreateSharedHandle(heap)");
+        Com<ID3D12Heap> opened_heap;
+        CK(dev->OpenSharedHandle(hh, __uuidof(ID3D12Heap),
+                                 (void**)&opened_heap),
+           "OpenSharedHandle(heap)");
+        D3D12_HEAP_DESC ohd = opened_heap->GetDesc();
+        EXPECT(ohd.SizeInBytes == hd.SizeInBytes,
+               "opened heap desc size mismatch");
+
+        D3D12_RESOURCE_DESC bd{};
+        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bd.Width = kSz;
+        bd.Height = 1;
+        bd.DepthOrArraySize = 1;
+        bd.MipLevels = 1;
+        bd.SampleDesc.Count = 1;
+        bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        Com<ID3D12Resource> bo;
+        CK(dev->CreatePlacedResource(opened_heap.ptr(), kOff, &bd,
+                                     D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                     __uuidof(ID3D12Resource), (void**)&bo),
+           "CreatePlacedResource(opened heap)");
+        HANDLE hbo = nullptr;
+        CK(dev->CreateSharedHandle(bo.ptr(), nullptr, 0, nullptr, &hbo),
+           "CreateSharedHandle(buffer on opened heap)");
+        auto* po = (dmn_shared_buffer_handle*)hbo;
+        EXPECT(po->offset == kOff, "opened-heap placement lost its offset");
+        void* wo = mmap(nullptr, (size_t)kSz, PROT_READ, MAP_SHARED, po->fd,
+                        (off_t)po->offset);
+        EXPECT(wo != MAP_FAILED, "mmap(opened-heap placement) failed");
+        /* 3b left 0xC0FFEE01 at heap offset 64K through the ORIGINAL heap's
+         * placements; the opened heap's placement must read the same bytes. */
+        uint32_t seen = 0;
+        memcpy(&seen, wo, sizeof(seen));
+        EXPECT(seen == 0xC0FFEE01u,
+               "placement in an opened shared heap does not alias the "
+               "exporter's heap memory");
+        munmap(wo, (size_t)kSz);
+        dmn_shared_handle_close(hbo);
+        dmn_shared_handle_close(hh);
+        printf("HEAP: heap handle round trip ok (opened placement aliases)\n");
     }
 
     /* 3d) A GPU write through a placed buffer lands in THE HEAP'S object and
