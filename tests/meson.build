@@ -160,6 +160,11 @@ shared_srv_sample_test = executable('shared-srv-sample-test',
   include_directories: test_native_inc,
   link_with: dmn_lib)
 test('shared-srv-sample', shared_srv_sample_test, env: ['DMN_LOG=info'], timeout: 300)
+# The same sample with the impostor residency set switched off, so the
+# per-command-buffer useResources: path (macOS < 15, sparse textures) keeps a
+# bindlessly bound impostor resident too.
+test('shared-srv-sample-no-residency-set', shared_srv_sample_test,
+     env: ['DMN_LOG=info', 'DMN_RESIDENCY_SET=0'], timeout: 300)
 
 # A rejected call must leave nothing behind: no crash, no fds, no threads.
 # Interception starts work before it knows the call will succeed, so this is

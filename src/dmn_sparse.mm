@@ -18,7 +18,7 @@
 #include "dmn_private.h"
 #include "dmn_sparse.h"
 
-extern "C" void dmn_sub_resource_track(id res, unsigned long usage);
+extern "C" void dmn_sub_resource_track(id res, int sparse);
 
 namespace {
 
@@ -686,7 +686,7 @@ extern "C" id dmn_sparse_try_substitute(id device, MTLTextureDescriptor* desc) {
                  (unsigned long)desc.mipmapLevelCount, (unsigned long)desc.usage);
         return nil;
     }
-    dmn_sub_resource_track(tex, MTLResourceUsageRead | MTLResourceUsageWrite);
+    dmn_sub_resource_track(tex, /*sparse=*/1);
     g_chunks[(size_t)ci].reserved_bytes += (int64_t)reserve;
     t_captured_chunk = (size_t)ci;
     t_captured_reserve = reserve;

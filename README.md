@@ -129,6 +129,7 @@ over a Unix socket) and write back into the received copy before
 | `DMN_VSYNC` | `0`/`1`: sets `displaySyncEnabled` on the presentation layer. |
 | `DMN_RETINA` | Opt into the window's real backing scale (default is 1x, point == pixel). |
 | `DMN_PRESENT_FALLBACK` | Present the last vended drawable from the host side if D3DMetal's own present path does not. |
+| `DMN_RESIDENCY_SET` | `0` declares every substituted resource's GPU residency with a per-command-buffer `useResources:` batch instead of the `MTLResidencySet` used on macOS 15+ (sparse textures always take the per-command-buffer path). |
 | `DMN_SPARSE` | `0` disables sparse backing of D3D12 reserved (tiled) resources; they are then fully backed committed textures. |
 | `DMN_SPARSE_HEAP_MB` / `DMN_SPARSE_HEAP_MAX_MB` | Size of each sparse heap chunk (default 1024), and the largest chunk that may be opened for a single reserved resource that needs more than that (default 4096). |
 | `DMN_SPARSE_MAX_MB` | A hard cap on the total across sparse chunks; unset, the budget starts at `DMN_SPARSE_BUDGET_FLOOR_MB` (default 6144) and grows with the tile pools the app names, since it cannot map more tiles than it owns. Reserved resources created past the budget are fully backed. |

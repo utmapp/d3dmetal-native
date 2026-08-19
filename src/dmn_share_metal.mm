@@ -19,6 +19,7 @@
 #import <objc/runtime.h>
 
 #include <errno.h>
+#include <time.h>
 #include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
@@ -350,9 +351,11 @@ void restore_after_create() {
     free(copy);
 }
 
-/* Register a substituted impostor so it is made GPU-resident on every encoder,
- * declaring exactly `usage` (defined with the residency plumbing below). */
-void sub_resource_track(id res, MTLResourceUsage usage);
+/* Register a substituted impostor so it is GPU-resident wherever D3DMetal
+ * binds it bindlessly (defined with the residency plumbing below). `sparse` =
+ * a dmn_sparse heap texture, which can only be declared per command buffer;
+ * everything else may live in a residency set. */
+void sub_resource_track(id res, bool sparse = false);
 
 /* The swizzle registry's reader, defined with the rest of the plumbing below. */
 IMP lookup_orig(Class c, SEL sel);
@@ -439,37 +442,6 @@ void ensure_texture_class_swizzled(id tex);
  * — turning a mapped span into a linear MTLTexture — is make_linear_texture()
  * below, which takes ownership decisions as parameters instead of inferring
  * them. */
-
-/* Residency usage for an impostor, derived from the descriptor it was created
- * with — never from which side of the share we are on. An imported surface can
- * legitimately be a render target, so keying this on producer-vs-consumer
- * would strip access that the resource really has. MTLTextureUsageUnknown (0)
- * means "any usage", and anything we cannot classify falls back to the full
- * set: over-declaring costs hazard-tracking precision, under-declaring is a
- * correctness bug. */
-MTLResourceUsage residency_usage_for(MTLTextureDescriptor* desc) {
-    const MTLResourceUsage both = MTLResourceUsageRead | MTLResourceUsageWrite;
-    if (!desc || desc.usage == MTLTextureUsageUnknown)
-        return both;
-
-    const MTLTextureUsage u = desc.usage;
-    MTLResourceUsage r = 0;
-    if (u & MTLTextureUsageShaderRead)
-        r |= MTLResourceUsageRead;
-    if (u & MTLTextureUsageShaderWrite)
-        r |= MTLResourceUsageWrite;
-    /* A render target is read as well as written: load actions and blending
-     * both sample the existing contents. */
-    if (u & MTLTextureUsageRenderTarget)
-        r |= both;
-    /* MTLTextureUsageShaderAtomic, spelled numerically so this TU still builds
-     * against SDKs predating macOS 14 — the same reason dmn_formats.mm spells
-     * the GPU families numerically. The value is ABI-stable. */
-    if (u & 0x0020)
-        r |= both;
-    /* PixelFormatView alone says nothing about access. */
-    return r ? r : both;
-}
 
 /* Wrap an already-mapped span in a linear MTLTexture matching `desc`, with the
  * surface's first byte at `buf_offset` inside the buffer (0 for a surface that
@@ -583,9 +555,8 @@ id<MTLTexture> make_linear_texture(id<MTLBuffer> buf, MTLTextureDescriptor* desc
         }
     }
 
-    /* Keep resident when bound bindlessly, with the access the descriptor
-     * actually declared. */
-    sub_resource_track(tex, residency_usage_for(desc));
+    /* Keep resident wherever D3DMetal binds it bindlessly. */
+    sub_resource_track(tex);
     ensure_texture_class_swizzled(tex);
     return tex; /* +1, caller owns */
 }
@@ -903,8 +874,6 @@ id<MTLBuffer> substitute_buffer(id<MTLDevice> device, NSUInteger length) {
     if (!device)
         return nil;
 
-    const MTLResourceUsage both = MTLResourceUsageRead | MTLResourceUsageWrite;
-
     if (t_arm.alloc_new) {
         /* Two callers have a say in the size: D3DMetal, via the length it asked
          * Metal for, and the COM layer, via the D3D buffer width it armed with.
@@ -943,7 +912,7 @@ id<MTLBuffer> substitute_buffer(id<MTLDevice> device, NSUInteger length) {
             return nil;
         }
         buf.label = @"dmn-shared-prod-buffer";
-        sub_resource_track(buf, both);
+        sub_resource_track(buf);
         alias_cache_store(fd, 0, buf); /* a same-process import must alias
                                           THIS object, not a second mapping */
 
@@ -1006,7 +975,7 @@ id<MTLBuffer> substitute_buffer(id<MTLDevice> device, NSUInteger length) {
         /* The cached object may have been created as a TEXTURE backing, whose
          * residency rides the texture — as a standalone buffer resource it
          * must be tracked itself. Idempotent for an already-tracked buffer. */
-        sub_resource_track(buf, both);
+        sub_resource_track(buf);
     } else {
         void* ptr = mmap(nullptr, mapped, PROT_READ | PROT_WRITE, MAP_SHARED,
                          fd, (off_t)t_arm.existing_offset);
@@ -1025,7 +994,7 @@ id<MTLBuffer> substitute_buffer(id<MTLDevice> device, NSUInteger length) {
         }
         buf.label = window ? @"dmn-imported-heap-window"
                            : @"dmn-shared-cons-buffer";
-        sub_resource_track(buf, both);
+        sub_resource_track(buf);
         alias_cache_store(fd, t_arm.existing_offset, buf);
     }
     /* The bytes behind this impostor are somebody's: protect them from a
@@ -1217,8 +1186,8 @@ const char* tex_desc_str(MTLTextureDescriptor* d, char* buf, size_t n) {
 }
 
 extern "C" id dmn_sparse_try_substitute(id device, MTLTextureDescriptor* desc);
-extern "C" void dmn_sub_resource_track(id res, unsigned long usage) {
-    sub_resource_track(res, (MTLResourceUsage)usage);
+extern "C" void dmn_sub_resource_track(id res, int sparse) {
+    sub_resource_track(res, sparse != 0);
 }
 
 /* Device dedicated path: -[dev newTextureWithDescriptor:] */
@@ -1385,91 +1354,459 @@ id swz_dev_newheap(id self, SEL _cmd, MTLHeapDescriptor* desc) {
 
 /* == Residency for substituted resources =================================
  * A substituted impostor is a shared-memory MTLBuffer-backed texture/buffer,
- * not placed on one of D3DMetal's heaps. D3DMetal establishes per-encoder GPU
- * residency with useHeap:/useResource: for its OWN heap allocations, so an
- * impostor bound bindlessly through an argument buffer (a D3D descriptor table)
- * never gets a useResource: — the GPU address-faults on the first sample
- * (kIOGPUCommandBufferCallbackErrorPageFault -> SubmissionsIgnored -> the guest
- * device renders permanently black even as flips keep succeeding). Track every
- * substituted resource weakly and useResource: it on every render/compute
- * encoder.
+ * or a sparse-heap texture, not one of D3DMetal's own allocations. D3DMetal
+ * establishes GPU residency for what it owns and nothing else (per-encoder
+ * useHeap:/useResource: below macOS 15; its own MTLResidencySet from 15 on),
+ * so an impostor bound bindlessly through an argument buffer -- a D3D
+ * descriptor table -- is never declared by it, and the GPU address-faults on
+ * the first sample (kIOGPUCommandBufferCallbackErrorPageFault ->
+ * SubmissionsIgnored -> the guest device renders permanently black even as
+ * flips keep succeeding).
  *
- * The declared usage travels with the resource rather than being a constant:
- * see residency_usage_for(). It is stashed as an associated object so it
- * shares the resource's lifetime exactly — a parallel map keyed by pointer
- * would need pruning and would hand a recycled address the previous
- * resource's access. */
-NSHashTable* g_sub_resources;  /* weak MTLResource refs; guarded by g_sub_lock */
+ * Two mechanisms, chosen by what the impostor is:
+ *
+ *  - NON-SPARSE impostors (shm buffers, linear textures over them, imported
+ *    heap windows, IOSurface-backed render-target impostors) go into ONE
+ *    MTLResidencySet per Metal device, attached to every command queue.
+ *    Cost is O(changes), not O(resources x command buffers): an add when the
+ *    impostor is created, a removal when it dies. Nothing per command buffer.
+ *
+ *  - SPARSE-HEAP textures (dmn_sparse, reserved D3D12 resources) can NOT use
+ *    a set: Metal documents that "residency sets don't support sparse heaps
+ *    or sparse textures", and on this driver a sparse texture held only by a
+ *    queue-attached set page-faults once memory pressure has evicted it,
+ *    while the same texture useResource:'d in the encoder reads correctly.
+ *    Declaring one texture does not cover its heap siblings either, and
+ *    useHeap: on a sparse heap crashes inside IOSurfaceBindAccel.  They are
+ *    therefore tracked weakly and declared with a single useResources: batch
+ *    per command buffer.
+ *
+ * Below macOS 15, or with DMN_RESIDENCY_SET=0, there is no set and every
+ * impostor takes the per-command-buffer path.
+ *
+ * Once per command buffer, not per encoder: the IOGPU resource list that
+ * useResources: feeds is per command buffer, and D3DMetal executes command
+ * lists on a concurrent queue, so a per-encoder declaration of thousands of
+ * resources -- and the lock a per-encoder table copy needs -- would
+ * serialize every worker thread on rebuilding that list.
+ *
+ * What is declared is residency, not access: the useResources: call below
+ * passes MTLResourceUsageRead for everything (see the comment there for why a
+ * Write declaration would serialize every encoder against every other one),
+ * and a residency set carries no usage, so no per-resource usage is kept. */
+NSHashTable* g_sub_resources;  /* weak; the per-command-buffer list. g_sub_lock */
 std::mutex   g_sub_lock;
-const void*  kDmnUsageKey = &kDmnUsageKey;
 
-void sub_resource_track(id res, MTLResourceUsage usage) {
+/* True while nothing at all is on the per-command-buffer list -- the steady
+ * state of any workload without reserved resources (all of D3D11, and D3D12
+ * titles that do not use tiled resources). Lets the encoder hook return
+ * without taking g_sub_lock, which D3DMetal's concurrent command-list queue
+ * would otherwise convoy on. */
+std::atomic<bool> g_sub_empty{true};
+
+/* When the residency-set sweep may next run. With nothing on the
+ * per-command-buffer list there is nothing to declare, so the sweep is the
+ * only reason left to take g_sub_lock -- this bounds that to ten times a
+ * second instead of once per command buffer. */
+std::atomic<uint64_t> g_next_tick_ns{0};
+const uint64_t kTickNs = 100ull * 1000 * 1000;
+
+/* Strong snapshot of g_sub_resources. Rebuilt when the tracked set grows
+ * (g_sub_gen) or after kSubSnapshotMaxAgeNs, so a resource the guest freed
+ * stays pinned for at most that long past the buffers that used it. */
+struct DmnSubSnapshot {
+    std::atomic<int> refs;
+    NSArray*   arr;
+    id*        ptrs;
+    NSUInteger n;
+    uint64_t   gen;
+    uint64_t   built_ns;
+};
+
+void sub_snapshot_release(DmnSubSnapshot* s) {
+    if (s && s->refs.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        [s->arr release];
+        free(s->ptrs);
+        delete s;
+    }
+}
+
+DmnSubSnapshot* g_sub_snap;   /* +1 held by the cache; guarded by g_sub_lock */
+uint64_t        g_sub_gen;    /* bumped by sub_resource_track under g_sub_lock */
+const void*     kDmnSnapKey = &kDmnSnapKey;  /* cb -> snapshot it declared */
+const void*     kDmnSeenKey = &kDmnSeenKey;  /* cb -> visited (no snapshot) */
+const void*     kDmnQueueKey = &kDmnQueueKey; /* queue -> our set is attached */
+const uint64_t  kSubSnapshotMaxAgeNs = 250ull * 1000 * 1000;
+
+/* -1 undecided, 0 off (per-command-buffer path only), 1 residency set.
+ * Written under g_sub_lock; read without it by the two hot-path guards, which
+ * only need to know whether the set path is switched off for good. */
+std::atomic<int>                           g_res_mode{-1};
+
+/* -- In-flight command buffers ------------------------------------------
+ * A set member is freed when it leaves the set (the set holds the last
+ * reference -- that is how residency_sweep_locked recognises a dead one), and
+ * freeing an impostor whose pages a running command buffer still references
+ * aborts that buffer with kIOGPUCommandBufferCallbackErrorInvalidResource,
+ * which kills the whole MTLCommandQueue: every later submission on it fails,
+ * its fences never complete, and that guest process renders nothing again.
+ * D3DMetal's command buffers hold unretained references, so nothing else
+ * stops that.
+ *
+ * So removal waits behind a barrier: every command buffer committed at or
+ * before the moment a member was first seen unreferenced must have completed.
+ * Sequence numbers are handed out at commit (not creation: a command buffer
+ * that is created and never committed never completes, and would stall the
+ * barrier forever), and the oldest one still in flight is the watermark.
+ * Own mutex, held only across a set insert/erase, so the per-command-buffer
+ * path never contends with it. */
+std::mutex          g_cb_mtx;
+std::set<uint64_t>  g_cb_inflight;
+uint64_t            g_cb_seq;
+
+/* Sequence for a command buffer being committed; it leaves the set when the
+ * buffer completes (which Metal guarantees for a committed buffer, error
+ * paths included). */
+void residency_cb_committed(id<MTLCommandBuffer> cb) {
+    /* Nothing is ever removed from a set that does not exist, so the barrier
+     * -- and its handler on every command buffer -- is pure cost there. */
+    if (g_res_mode.load(std::memory_order_relaxed) != 1)
+        return;
+    uint64_t seq;
+    {
+        std::lock_guard<std::mutex> lk(g_cb_mtx);
+        seq = ++g_cb_seq;
+        g_cb_inflight.insert(seq);
+    }
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> unused) {
+        (void)unused;
+        std::lock_guard<std::mutex> lk(g_cb_mtx);
+        g_cb_inflight.erase(seq);
+    }];
+}
+
+/* `watermark` = every command buffer committed with a sequence below it has
+ * completed; `issued` = the last sequence handed out, which is the barrier a
+ * member observed now must outlive. Both come from one critical section: read
+ * apart, a commit landing in between would produce a barrier the watermark has
+ * already passed. */
+void residency_cb_state(uint64_t* watermark, uint64_t* issued) {
+    std::lock_guard<std::mutex> lk(g_cb_mtx);
+    *issued = g_cb_seq;
+    *watermark = g_cb_inflight.empty() ? g_cb_seq + 1 : *g_cb_inflight.begin();
+}
+
+/* -- Residency set (macOS 15+) -------------------------------------------
+ * One set per Metal device, created lazily and attached to every command
+ * queue. Metal documents residency-set methods as NOT thread-safe, so every
+ * call on one is made under g_sub_lock. */
+struct DmnResSet {
+    id device; /* +0: a device outlives every queue and resource on it */
+    id set;    /* +1 */
+};
+/* A member seen unreferenced: when it was first seen, and the last command
+ * buffer committed at that moment, which must complete before it can go. */
+struct DmnResStrike {
+    uint64_t seen_ns;
+    uint64_t barrier_seq;
+};
+std::vector<DmnResSet>                     g_res_sets;    /* g_sub_lock */
+std::unordered_map<void*, DmnResStrike>    g_res_strikes; /* g_sub_lock */
+uint64_t                                   g_res_sweep_ns;
+const uint64_t kResSweepNs = 500ull * 1000 * 1000;
+/* Backstop for a command buffer that never completes (a wedged queue): free a
+ * long-dead member anyway rather than leak it and its mapping forever. Far
+ * longer than any healthy buffer, and loud when it fires. */
+const uint64_t kResStuckNs = 10ull * 1000 * 1000 * 1000;
+
+bool residency_set_enabled_locked(void) {
+    const int cur = g_res_mode.load(std::memory_order_relaxed);
+    if (cur >= 0)
+        return cur == 1;
+    int mode = 0;
+    if (@available(macOS 15.0, *)) {
+        mode = 1;
+        const char* e = getenv("DMN_RESIDENCY_SET");
+        if (e && *e == '0')
+            mode = 0;
+    }
+    g_res_mode.store(mode, std::memory_order_relaxed);
+    DMN_INFO("share: impostor residency: %s",
+             mode ? "residency set for non-sparse impostors, "
+                    "per-command-buffer useResources for sparse textures"
+                  : "per-command-buffer useResources for every impostor "
+                    "(macOS < 15 or DMN_RESIDENCY_SET=0)");
+    return mode == 1;
+}
+
+/* Our set for `device`, creating it on first sight. nil -- and the mode
+ * downgraded to the per-command-buffer path, loudly -- if Metal refuses. */
+API_AVAILABLE(macos(15.0))
+id<MTLResidencySet> residency_set_for_locked(id<MTLDevice> device) {
+    if (!device)
+        return nil;
+    for (const DmnResSet& e : g_res_sets)
+        if (e.device == (id)device)
+            return (id<MTLResidencySet>)e.set;
+    MTLResidencySetDescriptor* d = [[MTLResidencySetDescriptor alloc] init];
+    d.label = @"dmn-impostors";
+    d.initialCapacity = 1024;
+    NSError* err = nil;
+    id<MTLResidencySet> set = [device newResidencySetWithDescriptor:d error:&err];
+    [d release];
+    if (!set) {
+        DMN_ERROR("share: newResidencySetWithDescriptor: failed on %s (%s) -- "
+                  "falling back to per-command-buffer residency for every "
+                  "impostor", device.name.UTF8String,
+                  err ? err.localizedDescription.UTF8String : "no error");
+        g_res_mode.store(0, std::memory_order_relaxed);
+        return nil;
+    }
+    g_res_sets.push_back(DmnResSet{ (id)device, (id)set });
+    DMN_INFO("share: created impostor residency set on %s", device.name.UTF8String);
+    return set;
+}
+
+/* Attach our set to a queue once. `late` marks the safety-net path -- a queue
+ * first seen through one of its command buffers rather than at creation --
+ * which should not happen: every queue creator on the device class is hooked.
+ * It is still a correct place to attach, because Metal binds a queue's
+ * residency sets to a command buffer at the buffer's *commit*, and that path
+ * runs from an encoder creation, which is always before commit. The mark
+ * lives on the queue itself so the check costs no global lock. */
+void residency_attach_queue(id q, bool late) {
+    /* mode 0 is final, so this costs nothing on macOS 14 or with the set
+     * switched off -- where taking g_sub_lock once per command buffer would
+     * be exactly the convoy the per-command-buffer path was fixed to avoid. */
+    if (!q || g_res_mode.load(std::memory_order_relaxed) == 0 ||
+        objc_getAssociatedObject(q, kDmnQueueKey))
+        return;
+    std::lock_guard<std::mutex> lk(g_sub_lock);
+    if (!residency_set_enabled_locked())
+        return;
+    if (objc_getAssociatedObject(q, kDmnQueueKey))
+        return; /* lost the race; the winner attached it */
+    if (@available(macOS 15.0, *)) {
+        id<MTLResidencySet> set =
+            residency_set_for_locked([(id<MTLCommandQueue>)q device]);
+        if (!set)
+            return;
+        [(id<MTLCommandQueue>)q addResidencySet:set];
+        objc_setAssociatedObject(q, kDmnQueueKey, (id)q, OBJC_ASSOCIATION_ASSIGN);
+        if (late)
+            DMN_WARN("share: command queue %p reached the residency path through "
+                     "a command buffer before its creation was seen; attached "
+                     "the impostor set late (an unhooked queue creator?)",
+                     (void*)q);
+        else
+            DMN_DEBUG("share: attached impostor residency set to queue %p",
+                      (void*)q);
+    }
+}
+
+/* Free set members nobody else references any more, once no command buffer
+ * that predates the observation is still running.
+ *
+ * Under g_sub_lock. The only other path that can take a new reference to a
+ * set-only member is the same-process alias cache, whose caller re-tracks the
+ * buffer under this same lock -- so it either still shows a reference here or
+ * is re-added right after. */
+void residency_sweep_locked(uint64_t now) {
+    if (g_res_sets.empty() || now - g_res_sweep_ns < kResSweepNs)
+        return;
+    g_res_sweep_ns = now;
+    if (@available(macOS 15.0, *)) {
+        uint64_t watermark = 0, issued = 0;
+        residency_cb_state(&watermark, &issued);
+        for (const DmnResSet& e : g_res_sets) {
+            id<MTLResidencySet> set = (id<MTLResidencySet>)e.set;
+            std::vector<id> dead;
+            @autoreleasepool {
+                /* allAllocations is a +0 copy: each member is +1 for the
+                 * pool's lifetime, so "only the set and this array" == 2. */
+                NSArray* all = [set allAllocations];
+                for (id a in all) {
+                    if (CFGetRetainCount((CFTypeRef)a) > 2) {
+                        g_res_strikes.erase((void*)a);
+                        continue;
+                    }
+                    auto it = g_res_strikes.find((void*)a);
+                    if (it == g_res_strikes.end()) {
+                        /* First sighting: it may be freed once every command
+                         * buffer already committed has finished with it. */
+                        g_res_strikes[(void*)a] = DmnResStrike{ now, issued };
+                        continue;
+                    }
+                    const bool drained = watermark > it->second.barrier_seq;
+                    const bool stuck = now - it->second.seen_ns > kResStuckNs;
+                    if (!drained && !stuck)
+                        continue;
+                    if (stuck && !drained) {
+                        DMN_WARN("share: freeing impostor %p after %llu s with "
+                                 "command buffer %llu still in flight (queue "
+                                 "wedged?) -- the in-flight barrier was skipped",
+                                 (void*)a,
+                                 (unsigned long long)((now - it->second.seen_ns) / 1000000000ull),
+                                 (unsigned long long)it->second.barrier_seq);
+                    }
+                    g_res_strikes.erase(it);
+                    dead.push_back(a);
+                }
+                if (!dead.empty()) {
+                    [set removeAllocations:(id<MTLAllocation>*)dead.data()
+                                     count:dead.size()];
+                    [set commit];
+                }
+            } /* the pool drains: the set's references were the last, so the
+                 impostors deallocate here and their mappings are unmapped */
+        }
+        /* commit only makes newly added members resident if the set is
+         * already resident; re-asserting it here is cheap and keeps that
+         * true after an eviction. */
+        for (const DmnResSet& e : g_res_sets)
+            [(id<MTLResidencySet>)e.set requestResidency];
+    }
+}
+
+void sub_resource_track(id res, bool sparse) {
     if (!res)
         return;
-    objc_setAssociatedObject(res, kDmnUsageKey,
-                             [NSNumber numberWithUnsignedLongLong:usage],
-                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     std::lock_guard<std::mutex> lk(g_sub_lock);
+    if (!sparse && residency_set_enabled_locked()) {
+        if (@available(macOS 15.0, *)) {
+            id<MTLResidencySet> set =
+                residency_set_for_locked([(id<MTLResource>)res device]);
+            if (set) {
+                /* A re-tracked member (an alias-cache reuse) is a no-op, but
+                 * its strike must go: it is referenced again. A recycled
+                 * address must not inherit the previous object's strike
+                 * either. */
+                g_res_strikes.erase((void*)res);
+                if (![set containsAllocation:res]) {
+                    [set addAllocation:res];
+                    /* Commit now: a command buffer committed on any queue
+                     * after this point must already see the member, and the
+                     * caller is about to hand the resource to D3DMetal. */
+                    [set commit];
+                }
+                return;
+            }
+            /* creation failed: the mode was downgraded, fall through to the
+             * per-command-buffer list */
+        }
+    }
     if (!g_sub_resources)
         g_sub_resources = [[NSHashTable weakObjectsHashTable] retain];
-    [g_sub_resources addObject:res];
+    if (![g_sub_resources containsObject:res]) {
+        [g_sub_resources addObject:res];
+        g_sub_gen++;
+        g_sub_empty.store(false, std::memory_order_release);
+    }
 }
 
-MTLResourceUsage sub_resource_usage(id res) {
-    NSNumber* n = objc_getAssociatedObject(res, kDmnUsageKey);
-    /* Untracked resources cannot reach here, but fall back to full access
-     * rather than to none if one ever does. */
-    return n ? (MTLResourceUsage)[n unsignedLongLongValue]
-             : (MTLResourceUsageRead | MTLResourceUsageWrite);
+/* Current per-command-buffer snapshot, +1, or nil when that list is empty.
+ * Also where the residency-set sweep runs. */
+DmnSubSnapshot* sub_snapshot_acquire(uint64_t now) {
+    std::lock_guard<std::mutex> lk(g_sub_lock);
+    g_next_tick_ns.store(now + kTickNs, std::memory_order_release);
+    residency_sweep_locked(now);
+    if (!g_sub_resources || g_sub_resources.count == 0)
+        return nil;
+    if (g_sub_snap && g_sub_snap->gen == g_sub_gen &&
+        now - g_sub_snap->built_ns < kSubSnapshotMaxAgeNs) {
+        g_sub_snap->refs.fetch_add(1, std::memory_order_relaxed);
+        return g_sub_snap;
+    }
+
+    NSArray* arr = [[g_sub_resources allObjects] retain];
+    DmnSubSnapshot* snap = new DmnSubSnapshot;
+    snap->refs.store(2, std::memory_order_relaxed); /* cache + caller */
+    snap->arr = arr;
+    snap->n = arr.count;
+    snap->ptrs = (id*)malloc(sizeof(id) * (snap->n ? snap->n : 1));
+    [arr getObjects:snap->ptrs range:NSMakeRange(0, snap->n)];
+    snap->gen = g_sub_gen;
+    snap->built_ns = now;
+    sub_snapshot_release(g_sub_snap);
+    g_sub_snap = snap;
+    return snap;
 }
 
-/* Snapshot under the lock, useResource: outside it, and hold the snapshot until
- * `cb` completes rather than until this returns.
+/* Declare the per-command-buffer list on the buffer's first encoder -- and
+ * again on a later encoder only if that list changed in between -- and pin
+ * each snapshot declared until the buffer completes.
  *
- * Residency and lifetime must have the same scope here. g_sub_resources is weak
- * and D3DMetal's command buffers come from commandBufferWithUnretainedReferences,
- * so nothing else keeps an impostor alive between encode and execution — and
- * useResource: has already promised the GPU it will be there. An impostor freed
- * inside that window (the guest destroying an imported surface) aborts the buffer
- * with kIOGPUCommandBufferCallbackErrorInvalidResource, which kills the whole
+ * Residency and lifetime must have the same scope here. g_sub_resources is
+ * weak and D3DMetal's command buffers come from
+ * commandBufferWithUnretainedReferences, so nothing else keeps an impostor
+ * alive between encode and execution -- and useResources: has already
+ * promised the GPU it will be there. An impostor freed inside that window
+ * (the guest destroying an imported surface) aborts the buffer with
+ * kIOGPUCommandBufferCallbackErrorInvalidResource, which kills the whole
  * MTLCommandQueue: every later submission on it fails, so its fences never
- * complete and that process renders nothing again.
+ * complete and that process renders nothing again. (Set members get the same
+ * promise from the in-flight barrier in residency_sweep_locked.)
  *
- * Pinning the entire tracked set rather than the subset a buffer touches is
- * deliberate — useResource: declares the entire set, so that is the promise being
- * backed. It adds no allocation, since allObjects already copies per encoder. */
+ * Pinning the entire list rather than the subset a buffer touches is
+ * deliberate -- useResources: declares the whole thing, so that is the
+ * promise being backed. */
 void sub_resources_make_resident(id<MTLCommandBuffer> cb, id enc, bool compute) {
-    NSArray* snapshot = nil;
-    {
-        std::lock_guard<std::mutex> lk(g_sub_lock);
-        if (!g_sub_resources || g_sub_resources.count == 0)
-            return;
-        snapshot = [[g_sub_resources allObjects] retain];
+    const bool first = objc_getAssociatedObject(cb, kDmnSeenKey) == nil;
+    if (first) {
+        objc_setAssociatedObject(cb, kDmnSeenKey, (id)cb, OBJC_ASSOCIATION_ASSIGN);
+        /* Safety net for a queue whose creation we never saw. */
+        residency_attach_queue([cb commandQueue], /*late=*/true);
+    } else if (g_sub_empty.load(std::memory_order_acquire)) {
+        /* Nothing is declared per command buffer (the residency set covers
+         * every impostor), so later encoders have nothing to re-check. */
+        return;
+    }
+
+    const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    /* Set-only workloads -- every D3D11 title, and any D3D12 one without
+     * reserved resources -- reach here on every command buffer with nothing
+     * to declare; leaving without g_sub_lock keeps D3DMetal's concurrent
+     * command-list threads off a shared lock entirely. */
+    if (g_sub_empty.load(std::memory_order_acquire) &&
+        now < g_next_tick_ns.load(std::memory_order_acquire))
+        return;
+    DmnSubSnapshot* snap = sub_snapshot_acquire(now);
+    if (!snap)
+        return;
+    /* Already declared on this buffer, and nothing was tracked since: the
+     * common case for every encoder after a buffer's first. A snapshot that
+     * moved (a resource tracked mid-buffer, or the 250 ms rebuild) is
+     * declared again so a later encoder of the same buffer can reach it. */
+    if (objc_getAssociatedObject(cb, kDmnSnapKey) == (id)snap) {
+        sub_snapshot_release(snap);
+        return;
     }
     /* Residency-only declaration: always Read, never the resource's stored
-     * usage.  Writes to impostors ride explicit binding points (render-pass
+     * usage. Writes to impostors ride explicit binding points (render-pass
      * attachments, blit arguments), which hazard-track on their own; a Write
-     * declared here would instead put a write hazard on the whole tracked set
-     * in every encoder, serializing every encoder against every other one.
+     * declared here would instead put a write hazard on the whole list in
+     * every encoder, serializing every encoder against every other one.
      * Read is the weakest usage that still pins residency for the
      * unretained CBs. */
-    for (id<MTLResource> r in snapshot) {
-        if (compute) {
-            [(id<MTLComputeCommandEncoder>)enc useResource:r
-                                                     usage:MTLResourceUsageRead];
-        } else {
-            [(id<MTLRenderCommandEncoder>)enc
-                useResource:r
-                      usage:MTLResourceUsageRead
-                     stages:MTLRenderStageVertex | MTLRenderStageFragment];
-        }
+    if (compute) {
+        [(id<MTLComputeCommandEncoder>)enc useResources:snap->ptrs
+                                                  count:snap->n
+                                                  usage:MTLResourceUsageRead];
+    } else {
+        [(id<MTLRenderCommandEncoder>)enc
+            useResources:snap->ptrs
+                   count:snap->n
+                   usage:MTLResourceUsageRead
+                  stages:MTLRenderStageVertex | MTLRenderStageFragment];
     }
     /* Encoders are created before commit, so a completion handler is always
      * still accepted here; it runs on error paths too, so the pin cannot leak
-     * on an aborted buffer. */
+     * on an aborted buffer. The association is assign-only: the handler's
+     * block holds the reference. */
+    objc_setAssociatedObject(cb, kDmnSnapKey, (id)snap, OBJC_ASSOCIATION_ASSIGN);
     [cb addCompletedHandler:^(id<MTLCommandBuffer> unused) {
         (void)unused;
-        [snapshot release];
+        sub_snapshot_release(snap);
     }];
 }
 
@@ -1582,6 +1919,18 @@ void ensure_texture_class_swizzled(id tex) {
                      sizeof(jobs) / sizeof(jobs[0]), "texture-upload", &memo);
 }
 
+/* -commit / -commitAndWaitUntilSubmitted: give the buffer a sequence number
+ * so residency_sweep_locked can tell when everything that might still touch a
+ * dead impostor has finished. Registering at commit rather than at creation
+ * matters: a command buffer that is created and dropped never completes, and
+ * would stall the barrier -- and every removal behind it -- forever. */
+void swz_cb_commit(id self, SEL _cmd) {
+    residency_cb_committed((id<MTLCommandBuffer>)self);
+    IMP orig = lookup_orig(object_getClass(self), _cmd);
+    if (orig)
+        ((void (*)(id, SEL))orig)(self, _cmd);
+}
+
 /* Runs for every command buffer, so the memo fast path matters here. */
 void ensure_cmdbuf_class_swizzled(Class cbc) {
     static const SwizzleJob jobs[] = {
@@ -1589,6 +1938,8 @@ void ensure_cmdbuf_class_swizzled(Class cbc) {
         { @selector(computeCommandEncoder), (IMP)swz_cb_cce },
         { @selector(computeCommandEncoderWithDispatchType:), (IMP)swz_cb_cced },
         { @selector(computeCommandEncoderWithDescriptor:), (IMP)swz_cb_cceD },
+        { @selector(commit), (IMP)swz_cb_commit },
+        { @selector(commitAndWaitUntilSubmitted), (IMP)swz_cb_commit },
     };
     static std::atomic<Class> memo{nullptr};
     install_swizzles(cbc, jobs, sizeof(jobs) / sizeof(jobs[0]),
@@ -1635,19 +1986,26 @@ void ensure_queue_class_swizzled(Class qc) {
                      "command-buffer-creator", &memo);
 }
 
+/* A new queue: hook its command-buffer creators, and give it the impostor
+ * residency set before D3DMetal can commit anything on it. */
+void note_new_queue(id q) {
+    if (!q)
+        return;
+    ensure_queue_class_swizzled(object_getClass(q));
+    residency_attach_queue(q, /*late=*/false);
+}
+
 id swz_dev_newq(id self, SEL _cmd) {
     IMP orig = lookup_orig(object_getClass(self), _cmd);
     id q = orig ? ((id (*)(id, SEL))orig)(self, _cmd) : nil;
-    if (q)
-        ensure_queue_class_swizzled(object_getClass(q));
+    note_new_queue(q);
     return q;
 }
 
 id swz_dev_newqmax(id self, SEL _cmd, NSUInteger maxCount) {
     IMP orig = lookup_orig(object_getClass(self), _cmd);
     id q = orig ? ((id (*)(id, SEL, NSUInteger))orig)(self, _cmd, maxCount) : nil;
-    if (q)
-        ensure_queue_class_swizzled(object_getClass(q));
+    note_new_queue(q);
     return q;
 }
 
@@ -1657,11 +2015,9 @@ id swz_dev_newqmax(id self, SEL _cmd, NSUInteger maxCount) {
 id swz_dev_newqdesc(id self, SEL _cmd, id desc) {
     IMP orig = lookup_orig(object_getClass(self), _cmd);
     id q = orig ? ((id (*)(id, SEL, id))orig)(self, _cmd, desc) : nil;
-    if (q)
-        ensure_queue_class_swizzled(object_getClass(q));
+    note_new_queue(q);
     return q;
 }
-
 /* Runs once per distinct device class at install time — no memo needed. */
 void swizzle_device_class(Class cls) {
     static const SwizzleJob jobs[] = {
