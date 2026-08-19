@@ -83,6 +83,14 @@ d3d11_cube = executable('d3d11-cube',
   link_with: dmn_lib,
   dependencies: [cocoa_deps])
 
+# A placed BUFFER in a plain DEFAULT heap -- the shape Triton gives every guest
+# buffer, and the one heap-placed-test does not cover (it uses SHARED heaps,
+# which our substitution layer replaces with synthetic ones).
+d3d12_defbuf_test = executable('d3d12-defbuf-test',
+  ['d3d12_defbuf_test.cpp'],
+  include_directories: [test_native_inc, include_directories('../src')],
+  link_with: dmn_lib)
+
 d3d12_triangle = executable('d3d12-triangle',
   ['d3d12_triangle.cpp', 'cocoa_window.mm'],
   include_directories: test_native_inc,

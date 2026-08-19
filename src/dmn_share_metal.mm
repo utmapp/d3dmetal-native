@@ -104,8 +104,16 @@ int dmn_anon_file(off_t size) {
     return fd;
 }
 
+/* Apple Silicon kernel/GPU pages are 16 KiB, but this is the x86_64 slice and
+ * runs under Rosetta, where getpagesize() reports the emulated 4096. A mapping
+ * whose length is only 4 KiB-aligned leaves its final real page partly
+ * described, and the GPU has no mapping for the tail. */
+constexpr size_t kMinPageAlign = 16384;
+
 size_t page_align(size_t n) {
     size_t pg = (size_t)getpagesize();
+    if (pg < kMinPageAlign)
+        pg = kMinPageAlign;
     return (n + pg - 1) & ~(pg - 1);
 }
 
@@ -157,12 +165,28 @@ struct LinearLayout {
  * among those references — D3DMetal's are unretained — so a buffer still
  * referencing this one is kept alive by sub_resources_make_resident()
  * instead. */
-id<MTLBuffer> shared_buffer_over(id<MTLDevice> device, void* ptr, size_t aligned) {
+/* `mapped` is the mmap (whole pages, so every page the GPU touches is backed);
+ * `logical` is the size the buffer must report.
+ *
+ * They must not be conflated. D3DMetal 3.0's EncodeCopyResource compares
+ * [dst length] against [src length] and, when they differ, returns having
+ * encoded nothing -- silently: no error, no Metal validation complaint, the
+ * fence still signals. A substituted buffer reporting its page-rounded mapping
+ * size therefore swallows every copy between it and one of the framework's own
+ * allocations, which are sized exactly.
+ *
+ * The deallocator munmaps the MAPPING, so the mapped size is captured rather
+ * than taken from Metal's callback length. */
+id<MTLBuffer> shared_buffer_over(id<MTLDevice> device, void* ptr, size_t mapped,
+                                 size_t logical = 0) {
+    const size_t report = (logical && logical <= mapped) ? logical : mapped;
+    const size_t unmap_len = mapped;
     return [device newBufferWithBytesNoCopy:ptr
-                                     length:aligned
+                                     length:report
                                     options:MTLResourceStorageModeShared
                                 deallocator:^(void* p, NSUInteger len) {
-                                    munmap(p, len);
+                                    (void)len;
+                                    munmap(p, unmap_len);
                                 }];
 }
 
@@ -632,7 +656,8 @@ id<MTLTexture> substitute_producer(id<MTLDevice> device,
      * wait for D3DMetal's deferred destruction to drop the last Metal
      * reference, which is GPU-timing-dependent. The mapping alone keeps the
      * shm object's pages alive. */
-    id<MTLBuffer> buf = shared_buffer_over(device, ptr, layout.mapped);
+    id<MTLBuffer> buf = shared_buffer_over(device, ptr, layout.mapped,
+                                           layout.logical);
     if (!buf) {
         DMN_ERROR("share: newBufferWithBytesNoCopy failed");
         munmap(ptr, layout.mapped);
@@ -729,7 +754,8 @@ id<MTLTexture> substitute_consumer(id<MTLDevice> device,
                       floor, layout.mapped, strerror(errno));
             return nil;
         }
-        buf = shared_buffer_over(device, ptr, layout.mapped);
+        buf = shared_buffer_over(device, ptr, layout.mapped,
+                                 layout.logical);
         if (!buf) {
             DMN_ERROR("share: consumer newBufferWithBytesNoCopy failed");
             munmap(ptr, layout.mapped);
@@ -831,7 +857,8 @@ id<MTLTexture> substitute_texture_window(id<MTLDevice> device,
                       fd, floor, layout.mapped, strerror(errno));
             return nil;
         }
-        buf = shared_buffer_over(device, ptr, layout.mapped);
+        buf = shared_buffer_over(device, ptr, layout.mapped,
+                                 layout.logical);
         if (!buf) {
             DMN_ERROR("share: heap-window newBufferWithBytesNoCopy failed");
             munmap(ptr, layout.mapped);
@@ -904,7 +931,7 @@ id<MTLBuffer> substitute_buffer(id<MTLDevice> device, NSUInteger length) {
         }
         /* Mapping-only ownership; the fd goes out through the arm — see the
          * producer texture path for why. */
-        id<MTLBuffer> buf = shared_buffer_over(device, ptr, mapped);
+        id<MTLBuffer> buf = shared_buffer_over(device, ptr, mapped, logical);
         if (!buf) {
             DMN_ERROR("share: buffer newBufferWithBytesNoCopy failed");
             munmap(ptr, mapped);
@@ -986,7 +1013,7 @@ id<MTLBuffer> substitute_buffer(id<MTLDevice> device, NSUInteger length) {
                       strerror(errno));
             return nil;
         }
-        buf = shared_buffer_over(device, ptr, mapped);
+        buf = shared_buffer_over(device, ptr, mapped, logical);
         if (!buf) {
             DMN_ERROR("share: consumer buffer newBufferWithBytesNoCopy failed");
             munmap(ptr, mapped);
