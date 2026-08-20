@@ -27,6 +27,9 @@
 
 DmnFrameworkApi g_dmn_api = {};
 
+/* dmn_share_metal.mm: false only under DMN_NO_SHADOW_HEAP=1. */
+extern "C" int dmn_shadow_heaps_enabled(void);
+
 namespace {
 
 std::mutex g_init_mutex;
@@ -321,9 +324,13 @@ void dmn_dedicated_metal_alloc_begin() {
         return;
     if (g_dmn_api.UseInternalHeaps)
         *g_dmn_api.UseInternalHeaps = 0;
-    /* Suppress the CPU zero-fill: it reaches through the texture's heap, and a
-     * substituted texture has none. */
-    if (g_dmn_api.ForceCPUInit)
+    /* Fallback init suppression (DMN_NO_SHADOW_HEAP=1 only): a substituted
+     * texture has no heap, and Finalize's CPU zero-fill reaches through it.
+     * The default is the per-impostor shadow heap in dmn_share_metal.mm —
+     * this flag is process-global, so while it is set the init of UNRELATED
+     * textures created concurrently is skipped too, and it also reroutes
+     * D3D12Buffer creates onto CPU-accessible heap types. */
+    if (g_dmn_api.ForceCPUInit && !dmn_shadow_heaps_enabled())
         *g_dmn_api.ForceCPUInit = 1;
 }
 
@@ -334,7 +341,7 @@ void dmn_dedicated_metal_alloc_end() {
         return;
     if (g_dmn_api.UseInternalHeaps)
         *g_dmn_api.UseInternalHeaps = 1;
-    if (g_dmn_api.ForceCPUInit)
+    if (g_dmn_api.ForceCPUInit && !dmn_shadow_heaps_enabled())
         *g_dmn_api.ForceCPUInit = 0;
 }
 

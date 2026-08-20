@@ -49,6 +49,113 @@ static_assert(sizeof(DmnShareTexPOD) == sizeof(dmn_shared_texture_handle),
 static_assert(sizeof(DmnShareFencePOD) == sizeof(dmn_shared_fence_handle),
               "fence POD layout drift");
 
+/* == Shadow heap ==========================================================
+ * D3DMTexture::Finalize initializes a new Shared-storage texture by zeroing
+ * `[[tex heap] newBufferWithLength:[heap size] options:[heap resourceOptions]
+ * offset:0].contents + [tex heapOffset]` for `[tex allocatedSize]` bytes —
+ * the only use of a texture's -heap anywhere in D3DMetal 3.0. A substituted
+ * texture is buffer-backed and has no heap, so that chain dereferences NULL.
+ *
+ * Each impostor therefore carries a shadow object answering exactly those
+ * selectors. A producer's shadow hands back the real backing buffer, so
+ * Finalize's zero-fill lands on the new surface (a committed D3D12 resource
+ * is OS-zeroed on Windows; apps rely on it). A consumer's or heap-window's
+ * shadow hands back a scratch buffer: an opened surface holds the producer's
+ * pixels and a placed resource may share pages with live neighbours, so for
+ * those the init must not touch the real bytes.
+ *
+ * DMN_NO_SHADOW_HEAP=1 falls back to suppressing the init wholesale through
+ * the process-global D3DMDevice::ForceCPUInit (see
+ * dmn_dedicated_metal_alloc_begin) — for framework builds whose Finalize has
+ * not been verified against the shadow. The global flag also skips the init
+ * of unrelated textures created concurrently, so the shadow is the default.
+ *
+ * ObjC classes cannot live in the anonymous namespace, hence global scope. */
+static bool shadow_heaps_enabled_impl(void) {
+    static std::atomic<int> v{-1};
+    int cur = v.load(std::memory_order_relaxed);
+    if (cur < 0) {
+        const char* e = getenv("DMN_NO_SHADOW_HEAP");
+        cur = (e && *e && *e != '0') ? 0 : 1;
+        v.store(cur, std::memory_order_relaxed);
+        if (!cur)
+            DMN_WARN("share: shadow heaps disabled; falling back to the "
+                     "ForceCPUInit init suppression");
+    }
+    return cur == 1;
+}
+extern "C" int dmn_shadow_heaps_enabled(void) {
+    return shadow_heaps_enabled_impl();
+}
+
+static const void* kDmnShadowHeapKey = &kDmnShadowHeapKey;
+
+@interface DmnShadowHeap : NSObject {
+  @public
+    id<MTLBuffer> _give;   /* what -newBufferWithLength:... hands out */
+    NSUInteger _sizeClaim; /* what -size reports */
+}
+@end
+
+@implementation DmnShadowHeap
+- (void)dealloc {
+    [_give release];
+    [super dealloc];
+}
+- (NSUInteger)size {
+    return _sizeClaim;
+}
+- (MTLResourceOptions)resourceOptions {
+    return _give.resourceOptions;
+}
+- (id)newBufferWithLength:(NSUInteger)len
+                  options:(MTLResourceOptions)opts
+                   offset:(NSUInteger)off {
+    (void)opts;
+    if (off == 0 && len <= _sizeClaim)
+        return [_give retain];
+    /* Finalize never nil-checks this result before taking .contents, so an
+     * out-of-contract request must still yield a real buffer — a throwaway
+     * one, absorbing the init instead of crashing or corrupting. */
+    DMN_ERROR("share: shadow heap asked for %lu bytes at offset %lu "
+              "(claim %lu); handing a scratch buffer",
+              (unsigned long)len, (unsigned long)off,
+              (unsigned long)_sizeClaim);
+    return [_give.device newBufferWithLength:(len ? len : 16)
+                                     options:MTLResourceStorageModeShared];
+}
+@end
+
+/* Attach a shadow to an impostor. `usable` is the mapped span behind
+ * `backing`; only a producer's fresh surface may be zeroed for real, and only
+ * when the whole zero-fill fits the mapping. */
+static void attach_shadow_heap(id<MTLTexture> tex, id<MTLBuffer> backing,
+                               size_t usable, bool producer) {
+    if (!shadow_heaps_enabled_impl() || !tex)
+        return;
+    const NSUInteger need = [tex allocatedSize];
+    DmnShadowHeap* sh = [[DmnShadowHeap alloc] init];
+    if (producer && need <= usable) {
+        sh->_give = [backing retain];
+        sh->_sizeClaim = usable;
+    } else {
+        id<MTLBuffer> scratch =
+            [[tex device] newBufferWithLength:(need ? need : 16)
+                                      options:MTLResourceStorageModeShared];
+        if (!scratch) {
+            DMN_ERROR("share: shadow-heap scratch alloc (%lu) failed; texture "
+                      "left shadowless", (unsigned long)need);
+            [sh release];
+            return;
+        }
+        sh->_give = scratch;
+        sh->_sizeClaim = need ? need : 16;
+    }
+    objc_setAssociatedObject(tex, kDmnShadowHeapKey, sh,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    [sh release];
+}
+
 namespace {
 
 /* An app group prefix must leave room for "/", a slot digit and one nonce
@@ -578,6 +685,8 @@ id<MTLTexture> make_linear_texture(id<MTLBuffer> buf, MTLTextureDescriptor* desc
             DMN_WARN("share: 2DArray view of impostor failed; sampling may box");
         }
     }
+
+    attach_shadow_heap(tex, buf, layout.mapped, producer && buf_offset == 0);
 
     /* Keep resident wherever D3DMetal binds it bindlessly. */
     sub_resource_track(tex);
@@ -1932,6 +2041,20 @@ id swz_tex_new_view(id self, SEL _cmd, MTLPixelFormat fmt,
         self, _cmd, fmt, type, levels, slices, swz);
 }
 
+/* -heap is an MTLResource method, so its implementing class may be a base
+ * shared with buffers and heaps — the shadow lookup keys on the associated
+ * object, which only impostor textures carry. */
+id swz_tex_heap(id self, SEL _cmd) {
+    IMP orig = lookup_orig(object_getClass(self), _cmd);
+    id h = orig ? ((id (*)(id, SEL))orig)(self, _cmd) : nil;
+    if (!h) {
+        id sh = objc_getAssociatedObject(self, kDmnShadowHeapKey);
+        if (sh)
+            return sh;
+    }
+    return h;
+}
+
 void ensure_texture_class_swizzled(id tex) {
     static const SwizzleJob jobs[] = {
         { @selector(replaceRegion:mipmapLevel:slice:withBytes:bytesPerRow:
@@ -1944,6 +2067,15 @@ void ensure_texture_class_swizzled(id tex) {
     static std::atomic<Class> memo{nullptr};
     install_swizzles(tex ? object_getClass(tex) : nil, jobs,
                      sizeof(jobs) / sizeof(jobs[0]), "texture-upload", &memo);
+    if (shadow_heaps_enabled_impl()) {
+        static const SwizzleJob hjobs[] = {
+            { @selector(heap), (IMP)swz_tex_heap },
+        };
+        static std::atomic<Class> hmemo{nullptr};
+        install_swizzles(tex ? object_getClass(tex) : nil, hjobs,
+                         sizeof(hjobs) / sizeof(hjobs[0]), "shadow-heap",
+                         &hmemo);
+    }
 }
 
 /* -commit / -commitAndWaitUntilSubmitted: give the buffer a sequence number
