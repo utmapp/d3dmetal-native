@@ -192,6 +192,8 @@ dmn_result init_locked(const dmn_options* options) {
      * but treat it as optional. */
     g_dmn_api.EnableWriteBufferImmediate = reinterpret_cast<unsigned char*>(
         dlsym(handle, "_ZN10D3DMDevice26EnableWriteBufferImmediateE"));
+    g_dmn_api.ForceCPUInit = reinterpret_cast<unsigned char*>(
+        dlsym(handle, "_ZN10D3DMDevice12ForceCPUInitE"));
     if (!g_dmn_api.EnableWriteBufferImmediate)
         DMN_WARN("D3DMetal does not export EnableWriteBufferImmediate; if this "
                  "build defaults it off, shared D3D12 fences will not signal");
@@ -313,17 +315,27 @@ std::atomic<int> g_dedicated_depth{0};
 }
 
 void dmn_dedicated_metal_alloc_begin() {
-    if (!g_dmn_api.UseInternalHeaps)
+    if (!g_dmn_api.UseInternalHeaps && !g_dmn_api.ForceCPUInit)
         return;
-    if (g_dedicated_depth.fetch_add(1, std::memory_order_acq_rel) == 0)
+    if (g_dedicated_depth.fetch_add(1, std::memory_order_acq_rel) != 0)
+        return;
+    if (g_dmn_api.UseInternalHeaps)
         *g_dmn_api.UseInternalHeaps = 0;
+    /* Suppress the CPU zero-fill: it reaches through the texture's heap, and a
+     * substituted texture has none. */
+    if (g_dmn_api.ForceCPUInit)
+        *g_dmn_api.ForceCPUInit = 1;
 }
 
 void dmn_dedicated_metal_alloc_end() {
-    if (!g_dmn_api.UseInternalHeaps)
+    if (!g_dmn_api.UseInternalHeaps && !g_dmn_api.ForceCPUInit)
         return;
-    if (g_dedicated_depth.fetch_sub(1, std::memory_order_acq_rel) == 1)
+    if (g_dedicated_depth.fetch_sub(1, std::memory_order_acq_rel) != 1)
+        return;
+    if (g_dmn_api.UseInternalHeaps)
         *g_dmn_api.UseInternalHeaps = 1;
+    if (g_dmn_api.ForceCPUInit)
+        *g_dmn_api.ForceCPUInit = 0;
 }
 
 /* == Exported D3D entry points =========================================== */
