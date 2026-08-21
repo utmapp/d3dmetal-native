@@ -65,16 +65,6 @@ struct DmnFrameworkApi {
      * NULL if the symbol is absent. See dmn_force_write_buffer_immediate(). */
     unsigned char* EnableWriteBufferImmediate;
 
-    /* D3DMDevice::ForceCPUInit — an exported static bool. With it clear,
-     * D3DMTexture::Finalize zero-fills a new texture on the CPU through
-     * [[texture heap] newBufferWithLength:options:offset:].contents. A
-     * substituted texture is buffer-backed and has no heap, so that chain
-     * yields nil and the bzero runs against NULL. Set for the duration of an
-     * armed create (see dmn_dedicated_metal_alloc_begin); the shm behind a
-     * substitution is freshly mapped and therefore already zero.
-     * NULL if the symbol is absent. */
-    unsigned char* ForceCPUInit;
-
     /* D3DMDevice::UseInternalHeaps — new in GPTk 4.0b1 (absent before), an
      * exported static bool that makes D3DMetal suballocate resources out of
      * large internal Metal heaps: a 4 KiB D3D11 buffer becomes an offset into a

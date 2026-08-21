@@ -64,30 +64,7 @@ static_assert(sizeof(DmnShareFencePOD) == sizeof(dmn_shared_fence_handle),
  * pixels and a placed resource may share pages with live neighbours, so for
  * those the init must not touch the real bytes.
  *
- * DMN_NO_SHADOW_HEAP=1 falls back to suppressing the init wholesale through
- * the process-global D3DMDevice::ForceCPUInit (see
- * dmn_dedicated_metal_alloc_begin) — for framework builds whose Finalize has
- * not been verified against the shadow. The global flag also skips the init
- * of unrelated textures created concurrently, so the shadow is the default.
- *
  * ObjC classes cannot live in the anonymous namespace, hence global scope. */
-static bool shadow_heaps_enabled_impl(void) {
-    static std::atomic<int> v{-1};
-    int cur = v.load(std::memory_order_relaxed);
-    if (cur < 0) {
-        const char* e = getenv("DMN_NO_SHADOW_HEAP");
-        cur = (e && *e && *e != '0') ? 0 : 1;
-        v.store(cur, std::memory_order_relaxed);
-        if (!cur)
-            DMN_WARN("share: shadow heaps disabled; falling back to the "
-                     "ForceCPUInit init suppression");
-    }
-    return cur == 1;
-}
-extern "C" int dmn_shadow_heaps_enabled(void) {
-    return shadow_heaps_enabled_impl();
-}
-
 static const void* kDmnShadowHeapKey = &kDmnShadowHeapKey;
 
 @interface DmnShadowHeap : NSObject {
@@ -131,7 +108,7 @@ static const void* kDmnShadowHeapKey = &kDmnShadowHeapKey;
  * when the whole zero-fill fits the mapping. */
 static void attach_shadow_heap(id<MTLTexture> tex, id<MTLBuffer> backing,
                                size_t usable, bool producer) {
-    if (!shadow_heaps_enabled_impl() || !tex)
+    if (!tex)
         return;
     const NSUInteger need = [tex allocatedSize];
     DmnShadowHeap* sh = [[DmnShadowHeap alloc] init];
@@ -2067,7 +2044,7 @@ void ensure_texture_class_swizzled(id tex) {
     static std::atomic<Class> memo{nullptr};
     install_swizzles(tex ? object_getClass(tex) : nil, jobs,
                      sizeof(jobs) / sizeof(jobs[0]), "texture-upload", &memo);
-    if (shadow_heaps_enabled_impl()) {
+    {
         static const SwizzleJob hjobs[] = {
             { @selector(heap), (IMP)swz_tex_heap },
         };

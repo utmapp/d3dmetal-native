@@ -27,9 +27,6 @@
 
 DmnFrameworkApi g_dmn_api = {};
 
-/* dmn_share_metal.mm: false only under DMN_NO_SHADOW_HEAP=1. */
-extern "C" int dmn_shadow_heaps_enabled(void);
-
 namespace {
 
 std::mutex g_init_mutex;
@@ -195,8 +192,6 @@ dmn_result init_locked(const dmn_options* options) {
      * but treat it as optional. */
     g_dmn_api.EnableWriteBufferImmediate = reinterpret_cast<unsigned char*>(
         dlsym(handle, "_ZN10D3DMDevice26EnableWriteBufferImmediateE"));
-    g_dmn_api.ForceCPUInit = reinterpret_cast<unsigned char*>(
-        dlsym(handle, "_ZN10D3DMDevice12ForceCPUInitE"));
     if (!g_dmn_api.EnableWriteBufferImmediate)
         DMN_WARN("D3DMetal does not export EnableWriteBufferImmediate; if this "
                  "build defaults it off, shared D3D12 fences will not signal");
@@ -318,31 +313,19 @@ std::atomic<int> g_dedicated_depth{0};
 }
 
 void dmn_dedicated_metal_alloc_begin() {
-    if (!g_dmn_api.UseInternalHeaps && !g_dmn_api.ForceCPUInit)
+    if (!g_dmn_api.UseInternalHeaps)
         return;
     if (g_dedicated_depth.fetch_add(1, std::memory_order_acq_rel) != 0)
         return;
-    if (g_dmn_api.UseInternalHeaps)
-        *g_dmn_api.UseInternalHeaps = 0;
-    /* Fallback init suppression (DMN_NO_SHADOW_HEAP=1 only): a substituted
-     * texture has no heap, and Finalize's CPU zero-fill reaches through it.
-     * The default is the per-impostor shadow heap in dmn_share_metal.mm —
-     * this flag is process-global, so while it is set the init of UNRELATED
-     * textures created concurrently is skipped too, and it also reroutes
-     * D3D12Buffer creates onto CPU-accessible heap types. */
-    if (g_dmn_api.ForceCPUInit && !dmn_shadow_heaps_enabled())
-        *g_dmn_api.ForceCPUInit = 1;
+    *g_dmn_api.UseInternalHeaps = 0;
 }
 
 void dmn_dedicated_metal_alloc_end() {
-    if (!g_dmn_api.UseInternalHeaps && !g_dmn_api.ForceCPUInit)
+    if (!g_dmn_api.UseInternalHeaps)
         return;
     if (g_dedicated_depth.fetch_sub(1, std::memory_order_acq_rel) != 1)
         return;
-    if (g_dmn_api.UseInternalHeaps)
-        *g_dmn_api.UseInternalHeaps = 1;
-    if (g_dmn_api.ForceCPUInit && !dmn_shadow_heaps_enabled())
-        *g_dmn_api.ForceCPUInit = 0;
+    *g_dmn_api.UseInternalHeaps = 1;
 }
 
 /* == Exported D3D entry points =========================================== */
