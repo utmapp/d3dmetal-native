@@ -277,6 +277,16 @@ heap_placed = executable('heap-placed-test',
   link_with: dmn_lib)
 test('heap-placed', heap_placed, env: ['DMN_LOG=info'], timeout: 300)
 
+# Windowless: the companion-present copy — CopyResource with a SUBSTITUTED
+# shared texture as dest and a native optimally-tiled texture as source, both
+# in COMMON (implicit promotion), verified through the exported fd.  This is
+# the exact GPU work Triton's D3D12 present-time blit records.
+present_copy = executable('present-copy-test',
+  'present_copy_test.cpp',
+  include_directories: test_native_inc,
+  link_with: dmn_lib)
+test('present-copy', present_copy, env: ['DMN_LOG=info'], timeout: 300)
+
 # Windowless: dmn_open_existing_heap_from_fd — a shm window imported as an
 # ID3D12Heap whose placed buffers alias the caller's pages in both directions
 # (import offset + heap offset compose), the backing survives releasing the
