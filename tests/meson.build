@@ -86,6 +86,14 @@ d3d11_cube = executable('d3d11-cube',
 # A placed BUFFER in a plain DEFAULT heap -- the shape Triton gives every guest
 # buffer, and the one heap-placed-test does not cover (it uses SHARED heaps,
 # which our substitution layer replaces with synthetic ones).
+# Min-precision (min16float) DXBC draw + readback: host twin of the guest's
+# `sm6draw.exe -minprec`, backing Triton's D3D12 SHADER.MinPrecision claim.
+d3d12_minprec_test = executable('d3d12-minprec-test',
+  ['d3d12_minprec_test.cpp'],
+  include_directories: [test_native_inc, include_directories('../src')],
+  link_with: dmn_lib)
+test('d3d12-minprec', d3d12_minprec_test, env: ['DMN_LOG=info'], timeout: 300)
+
 d3d12_defbuf_test = executable('d3d12-defbuf-test',
   ['d3d12_defbuf_test.cpp'],
   include_directories: [test_native_inc, include_directories('../src')],
