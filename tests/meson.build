@@ -110,6 +110,14 @@ d3d12_native16_test = executable('d3d12-native16-test',
   link_with: dmn_lib)
 test('d3d12-native16', d3d12_native16_test, env: ['DMN_LOG=info'], timeout: 300)
 
+# SM 6.6 64-bit integer atomics (typed R32G32_UINT UAV, group shared, raw):
+# host twin of the guest's atomic64.exe, backing SHADER.AtomicInt64On*.
+d3d12_atomic64_test = executable('d3d12-atomic64-test',
+  ['d3d12_atomic64_test.cpp'],
+  include_directories: [test_native_inc, include_directories('../src')],
+  link_with: dmn_lib)
+test('d3d12-atomic64', d3d12_atomic64_test, env: ['DMN_LOG=info'], timeout: 300)
+
 d3d12_defbuf_test = executable('d3d12-defbuf-test',
   ['d3d12_defbuf_test.cpp'],
   include_directories: [test_native_inc, include_directories('../src')],
