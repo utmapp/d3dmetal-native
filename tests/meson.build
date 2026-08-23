@@ -94,6 +94,14 @@ d3d12_minprec_test = executable('d3d12-minprec-test',
   link_with: dmn_lib)
 test('d3d12-minprec', d3d12_minprec_test, env: ['DMN_LOG=info'], timeout: 300)
 
+# SV_Barycentrics (SM 6.1) draw + readback: host twin of the guest's
+# barydraw.exe, backing Triton's OPTIONS3.BarycentricsSupported forward.
+d3d12_bary_test = executable('d3d12-bary-test',
+  ['d3d12_bary_test.cpp'],
+  include_directories: [test_native_inc, include_directories('../src')],
+  link_with: dmn_lib)
+test('d3d12-bary', d3d12_bary_test, env: ['DMN_LOG=info'], timeout: 300)
+
 d3d12_defbuf_test = executable('d3d12-defbuf-test',
   ['d3d12_defbuf_test.cpp'],
   include_directories: [test_native_inc, include_directories('../src')],
