@@ -102,6 +102,14 @@ d3d12_bary_test = executable('d3d12-bary-test',
   link_with: dmn_lib)
 test('d3d12-bary', d3d12_bary_test, env: ['DMN_LOG=info'], timeout: 300)
 
+# Native 16-bit shader ops (SM 6.2 float16_t) compute + readback: host twin
+# of the guest's native16.exe, backing Triton's SHADER.Native16BitOps forward.
+d3d12_native16_test = executable('d3d12-native16-test',
+  ['d3d12_native16_test.cpp'],
+  include_directories: [test_native_inc, include_directories('../src')],
+  link_with: dmn_lib)
+test('d3d12-native16', d3d12_native16_test, env: ['DMN_LOG=info'], timeout: 300)
+
 d3d12_defbuf_test = executable('d3d12-defbuf-test',
   ['d3d12_defbuf_test.cpp'],
   include_directories: [test_native_inc, include_directories('../src')],
