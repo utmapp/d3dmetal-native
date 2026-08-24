@@ -101,6 +101,23 @@ static const void* kDmnShadowHeapKey = &kDmnShadowHeapKey;
     return [_give.device newBufferWithLength:(len ? len : 16)
                                      options:MTLResourceStorageModeShared];
 }
+/* The impostor is duck-typed: it implements only the selectors D3DMetal
+ * actually sends it.  MetalTools sends others.  With MTL_DEBUG_LAYER=1,
+ * -[MTLDebugCommandBuffer preCommit] walks every resource in the command
+ * buffer and sends each -lockPurgeableState, which raised
+ *   -[DmnShadowHeap lockPurgeableState]: unrecognized selector sent to ...
+ * and took the render-server worker down with SIGABRT -- making the debug
+ * layer unusable on exactly the GPU page-fault bugs it exists to diagnose.
+ *
+ * Forward anything unimplemented to the buffer we stand in for.  This only
+ * changes behaviour where the alternative was an exception, and it leaves
+ * -respondsToSelector: answering NO, so D3DMetal's own capability probes
+ * see the same impostor they see today. */
+- (id)forwardingTargetForSelector:(SEL)sel {
+    if (_give && [_give respondsToSelector:sel])
+        return _give;
+    return [super forwardingTargetForSelector:sel];
+}
 @end
 
 /* Attach a shadow to an impostor. `usable` is the mapped span behind

@@ -152,6 +152,16 @@ d3d12_sharedbuf = executable('d3d12-sharedbuf-test',
   link_with: dmn_lib)
 test('d3d12-sharedbuf', d3d12_sharedbuf, env: ['DMN_LOG=info'], timeout: 300)
 
+# The shared-texture impostor is duck-typed and must forward the selectors it
+# does not implement; MetalTools sends more than D3DMetal does. Runtime-level,
+# so it needs no framework and no GPU submission.
+shadow_heap_forward = executable('shadow-heap-forward-test',
+  'shadow_heap_forward_test.mm',
+  include_directories: [test_native_inc, include_directories('../src')],
+  link_with: dmn_lib,
+  dependencies: [cocoa_deps])
+test('shadow-heap-forward', shadow_heap_forward, timeout: 60)
+
 d3d11_sharedbuf = executable('d3d11-sharedbuf-test',
   'd3d11_sharedbuf_test.cpp',
   include_directories: test_native_inc,
