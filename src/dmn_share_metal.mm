@@ -407,6 +407,75 @@ void alias_cache_store(int fd, uint64_t off, id<MTLBuffer> buf) {
     objc_storeWeak(&slot->weak_buf, buf);
 }
 
+/* == Texture-level aliasing ==============================================
+ * Sharing the backing MTLBuffer is NOT enough.  A producer and its
+ * same-process import over ONE buffer but as TWO MTLTexture objects are two
+ * resources to Metal, so a clear issued through the import is not ordered
+ * against a copy from the producer in the same command list -- the producer
+ * reads stale bytes -- and it stays broken even with a D3D12 ALIASING
+ * barrier.  Metal orders accesses to the SAME resource.
+ *
+ * A shared surface and its import are the same allocation, so hand back the
+ * SAME MTLTexture when the descriptor matches.  The geometry is part of the
+ * key: a mismatched view must never be served from here. */
+struct TexSlot {
+    id       weak_tex = nil;   /* objc_storeWeak / objc_loadWeak */
+    uint32_t fmt = 0;
+    uint64_t w = 0, h = 0;
+    uint64_t stride = 0;
+};
+std::mutex g_tex_alias_mtx;
+std::unordered_map<AliasKey, TexSlot*, AliasKeyHash> g_tex_alias_cache;
+
+/* A live cached texture for this exact surface, +1, or nil. */
+id<MTLTexture> tex_alias_lookup(id<MTLDevice> device, int fd, uint64_t off,
+                                uint32_t fmt, uint64_t w, uint64_t h,
+                                uint64_t stride) {
+    AliasKey key;
+    if (!alias_key_of(fd, off, &key))
+        return nil;
+    TexSlot* slot;
+    {
+        std::lock_guard<std::mutex> lk(g_tex_alias_mtx);
+        auto it = g_tex_alias_cache.find(key);
+        if (it == g_tex_alias_cache.end())
+            return nil;
+        slot = it->second;
+    }
+    if (slot->fmt != fmt || slot->w != w || slot->h != h ||
+        slot->stride != stride)
+        return nil; /* a different view of the same bytes is not interchangeable */
+    id tex;
+    @autoreleasepool {
+        tex = [objc_loadWeak(&slot->weak_tex) retain];
+    }
+    if (!tex)
+        return nil;
+    if ([(id<MTLTexture>)tex device] != device) {
+        [tex release];
+        return nil;
+    }
+    return (id<MTLTexture>)tex; /* +1 */
+}
+
+void tex_alias_store(int fd, uint64_t off, id<MTLTexture> tex, uint32_t fmt,
+                     uint64_t w, uint64_t h, uint64_t stride) {
+    if (!tex)
+        return;
+    AliasKey key;
+    if (!alias_key_of(fd, off, &key))
+        return;
+    std::lock_guard<std::mutex> lk(g_tex_alias_mtx);
+    TexSlot*& slot = g_tex_alias_cache[key];
+    if (!slot)
+        slot = new TexSlot();
+    slot->fmt = fmt;
+    slot->w = w;
+    slot->h = h;
+    slot->stride = stride;
+    objc_storeWeak(&slot->weak_tex, tex);
+}
+
 /* == Create-time zero-fill defence ========================================
  * GPTk 1.0, 2.1 and 3.0 memset a new buffer's contents to zero synchronously
  * inside the create; 4.0 does not. For a consumer or window impostor those
@@ -780,6 +849,7 @@ id<MTLTexture> substitute_producer(id<MTLDevice> device,
     t_arm.out_fd     = fd;
     t_arm.out_stride = layout.stride;
     t_arm.out_size   = layout.logical;
+    tex_alias_store(fd, 0, tex, (uint32_t)fmt, width, height, layout.stride);
     DMN_INFO("share: substituted producer texture fmt=%lu %zux%zu stride=%zu "
              "size=%zu fd=%d", (unsigned long)fmt, width, height, layout.stride,
              layout.logical, fd);
@@ -845,8 +915,31 @@ id<MTLTexture> substitute_consumer(id<MTLDevice> device,
      * span when one exists (see the alias cache): each import still gets its
      * own MTLTexture, but over the SAME buffer, so Metal orders aliased
      * accesses. */
+    /* Ask for the span the texture will actually ADDRESS (delta + logical),
+     * not the page-aligned mapping.  shared_buffer_over() reports the buffer's
+     * length as `logical` -- a substituted buffer must report its EXACT size,
+     * so that cannot change -- while `layout.mapped` is
+     * page_align(delta + logical).  Comparing a logical length against a mapped
+     * size made `[b length] < need_len` true whenever the surface was not an
+     * exact page multiple (or the placement was not page-aligned), so the cache
+     * MISSED in the common case and every aliasing view mmap'd its own
+     * MTLBuffer over the same memory.  Asking for the addressed span is also
+     * strictly safer: it can never hand back a buffer too small for the
+     * texture. */
     const int fd = t_arm.existing_fd;
-    id<MTLBuffer> buf = alias_cache_lookup(device, fd, floor, layout.mapped);
+    /* Same allocation as the producer: hand back the SAME MTLTexture when the
+     * geometry matches, so Metal sees one resource and orders accesses through
+     * both views. */
+    if (id<MTLTexture> shared_tex =
+            tex_alias_lookup(device, fd, (uint64_t)offset, (uint32_t)fmt,
+                             width, height, layout.stride)) {
+        DMN_INFO("share: consumer texture reuses cached impostor TEXTURE");
+        t_arm.captured   = true;
+        t_arm.out_stride = layout.stride;
+        t_arm.out_size   = layout.logical;
+        return shared_tex;
+    }
+    id<MTLBuffer> buf = alias_cache_lookup(device, fd, floor, span);
     if (buf) {
         DMN_INFO("share: consumer texture reuses cached impostor backing");
     } else {
@@ -876,6 +969,8 @@ id<MTLTexture> substitute_consumer(id<MTLDevice> device,
     t_arm.out_fd     = fd;
     t_arm.out_stride = layout.stride;
     t_arm.out_size   = layout.logical;
+    tex_alias_store(fd, (uint64_t)offset, tex, (uint32_t)fmt, width, height,
+                    layout.stride);
     DMN_INFO("share: substituted consumer texture fmt=%lu %zux%zu stride=%zu "
              "size=%zu fd=%d", (unsigned long)fmt, width, height, layout.stride,
              layout.logical, fd);
@@ -949,7 +1044,8 @@ id<MTLTexture> substitute_texture_window(id<MTLDevice> device,
      * alias cache) — that is also what gives aliased placements hazard
      * ordering within a process. */
     const int fd = t_arm.existing_fd;
-    id<MTLBuffer> buf = alias_cache_lookup(device, fd, floor, layout.mapped);
+    /* Same logical-vs-mapped fix as the consumer path above. */
+    id<MTLBuffer> buf = alias_cache_lookup(device, fd, floor, span);
     if (buf) {
         DMN_INFO("share: heap-window texture reuses cached impostor backing");
     } else {

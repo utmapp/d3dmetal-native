@@ -162,6 +162,17 @@ shadow_heap_forward = executable('shadow-heap-forward-test',
   dependencies: [cocoa_deps])
 test('shadow-heap-forward', shadow_heap_forward, timeout: 60)
 
+# SHARED (impostor-backed) textures at the resource shapes of the Subnautica 2
+# command buffer that GPU-page-faults during world load. Phase G is the
+# regression test for same-process import aliasing: it FAILS when a producer
+# and its import are two MTLTexture objects, and PASSES when they are one.
+d3d12_lumen_shapes = executable('d3d12-lumen-shapes-test',
+  'd3d12_lumen_shapes_test.cpp',
+  include_directories: test_native_inc,
+  link_with: dmn_lib)
+test('d3d12-lumen-shapes', d3d12_lumen_shapes, env: ['DMN_LOG=warn'],
+  timeout: 300)
+
 d3d11_sharedbuf = executable('d3d11-sharedbuf-test',
   'd3d11_sharedbuf_test.cpp',
   include_directories: test_native_inc,
