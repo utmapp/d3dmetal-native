@@ -444,3 +444,19 @@ sparse_pool_probe = executable('sparse-pool-probe',
   link_with: dmn_lib,
   dependencies: [cocoa_deps])
 
+# A placed create on an imported (synthetic) heap must never write to the
+# heap's memory: pre-filled window + spin-checker for transient zeros while
+# creates loop, then a GPU copy-out proving the import still aliases.  Fails
+# if the placed->committed translation drops D3D12_HEAP_FLAG_CREATE_NOT_ZEROED.
+d3d12_placed_notzeroed = executable('d3d12-placed-notzeroed-test',
+  ['d3d12_placed_notzeroed_test.cpp'],
+  include_directories: [test_native_inc, include_directories('../src')],
+  link_with: dmn_lib)
+test('d3d12-placed-notzeroed', d3d12_placed_notzeroed, env: ['DMN_LOG=warn'],
+  timeout: 300)
+
+import_zerofill = executable('import-zerofill-test',
+  ['import_zerofill_test.cpp'],
+  include_directories: [test_native_inc, include_directories('../src')],
+  link_with: dmn_lib)
+test('import-zerofill', import_zerofill, env: ['DMN_LOG=warn'], timeout: 300)

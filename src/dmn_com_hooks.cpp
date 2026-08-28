@@ -53,6 +53,16 @@
 #include "dmn_share.h"
 #include "dmn_sparse.h"
 
+/* D3D12_HEAP_FLAG_CREATE_NOT_ZEROED, absent from the vendored d3d12.h.
+ * Passed on every committed create whose allocation is substituted with a
+ * window over EXISTING bytes (placed translations, buffer imports): the
+ * framework zero-fills committed resources inside the create, and those
+ * bytes are a producer's — live guest pages, a peer's surface. The flag
+ * removes the memset at the source; the matching arm carries
+ * create_not_zeroed so the zero-fill detection (dmn_share_metal.mm)
+ * skips these creates. */
+static const D3D12_HEAP_FLAGS kHeapCreateNotZeroed = (D3D12_HEAP_FLAGS)0x1000;
+
 /* == Format-support bit mirrors ============================================ */
 /* dmn_formats.h re-declares the D3D11_FORMAT_SUPPORT bits because its
  * implementation TU is ObjC++ and cannot include d3d11.h. This is the only TU
@@ -1187,9 +1197,11 @@ HRESULT import_buffer_d3d11(ID3D11Device* dev, const dmn_shared_buffer_handle* p
 
     ID3D11Buffer* buf = nullptr;
     if (pod->offset)
-        dmn_share_arm_import_window(pod->fd, pod->offset, pod->size, 0);
+        dmn_share_arm_import_window(pod->fd, pod->offset, pod->size, 0,
+                                    /*create_not_zeroed=*/false);
     else
-        dmn_share_arm_consumer_buffer(pod->fd, pod->size);
+        dmn_share_arm_consumer_buffer(pod->fd, pod->size,
+                                      /*create_not_zeroed=*/false);
     HRESULT hr = dev->CreateBuffer(&bd, nullptr, &buf);
     DmnShareArm arm{};
     bool captured = dmn_share_disarm(&arm);
@@ -1199,6 +1211,14 @@ HRESULT import_buffer_d3d11(ID3D11Device* dev, const dmn_shared_buffer_handle* p
     }
     if (!captured)
         return fail_unshared("D3D11 buffer import",
+                             reinterpret_cast<void**>(&buf));
+    /* The create zeroed the bytes it aliases (unsupported zeroing
+     * framework — see the detection in dmn_share_metal.mm): the
+     * producer's data is gone, so hand back a loud failure, never a
+     * silently-wiped alias. */
+    if (arm.zero_filled)
+        return fail_unshared("D3D11 buffer import (create zero-filled the "
+                             "imported bytes)",
                              reinterpret_cast<void**>(&buf));
     register_buffer_pod(buf, *pod);
     hr = buf->QueryInterface(iid, out);
@@ -1266,10 +1286,12 @@ HRESULT import_buffer_d3d12(ID3D12Device* dev, const dmn_shared_buffer_handle* p
     hp.Type = D3D12_HEAP_TYPE_DEFAULT;
 
     if (pod->offset)
-        dmn_share_arm_import_window(pod->fd, pod->offset, pod->size, 0);
+        dmn_share_arm_import_window(pod->fd, pod->offset, pod->size, 0,
+                                    /*create_not_zeroed=*/true);
     else
-        dmn_share_arm_consumer_buffer(pod->fd, pod->size);
-    HRESULT hr = dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+        dmn_share_arm_consumer_buffer(pod->fd, pod->size,
+                                      /*create_not_zeroed=*/true);
+    HRESULT hr = dev->CreateCommittedResource(&hp, kHeapCreateNotZeroed, &rd,
                                               D3D12_RESOURCE_STATE_COMMON,
                                               nullptr, riid, out);
     DmnShareArm arm{};
@@ -2016,7 +2038,8 @@ D3D12_HEAP_PROPERTIES commit_props_for(const D3D12_HEAP_PROPERTIES& hp,
 /* A placed create on a synthetic heap. The heap is ours, so the framework can
  * neither validate nor allocate for it — the create is translated into an
  * armed CreateCommittedResource (`commit`, built by the hook for its device
- * tier with the heap's Properties and D3D12_HEAP_FLAG_NONE) whose Metal
+ * tier with the heap's Properties and kHeapCreateNotZeroed, since the
+ * window bytes are the caller's and placed contents are undefined) whose Metal
  * allocation is substituted with a window into the heap's shm object:
  *
  *   BUFFER    -> buffer window at the placement offset (page-aligned by
@@ -2050,7 +2073,8 @@ HRESULT d12_place_on_synth(DmnSynthHeap* sh, UINT64 offset, const DescT* desc,
                  sh->imported ? "imported" : "shared",
                  (unsigned long long)offset, (unsigned long long)desc->Width);
         dmn_share_arm_import_window(sh->fd, sh->fd_off + offset, desc->Width,
-                                    sh->size - offset);
+                                    sh->size - offset,
+                                    /*create_not_zeroed=*/true);
         HRESULT hr = commit();
         DmnShareArm arm{};
         bool captured = dmn_share_disarm(&arm);
@@ -2232,7 +2256,7 @@ HRESULT STDMETHODCALLTYPE hook_d3d12_CreatePlacedResource(
         return d12_place_on_synth(sh, offset, desc, out, [&] {
             D3D12_HEAP_PROPERTIES hp =
                 commit_props_for(sh->desc.Properties, desc->Flags);
-            return This->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE,
+            return This->CreateCommittedResource(&hp, kHeapCreateNotZeroed,
                                                  desc, state, clear, riid, out);
         });
     return orig(This, heap, offset, desc, state, clear, riid, out);
@@ -2251,7 +2275,7 @@ HRESULT STDMETHODCALLTYPE hook_d3d12_CreatePlacedResource1(
         return d12_place_on_synth(sh, offset, desc, out, [&] {
             D3D12_HEAP_PROPERTIES hp =
                 commit_props_for(sh->desc.Properties, desc->Flags);
-            return This->CreateCommittedResource2(&hp, D3D12_HEAP_FLAG_NONE,
+            return This->CreateCommittedResource2(&hp, kHeapCreateNotZeroed,
                                                   desc, state, clear, nullptr,
                                                   riid, out);
         });
@@ -2280,7 +2304,7 @@ HRESULT STDMETHODCALLTYPE hook_d3d12_CreatePlacedResource2(
                 (desc && desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
                     ? (DMN_D3D12_BARRIER_LAYOUT)~0u
                     : layout;
-            return This->CreateCommittedResource3(&hp, D3D12_HEAP_FLAG_NONE,
+            return This->CreateCommittedResource3(&hp, kHeapCreateNotZeroed,
                                                   desc, lay, clear, nullptr,
                                                   num_castable, castable, riid,
                                                   out);

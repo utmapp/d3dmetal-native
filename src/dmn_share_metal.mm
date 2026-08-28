@@ -476,73 +476,72 @@ void tex_alias_store(int fd, uint64_t off, id<MTLTexture> tex, uint32_t fmt,
     objc_storeWeak(&slot->weak_tex, tex);
 }
 
-/* == Create-time zero-fill defence ========================================
- * GPTk 1.0, 2.1 and 3.0 memset a new buffer's contents to zero synchronously
- * inside the create; 4.0 does not. For a consumer or window impostor those
- * contents are a PRODUCER'S bytes — a placed buffer's neighbours in a shared
- * heap, an imported guest ring, the surface a peer just wrote — so on those
- * frameworks every import would wipe what it opened. There is nothing to
- * intercept (an inlined memset), so the bytes are snapshotted at capture and
- * put back at disarm.
+/* == Create-time zero-fill detection ======================================
+ * Some frameworks memset a new committed buffer's contents to zero
+ * synchronously inside the create (an inlined memset — nothing to
+ * intercept).  For a consumer or window impostor those contents are a
+ * PRODUCER'S bytes, so on such a framework the create wipes what it
+ * opened.  Every D3D12 aliasing create avoids this at the source with
+ * CREATE_NOT_ZEROED (and its arm skips this machinery); D3D11 has no
+ * equivalent flag, so its rare buffer imports are checked instead: the
+ * bytes are snapshotted at capture, compared at disarm, and a create
+ * that zeroed them FAILS LOUDLY.
  *
- * Self-calibrating: the first DECISIVE observation (a nonzero snapshot that
- * either was or was not modified by the create) decides for the process. A
- * framework that does not zero pays for snapshots only until that
- * observation; one that does pays a copy per import. Residual window on a
- * zeroing framework: a peer's GPU write landing between snapshot and restore
- * is reverted — inherent to any CPU-side repair, and far narrower than
- * losing the whole buffer. */
-enum ZeroFill { ZF_UNKNOWN, ZF_YES, ZF_NO };
-std::atomic<int> g_zero_fill{ZF_UNKNOWN};
-
-void snapshot_for_restore(void* ptr, size_t len) {
-    if (g_zero_fill.load(std::memory_order_acquire) == ZF_NO)
-        return;
+ * Detection, deliberately not repair.  A CPU-side write-back of the
+ * snapshot is unsound by construction — the guest CPU (persistent map)
+ * and in-flight GPU work write these bytes concurrently, so any repair
+ * races them (and a writer racing the memset itself is unrecoverable
+ * regardless: the snapshot predates it).  On the supported frameworks
+ * the zeroing create simply does not exist (GPTk 3.0's D3D11 create
+ * leaves contents alone — measured; 4.0 zeroes nothing), so this path
+ * is a tripwire for an unsupported framework, not a crutch: better an
+ * explicit import failure than bytes silently patched by racy code. */
+void snapshot_for_zero_check(void* ptr, size_t len) {
     void* copy = malloc(len);
     if (!copy)
-        return; /* nothing to do but let the create through unprotected */
+        return; /* the check just cannot run for this create */
     memcpy(copy, ptr, len);
-    t_arm.restore_dst  = ptr;
-    t_arm.restore_copy = copy;
-    t_arm.restore_len  = len;
+    t_arm.zerochk_dst  = ptr;
+    t_arm.zerochk_copy = copy;
+    t_arm.zerochk_len  = len;
 }
 
-/* At disarm: compare, restore, and learn. */
-void restore_after_create() {
-    if (!t_arm.restore_copy)
+/* At disarm: did the create zero bytes it merely aliases?  The create
+ * only ever writes zeros, so the signature is a word that is now zero
+ * where the snapshot was not.  (A concurrent writer's genuine zero can
+ * false-positive this — but sharing semantics already require the app
+ * to quiesce a surface around an open, and a loud spurious failure
+ * still beats silent corruption.) */
+void zero_fill_check() {
+    if (!t_arm.zerochk_copy)
         return;
-    void* dst = t_arm.restore_dst;
-    void* copy = t_arm.restore_copy;
-    const size_t len = t_arm.restore_len;
-    t_arm.restore_dst = nullptr;
-    t_arm.restore_copy = nullptr;
-    t_arm.restore_len = 0;
+    const void* dst = t_arm.zerochk_dst;
+    void* copy = t_arm.zerochk_copy;
+    const size_t len = t_arm.zerochk_len;
+    t_arm.zerochk_dst = nullptr;
+    t_arm.zerochk_copy = nullptr;
+    t_arm.zerochk_len = 0;
 
-    const bool changed = memcmp(dst, copy, len) != 0;
-    if (changed)
-        memcpy(dst, copy, len);
-    if (g_zero_fill.load(std::memory_order_acquire) == ZF_UNKNOWN) {
-        /* Decisive only if the snapshot had something to lose: an all-zero
-         * snapshot cannot tell a zeroing create from a benign one. */
-        bool nonzero = false;
-        const uint8_t* b = (const uint8_t*)copy;
-        for (size_t i = 0; i < len && !nonzero; i += 64)
-            nonzero = b[i] != 0;
-        if (!nonzero)
-            for (size_t i = 0; i < len && !nonzero; i++)
-                nonzero = b[i] != 0;
-        if (nonzero) {
-            g_zero_fill.store(changed ? ZF_YES : ZF_NO, std::memory_order_release);
-            if (changed)
-                DMN_WARN("share: this D3DMetal zero-fills new buffers on "
-                         "creation; imported/placed buffer contents will be "
-                         "snapshotted and restored around every create");
-            else
-                DMN_INFO("share: this D3DMetal leaves new buffer contents "
-                         "alone; no create-time restore needed");
-        }
-    }
+    size_t zeroed = 0;
+    const size_t words = len / sizeof(uint64_t);
+    const uint64_t* d = (const uint64_t*)dst;
+    const uint64_t* c = (const uint64_t*)copy;
+    for (size_t i = 0; i < words; i++)
+        if (d[i] == 0 && c[i] != 0)
+            zeroed++;
+    const uint8_t* db = (const uint8_t*)dst;
+    const uint8_t* cb = (const uint8_t*)copy;
+    for (size_t i = words * sizeof(uint64_t); i < len; i++)
+        if (db[i] == 0 && cb[i] != 0)
+            zeroed++;
     free(copy);
+    if (zeroed) {
+        t_arm.zero_filled = true;
+        DMN_ERROR("share: this D3DMetal zero-filled %zu word(s) of an "
+                  "imported buffer inside the create — unsupported zeroing "
+                  "framework; the import will FAIL (producer bytes are "
+                  "already lost)", zeroed);
+    }
 }
 
 /* Register a substituted impostor so it is GPU-resident wherever D3DMetal
@@ -1225,8 +1224,10 @@ id<MTLBuffer> substitute_buffer(id<MTLDevice> device, NSUInteger length) {
     }
     /* The bytes behind this impostor are somebody's: protect them from a
      * zero-filling create (see the defence above). [buf contents] is the
-     * mapping either way — a fresh one, or the cached impostor's. */
-    snapshot_for_restore([buf contents], (size_t)[buf length]);
+     * mapping either way — a fresh one, or the cached impostor's. A create
+     * carrying CREATE_NOT_ZEROED cannot write them and skips the check. */
+    if (!t_arm.create_not_zeroed)
+        snapshot_for_zero_check([buf contents], (size_t)[buf length]);
 
     t_arm.captured = true;
     t_arm.out_fd   = fd;
@@ -2287,8 +2288,8 @@ void swizzle_device_class(Class cls) {
 namespace {
 /* Fresh arm record; frees a snapshot a never-disarmed arm might still hold. */
 void arm_reset() {
-    if (t_arm.restore_copy)
-        free(t_arm.restore_copy);
+    if (t_arm.zerochk_copy)
+        free(t_arm.zerochk_copy);
     t_arm = {};
 }
 } // namespace
@@ -2338,7 +2339,8 @@ void dmn_share_arm_producer_buffer(uint64_t size) {
     t_arm.request_bytes = size;
 }
 
-void dmn_share_arm_consumer_buffer(int fd, uint64_t size) {
+void dmn_share_arm_consumer_buffer(int fd, uint64_t size,
+                                   bool create_not_zeroed) {
     dmn_dedicated_metal_alloc_begin();
     arm_reset();
     t_arm.armed = true;
@@ -2346,10 +2348,11 @@ void dmn_share_arm_consumer_buffer(int fd, uint64_t size) {
     t_arm.alloc_new = false;
     t_arm.existing_fd = fd;
     t_arm.existing_size = size;
+    t_arm.create_not_zeroed = create_not_zeroed;
 }
 
 void dmn_share_arm_import_window(int fd, uint64_t offset, uint64_t size,
-                                 uint64_t max_size) {
+                                 uint64_t max_size, bool create_not_zeroed) {
     dmn_dedicated_metal_alloc_begin();
     arm_reset();
     t_arm.armed = true;
@@ -2359,6 +2362,7 @@ void dmn_share_arm_import_window(int fd, uint64_t offset, uint64_t size,
     t_arm.existing_size = size;
     t_arm.existing_offset = offset;
     t_arm.existing_max = max_size;
+    t_arm.create_not_zeroed = create_not_zeroed;
 }
 
 bool dmn_share_is_armed(void) { return t_arm.armed; }
@@ -2367,8 +2371,8 @@ const void* dmn_share_init_data_sentinel(void) { return init_sentinel_base(); }
 
 bool dmn_share_disarm(DmnShareArm* out) {
     dmn_dedicated_metal_alloc_end();
-    restore_after_create(); /* the create has returned; put back what a
-                               zero-filling framework wiped */
+    zero_fill_check(); /* the create has returned; a zeroing framework
+                          fails the import (see the detection above) */
     bool captured = t_arm.captured;
     if (t_arm.armed && !captured)
         DMN_WARN("share: armed create reached NONE of the hooked Metal entry "

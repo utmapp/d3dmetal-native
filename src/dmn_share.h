@@ -85,16 +85,22 @@ struct DmnShareArm {
                                D3DMetal asked for, up to this, so a rounded-up
                                placed size stays a legal alias of the window
                                instead of an error */
+    bool     create_not_zeroed; /* the hook passes CREATE_NOT_ZEROED to the
+                               framework create, so it provably cannot write
+                               the aliased bytes: the zero-fill detection
+                               skips its snapshot/check entirely */
 
-    /* Consumer/window BUFFER captures on a framework that zero-fills new
-     * buffers (GPTk 1.0-3.0 memset the contents synchronously inside the
-     * create; 4.0 does not): the bytes the impostor aliases belong to a
-     * producer, so the swizzle snapshots them at capture — the last instant
-     * they are intact — and dmn_share_disarm restores them once the create has
-     * returned. Owned by the arm; freed at disarm. */
-    void*    restore_dst;
-    void*    restore_copy;
-    size_t   restore_len;
+    /* Consumer/window BUFFER captures without create_not_zeroed: the bytes
+     * the impostor aliases belong to a producer, so the swizzle snapshots
+     * them at capture and dmn_share_disarm compares once the create has
+     * returned — a create that zeroed them sets zero_filled and the hook
+     * FAILS the import (detection, never repair: see the zero-fill
+     * detection block in dmn_share_metal.mm). Snapshot owned by the arm;
+     * freed at disarm. */
+    void*    zerochk_dst;
+    void*    zerochk_copy;
+    size_t   zerochk_len;
+    bool     zero_filled;   /* out: the create zeroed aliased bytes */
 
     /* Filled by the swizzle on capture. */
     bool     init_dropped;  /* consumer: the sentinel initial-data upload was
@@ -132,16 +138,20 @@ void dmn_share_arm_consumer(int fd, uint64_t stride, uint64_t size,
 void dmn_share_arm_texture_window(int fd, uint64_t offset, uint64_t max_size);
 /* Arm the calling thread for the next raw MTLBuffer creation (device
  * newBufferWithLength:options: or heap newBufferWithLength:options:offset:).
- * `size` is the byte length to back with shared memory. */
+ * `size` is the byte length to back with shared memory. For the consumer
+ * variants, `create_not_zeroed` declares that the wrapped create carries
+ * D3D12_HEAP_FLAG_CREATE_NOT_ZEROED (see DmnShareArm::create_not_zeroed);
+ * pass false for any create the framework may still zero-fill. */
 void dmn_share_arm_producer_buffer(uint64_t size);
-void dmn_share_arm_consumer_buffer(int fd, uint64_t size);
+void dmn_share_arm_consumer_buffer(int fd, uint64_t size,
+                                   bool create_not_zeroed);
 /* Arm for the next raw MTLBuffer creation, backing it with the window of
  * `fd` at page-aligned `offset`: [offset + 0, offset + size) is the placed
  * resource, and up to max_size bytes exist at `offset` for D3DMetal's
  * size rounding. The fd is BORROWED (the imported-heap record owns it);
  * the substituted buffer's deallocator only munmaps its own window. */
 void dmn_share_arm_import_window(int fd, uint64_t offset, uint64_t size,
-                                 uint64_t max_size);
+                                 uint64_t max_size, bool create_not_zeroed);
 /* Disarm; copies the capture result into *out (may be NULL). Returns whether a
  * substitution was actually captured. Logs loudly if armed-but-not-captured. */
 bool dmn_share_disarm(DmnShareArm* out);
