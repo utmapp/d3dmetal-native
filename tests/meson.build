@@ -181,6 +181,12 @@ test('d3d11-sharedbuf', d3d11_sharedbuf, env: ['DMN_LOG=info'], timeout: 300)
 
 # Windowless: D3D12 producer fence (queue Signal -> helper-queue Wait +
 # WriteBufferImmediate) read back by the raw consumer and an imported ID3D12Fence.
+d3d12_mesh = executable('d3d12-mesh-test',
+  'd3d12_mesh_test.cpp',
+  include_directories: test_native_inc,
+  link_with: dmn_lib)
+test('d3d12-mesh', d3d12_mesh, env: ['DMN_LOG=info'], timeout: 300)
+
 d3d12_fence = executable('d3d12-fence-test',
   'd3d12_fence_test.cpp',
   include_directories: test_native_inc,
