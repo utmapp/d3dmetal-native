@@ -83,6 +83,12 @@ bool dmn_format_support(uint32_t dxgi_format, uint32_t* out_support);
  * UAV atomics, tiled). */
 bool dmn_format_support2(uint32_t dxgi_format, uint32_t* out_support2);
 
+/* False when the table knows Metal cannot carry `sample_count` samples of
+ * this format: the format is not multisample-renderable, or the device does
+ * not take the count.  A format the table does not describe is not its to
+ * judge and answers true. */
+bool dmn_format_msaa_ok(uint32_t dxgi_format, uint32_t sample_count);
+
 /* Bytes per pixel of an MTLPixelFormat laid out linearly (row-major, one
  * element per pixel) — the stride oracle for buffer-backed shared textures.
  *

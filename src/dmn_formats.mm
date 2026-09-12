@@ -259,6 +259,10 @@ void build_table(id<MTLDevice> dev, CapTable& t) {
     cap(MTLPixelFormatDepth32Float_Stencil8, kCapFilter);
 }
 
+/* Sample counts the device takes, as a bit mask indexed by count (counts are
+ * powers of two).  Built with the capability table; 1 is always in it. */
+uint32_t g_sample_counts = 1;
+
 /* Capability lookup. The table is immutable after the first call, so the
  * once_flag is the whole of the synchronisation. */
 uint32_t caps_for(MTLPixelFormat format) {
@@ -281,8 +285,13 @@ uint32_t caps_for(MTLPixelFormat format) {
                      [[dev name] UTF8String]);
         }
         build_table(dev, g_table);
-        DMN_INFO("formats: capability table built for %s (%zu formats)",
-                 [[dev name] UTF8String], g_table.size());
+        for (NSUInteger count = 2; count <= 32; count *= 2) {
+            if ([dev supportsTextureSampleCount:count])
+                g_sample_counts |= (uint32_t)count;
+        }
+        DMN_INFO("formats: capability table built for %s (%zu formats, "
+                 "sample counts 0x%x)",
+                 [[dev name] UTF8String], g_table.size(), g_sample_counts);
         [dev release];
     });
     auto it = g_table.find((uint32_t)format);
@@ -896,10 +905,23 @@ bool dmn_format_support(uint32_t dxgi_format, uint32_t* out_support) {
         support |= DMN_FMT_SUPPORT_RENDER_TARGET;
     if (caps & kCapBlend)
         support |= DMN_FMT_SUPPORT_BLENDABLE;
-    if (caps & kCapDepthStencil)
-        support |= DMN_FMT_SUPPORT_DEPTH_STENCIL |
-                   DMN_FMT_SUPPORT_SHADER_SAMPLE_COMPARISON |
+    if (caps & kCapDepthStencil) {
+        support |= DMN_FMT_SUPPORT_SHADER_SAMPLE_COMPARISON |
                    DMN_FMT_SUPPORT_SHADER_GATHER_COMPARISON;
+        /* Only the D* formats bind as depth-stencil.  The typeless parents
+         * and the single-plane views share their Metal format but not the
+         * bind (DXGI format support tables). */
+        switch (dxgi_format) {
+        case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+        case DXGI_FORMAT_D32_FLOAT:
+        case DXGI_FORMAT_D24_UNORM_S8_UINT:
+        case DXGI_FORMAT_D16_UNORM:
+            support |= DMN_FMT_SUPPORT_DEPTH_STENCIL;
+            break;
+        default:
+            break;
+        }
+    }
     if (caps & kCapResolve)
         support |= DMN_FMT_SUPPORT_MULTISAMPLE_RESOLVE;
     if (caps & kCapMSAA)
@@ -929,6 +951,19 @@ bool dmn_format_support(uint32_t dxgi_format, uint32_t* out_support) {
 
     *out_support = support;
     return true;
+}
+
+bool dmn_format_msaa_ok(uint32_t dxgi_format, uint32_t sample_count) {
+    DmnFormatDesc desc;
+    if (!describe(dxgi_format, desc) || desc.pixel == MTLPixelFormatInvalid)
+        return true;
+    if (sample_count == 1)
+        return true;
+    /* caps_for() also builds g_sample_counts. */
+    if (!(caps_for(desc.pixel) & kCapMSAA))
+        return false;
+    return sample_count <= 32 && (sample_count & (sample_count - 1)) == 0 &&
+           (g_sample_counts & sample_count);
 }
 
 bool dmn_format_support2(uint32_t dxgi_format, uint32_t* out_support2) {

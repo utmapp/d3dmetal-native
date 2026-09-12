@@ -642,6 +642,10 @@ HRESULT STDMETHODCALLTYPE hook_d3d11_CreateTexture3D(ID3D11Device*, const D3D11_
 HRESULT STDMETHODCALLTYPE hook_d3d11_CreateBuffer(ID3D11Device*, const D3D11_BUFFER_DESC*,
     const D3D11_SUBRESOURCE_DATA*, ID3D11Buffer**);
 HRESULT STDMETHODCALLTYPE hook_d3d11_CheckFormatSupport(ID3D11Device*, DXGI_FORMAT, UINT*);
+HRESULT STDMETHODCALLTYPE hook_d3d11_CheckMultisampleQualityLevels(ID3D11Device*, DXGI_FORMAT,
+    UINT, UINT*);
+HRESULT STDMETHODCALLTYPE hook_d3d11_CheckMultisampleQualityLevels1(ID3D11Device2*,
+    DXGI_FORMAT, UINT, UINT, UINT*);
 HRESULT STDMETHODCALLTYPE hook_d3d11_CheckFeatureSupport(ID3D11Device*, D3D11_FEATURE, void*,
     UINT);
 HRESULT STDMETHODCALLTYPE hook_d3d11_CreateBlendState1(ID3D11Device1*,
@@ -782,6 +786,8 @@ DMN_HOOK_STATE(d3d11_CreateTexture3D);
 DMN_HOOK_STATE(d3d11_CreateBuffer);
 DMN_HOOK_STATE(d3d11_CheckFormatSupport);
 DMN_HOOK_STATE(d3d11_CheckFeatureSupport);
+DMN_HOOK_STATE(d3d11_CheckMultisampleQualityLevels);
+DMN_HOOK_STATE(d3d11_CheckMultisampleQualityLevels1);
 DMN_HOOK_STATE(d3d11_CreateBlendState1);
 DMN_HOOK_STATE(d3d11_CreateShaderResourceView1);
 DMN_HOOK_STATE(d3d11_CreateRenderTargetView1);
@@ -1721,6 +1727,50 @@ HRESULT STDMETHODCALLTYPE hook_d3d11_CheckFormatSupport(
     }
     *out = support;
     return S_OK;
+}
+
+/* Whether D3DMetal itself supports textures of `format`: its own
+ * CheckFormatSupport answers 0 for a format it cannot make. */
+static bool d3dmetal_has_format(ID3D11Device* dev, DXGI_FORMAT format) {
+    auto orig = DMN_ORIG(d3d11_CheckFormatSupport, dev);
+    UINT support = 0;
+    return orig && SUCCEEDED(orig(dev, format, &support)) && support;
+}
+
+/* D3DMetal answers quality levels for formats it does not support and for
+ * sample counts Metal cannot give a format (BC included), and a caller that
+ * trusts it creates a texture Metal aborts on.  Its answer stands except
+ * where it claims such a combination. */
+static HRESULT filter_quality_levels(ID3D11Device* dev, HRESULT hr,
+                                     DXGI_FORMAT format, UINT sample_count,
+                                     UINT* out) {
+    if (SUCCEEDED(hr) && *out &&
+        (!d3dmetal_has_format(dev, format) ||
+         !dmn_format_msaa_ok((uint32_t)format, sample_count)))
+        *out = 0;
+    return hr;
+}
+
+HRESULT STDMETHODCALLTYPE hook_d3d11_CheckMultisampleQualityLevels(
+        ID3D11Device* This, DXGI_FORMAT format, UINT sample_count,
+        UINT* out) {
+    if (!out)
+        return E_INVALIDARG;
+    auto orig = DMN_ORIG(d3d11_CheckMultisampleQualityLevels, This);
+    return filter_quality_levels(
+        This, orig ? orig(This, format, sample_count, out) : E_FAIL,
+        format, sample_count, out);
+}
+
+HRESULT STDMETHODCALLTYPE hook_d3d11_CheckMultisampleQualityLevels1(
+        ID3D11Device2* This, DXGI_FORMAT format, UINT sample_count,
+        UINT flags, UINT* out) {
+    if (!out)
+        return E_INVALIDARG;
+    auto orig = DMN_ORIG(d3d11_CheckMultisampleQualityLevels1, This);
+    return filter_quality_levels(
+        This, orig ? orig(This, format, sample_count, flags, out) : E_FAIL,
+        format, sample_count, out);
 }
 
 /* FORMAT_SUPPORT and FORMAT_SUPPORT2 must agree with CheckFormatSupport, so
@@ -2678,10 +2728,30 @@ void STDMETHODCALLTYPE hook_d3d12_GetResourceTiling(
  * (Triton: host tier >= 1 -> forward CreateReservedResource/UpdateTileMappings;
  * tier 0 -> its committed-backing shim), which keeps an old host safe: an
  * unhooked CreateReservedResource there returns an unbacked object. */
+/* Whether D3DMetal itself supports textures of `format`.  For one it cannot
+ * make, its FORMAT_SUPPORT answer fails or is empty, depending on version. */
+static bool d3dmetal_has_format(ID3D12Device* dev, DXGI_FORMAT format) {
+    auto orig = DMN_ORIG(d3d12_CheckFeatureSupport, dev);
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT fs = {format, D3D12_FORMAT_SUPPORT1_NONE,
+                                            D3D12_FORMAT_SUPPORT2_NONE};
+    return orig &&
+           SUCCEEDED(orig(dev, D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof(fs))) &&
+           fs.Support1 != D3D12_FORMAT_SUPPORT1_NONE;
+}
+
 HRESULT STDMETHODCALLTYPE hook_d3d12_CheckFeatureSupport(
         ID3D12Device* This, D3D12_FEATURE feature, void* data, UINT size) {
     auto orig = DMN_ORIG(d3d12_CheckFeatureSupport, This);
     HRESULT hr = orig ? orig(This, feature, data, size) : E_FAIL;
+    /* Same correction as the D3D11 CheckMultisampleQualityLevels hook. */
+    if (SUCCEEDED(hr) && feature == D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS &&
+        data && size == sizeof(D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS)) {
+        auto* q = static_cast<D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS*>(data);
+        if (q->NumQualityLevels &&
+            (!d3dmetal_has_format(This, q->Format) ||
+             !dmn_format_msaa_ok((uint32_t)q->Format, q->SampleCount)))
+            q->NumQualityLevels = 0;
+    }
     if (SUCCEEDED(hr) && feature == D3D12_FEATURE_D3D12_OPTIONS && data &&
         size == sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS) && dmn_sparse_enabled()) {
         auto* o = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS*>(data);
@@ -3346,6 +3416,8 @@ extern "C" void dmn_hooks_after_d3d11_device(void* device) {
          * all-bits-or-nothing answer. */
         DMN_PATCH(d0, ID3D11Device, CheckFormatSupport, d3d11_CheckFormatSupport);
         DMN_PATCH(d0, ID3D11Device, CheckFeatureSupport, d3d11_CheckFeatureSupport);
+        DMN_PATCH(d0, ID3D11Device, CheckMultisampleQualityLevels,
+                  d3d11_CheckMultisampleQualityLevels);
         /* The context Wait hook must exist before a consumer waits on an
          * imported fence, so patch at device creation (per-class vtable). */
         ID3D11DeviceContext* ctx = nullptr;
@@ -3370,6 +3442,13 @@ extern "C" void dmn_hooks_after_d3d11_device(void* device) {
         /* Repairs a 4.0b1 CreateBlendState1 that answers S_OK with no state. */
         DMN_PATCH(d1, ID3D11Device1, CreateBlendState1, d3d11_CreateBlendState1);
         d1->Release();
+    }
+    ID3D11Device2* d2 = nullptr;
+    if (SUCCEEDED(dev->QueryInterface(__uuidof(ID3D11Device2),
+                                      reinterpret_cast<void**>(&d2))) && d2) {
+        DMN_PATCH(d2, ID3D11Device2, CheckMultisampleQualityLevels1,
+                  d3d11_CheckMultisampleQualityLevels1);
+        d2->Release();
     }
     ID3D11Device3* d3 = nullptr;
     if (SUCCEEDED(dev->QueryInterface(__uuidof(ID3D11Device3),

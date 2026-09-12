@@ -5,7 +5,7 @@
 // format fails against the unhooked path.  Also checks that CheckFeatureSupport
 // agrees with CheckFormatSupport (they are the same query in D3D11) and that
 // features we do not own still reach D3DMetal.
-#include <d3d11_1.h>
+#include <d3d11_2.h>
 #include <cstdio>
 
 template<class T> struct Com {
@@ -51,6 +51,51 @@ int main(){
         if(sup!=(D3D11_FORMAT_SUPPORT_BUFFER|D3D11_FORMAT_SUPPORT_CPU_LOCKABLE))
             printf("     (got 0x%08x)\n",sup);
     }
+
+    // CheckMultisampleQualityLevels: D3DMetal's answer, less the combinations
+    // Metal cannot make.  An unsupported pair may answer a failure or zero
+    // levels; both are documented.
+    {
+        struct { DXGI_FORMAT f; UINT n; bool want; const char* name; } cases[] = {
+            { DXGI_FORMAT_R8G8B8A8_UNORM, 4, true,  "msaa R8G8B8A8_UNORM x4" },
+            { DXGI_FORMAT_R8G8B8A8_UNORM, 3, false, "msaa R8G8B8A8_UNORM x3" },
+            { DXGI_FORMAT_R8G8B8A8_UNORM, 5, false, "msaa R8G8B8A8_UNORM x5" },
+            { DXGI_FORMAT_BC1_UNORM,      4, false, "msaa BC1_UNORM x4" },
+            { DXGI_FORMAT_R1_UNORM,       4, false, "msaa R1_UNORM x4" },
+            { DXGI_FORMAT_YUY2,           4, false, "msaa YUY2 x4" },
+            { DXGI_FORMAT_D32_FLOAT,      4, true,  "msaa D32_FLOAT x4" },
+            { DXGI_FORMAT_R24G8_TYPELESS, 4, true,  "msaa R24G8_TYPELESS x4" },
+        };
+        for (auto& c : cases) {
+            UINT levels = 0xdeadbeef;
+            HRESULT hr = dev->CheckMultisampleQualityLevels(c.f, c.n, &levels);
+            bool ok = c.want ? (SUCCEEDED(hr) && levels > 0)
+                             : (FAILED(hr) || levels == 0);
+            expect(ok, c.name);
+            if (!ok)
+                printf("     (hr=0x%08x levels=%u)\n", (unsigned)hr, levels);
+        }
+    }
+
+    // ID3D11Device2::CheckMultisampleQualityLevels1 gets the same filter.
+    // D3DMetal <= 3.0 does not implement it (E_NOTIMPL), which stands.
+    {
+        Com<ID3D11Device2> d2;
+        if(SUCCEEDED(dev->QueryInterface(__uuidof(ID3D11Device2),(void**)&d2))){
+            UINT levels=0xdeadbeef;
+            HRESULT hr=d2->CheckMultisampleQualityLevels1(DXGI_FORMAT_BC1_UNORM,4,0,&levels);
+            expect(FAILED(hr)||levels==0,"msaa1 BC1_UNORM x4");
+            hr=d2->CheckMultisampleQualityLevels1(DXGI_FORMAT_R8G8B8A8_UNORM,4,0,&levels);
+            expect(hr==E_NOTIMPL||(SUCCEEDED(hr)&&levels>0),"msaa1 R8G8B8A8_UNORM x4");
+        }
+    }
+
+    // The typeless parent of a depth family is not itself a depth-stencil
+    // format; only its D* view is (DXGI format support tables, FL 11.0).
+    expect_bits(dev.ptr(),DXGI_FORMAT_R32_TYPELESS,"R32_TYPELESS",
+        0,D3D11_FORMAT_SUPPORT_DEPTH_STENCIL);
+    expect_bits(dev.ptr(),DXGI_FORMAT_R24G8_TYPELESS,"R24G8_TYPELESS",
+        0,D3D11_FORMAT_SUPPORT_DEPTH_STENCIL);
 
     // No Metal representation at all.
     expect_invalid(dev.ptr(),DXGI_FORMAT_NV12,"NV12");
