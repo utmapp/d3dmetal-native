@@ -2,7 +2,7 @@
  * Copyright 2026 Turing Software LLC
  * SPDX-License-Identifier: MIT
  *
- * Hand-declared ID3D12Device2..ID3D12Device10 (the vendored d3d12.h stops at
+ * Hand-declared ID3D12Device2..ID3D12Device12 (the vendored d3d12.h stops at
  * ID3D12Device1). D3DMetal answers QueryInterface for all of them, and apps
  * bring their own headers, so the shared-resource create variants they add
  * (CreateCommittedResource1/2/3, CreateHeap1, CreatePlacedResource1/2,
@@ -12,7 +12,7 @@
  * call. Parameters whose types the vendored headers lack are declared as
  * ABI-equivalent opaque pointers/UINTs.
  *
- * The GetResourceAllocationInfo1/2 slots return an aggregate by value; they
+ * The GetResourceAllocationInfo1/2/3 slots return an aggregate by value; they
  * are declared in the explicit-return-pointer form this project builds with
  * (WIDL_EXPLICIT_AGGREGATE_RETURNS) and must not be called through these
  * declarations anyway — they exist only to hold their vtable slot.
@@ -240,4 +240,29 @@ ID3D12Device10 : public ID3D12Device9
 };
 #ifdef __CRT_UUID_DECL
 __CRT_UUID_DECL(ID3D12Device10, 0x517f8718, 0xaa66, 0x49f9, 0xb0,0x2b, 0xa7,0xab,0x89,0xc0,0x60,0x31)
+#endif
+
+MIDL_INTERFACE("5405c344-d457-444e-b4dd-2366e45aee39")
+ID3D12Device11 : public ID3D12Device10
+{
+    virtual void STDMETHODCALLTYPE CreateSampler2(
+        const void *desc, D3D12_CPU_DESCRIPTOR_HANDLE descriptor) = 0;
+};
+#ifdef __CRT_UUID_DECL
+__CRT_UUID_DECL(ID3D12Device11, 0x5405c344, 0xd457, 0x444e, 0xb4,0xdd, 0x23,0x66,0xe4,0x5a,0xee,0x39)
+#endif
+
+MIDL_INTERFACE("5af5c532-4c91-4cd0-b541-15a405395fc5")
+ID3D12Device12 : public ID3D12Device11
+{
+    /* Aggregate-by-value return; slot placeholder only — do not call. */
+    virtual D3D12_RESOURCE_ALLOCATION_INFO* STDMETHODCALLTYPE GetResourceAllocationInfo3(
+        D3D12_RESOURCE_ALLOCATION_INFO *ret, UINT visible_mask,
+        UINT num_resource_descs, const D3D12_RESOURCE_DESC1 *descs,
+        const UINT32 *num_castable_formats,
+        const DXGI_FORMAT *const *castable_formats,
+        D3D12_RESOURCE_ALLOCATION_INFO1 *info1) = 0;
+};
+#ifdef __CRT_UUID_DECL
+__CRT_UUID_DECL(ID3D12Device12, 0x5af5c532, 0x4c91, 0x4cd0, 0xb5,0x41, 0x15,0xa4,0x05,0x39,0x5f,0xc5)
 #endif

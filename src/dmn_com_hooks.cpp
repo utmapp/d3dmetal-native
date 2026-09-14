@@ -739,6 +739,20 @@ HRESULT STDMETHODCALLTYPE hook_d3d12_CreateReservedResource2(ID3D12Device10*,
 void STDMETHODCALLTYPE hook_d3d12_GetResourceTiling(ID3D12Device*, ID3D12Resource*,
         UINT*, D3D12_PACKED_MIP_INFO*, D3D12_TILE_SHAPE*, UINT*, UINT,
         D3D12_SUBRESOURCE_TILING*);
+D3D12_RESOURCE_ALLOCATION_INFO* STDMETHODCALLTYPE hook_d3d12_GetResourceAllocationInfo(
+        ID3D12Device*, D3D12_RESOURCE_ALLOCATION_INFO*, UINT, UINT,
+        const D3D12_RESOURCE_DESC*);
+D3D12_RESOURCE_ALLOCATION_INFO* STDMETHODCALLTYPE hook_d3d12_GetResourceAllocationInfo1(
+        ID3D12Device4*, D3D12_RESOURCE_ALLOCATION_INFO*, UINT, UINT,
+        const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_ALLOCATION_INFO1*);
+D3D12_RESOURCE_ALLOCATION_INFO* STDMETHODCALLTYPE hook_d3d12_GetResourceAllocationInfo2(
+        ID3D12Device8*, D3D12_RESOURCE_ALLOCATION_INFO*, UINT, UINT,
+        const D3D12_RESOURCE_DESC1*, D3D12_RESOURCE_ALLOCATION_INFO1*);
+D3D12_RESOURCE_ALLOCATION_INFO* STDMETHODCALLTYPE hook_d3d12_GetResourceAllocationInfo3(
+        ID3D12Device12*, D3D12_RESOURCE_ALLOCATION_INFO*, UINT, UINT,
+        const D3D12_RESOURCE_DESC1*, const UINT32*, const DXGI_FORMAT* const*,
+        D3D12_RESOURCE_ALLOCATION_INFO1*);
+static bool dmn_desc_format_ok(ID3D12Device* dev, const D3D12_RESOURCE_DESC* d);
 HRESULT STDMETHODCALLTYPE hook_d3d12_CreateCommandList(ID3D12Device*, UINT,
         D3D12_COMMAND_LIST_TYPE, ID3D12CommandAllocator*, ID3D12PipelineState*, REFIID,
         void**);
@@ -827,6 +841,10 @@ DMN_HOOK_STATE(d3d12_CreateReservedResource);
 DMN_HOOK_STATE(d3d12_CreateReservedResource1);
 DMN_HOOK_STATE(d3d12_CreateReservedResource2);
 DMN_HOOK_STATE(d3d12_GetResourceTiling);
+DMN_HOOK_STATE(d3d12_GetResourceAllocationInfo);
+DMN_HOOK_STATE(d3d12_GetResourceAllocationInfo1);
+DMN_HOOK_STATE(d3d12_GetResourceAllocationInfo2);
+DMN_HOOK_STATE(d3d12_GetResourceAllocationInfo3);
 DMN_HOOK_STATE(d3d12_CheckFeatureSupport);
 DMN_HOOK_STATE(d3d12_CreateCommandList);
 DMN_HOOK_STATE(d3d12_CreateCommandList1);
@@ -2188,6 +2206,8 @@ HRESULT STDMETHODCALLTYPE hook_d3d12_CreateCommittedResource(
         D3D12_HEAP_FLAGS flags, const D3D12_RESOURCE_DESC* desc,
         D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE* clear,
         REFIID riid, void** out) {
+    if (!dmn_desc_format_ok(This, desc))
+        return E_INVALIDARG;
     auto orig = DMN_ORIG(d3d12_CreateCommittedResource, This);
     if (!orig)
         return E_FAIL;
@@ -2202,6 +2222,8 @@ HRESULT STDMETHODCALLTYPE hook_d3d12_CreateCommittedResource1(
         D3D12_HEAP_FLAGS flags, const D3D12_RESOURCE_DESC* desc,
         D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE* clear,
         DMN_ID3D12ProtectedResourceSession* session, REFIID riid, void** out) {
+    if (!dmn_desc_format_ok(This, desc))
+        return E_INVALIDARG;
     auto orig = DMN_ORIG(d3d12_CreateCommittedResource1, This);
     if (!orig)
         return E_FAIL;
@@ -2217,6 +2239,8 @@ HRESULT STDMETHODCALLTYPE hook_d3d12_CreateCommittedResource2(
         D3D12_HEAP_FLAGS flags, const D3D12_RESOURCE_DESC1* desc,
         D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE* clear,
         DMN_ID3D12ProtectedResourceSession* session, REFIID riid, void** out) {
+    if (!dmn_desc_format_ok(This, (const D3D12_RESOURCE_DESC*)desc))
+        return E_INVALIDARG;
     auto orig = DMN_ORIG(d3d12_CreateCommittedResource2, This);
     if (!orig)
         return E_FAIL;
@@ -2233,6 +2257,8 @@ HRESULT STDMETHODCALLTYPE hook_d3d12_CreateCommittedResource3(
         DMN_D3D12_BARRIER_LAYOUT layout, const D3D12_CLEAR_VALUE* clear,
         DMN_ID3D12ProtectedResourceSession* session, UINT32 num_castable,
         const DXGI_FORMAT* castable, REFIID riid, void** out) {
+    if (!dmn_desc_format_ok(This, (const D3D12_RESOURCE_DESC*)desc))
+        return E_INVALIDARG;
     auto orig = DMN_ORIG(d3d12_CreateCommittedResource3, This);
     if (!orig)
         return E_FAIL;
@@ -2294,6 +2320,8 @@ HRESULT STDMETHODCALLTYPE hook_d3d12_CreatePlacedResource(
         ID3D12Device* This, ID3D12Heap* heap, UINT64 offset,
         const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES state,
         const D3D12_CLEAR_VALUE* clear, REFIID riid, void** out) {
+    if (!dmn_desc_format_ok(This, desc))
+        return E_INVALIDARG;
     auto orig = DMN_ORIG(d3d12_CreatePlacedResource, This);
     if (!orig)
         return E_FAIL;
@@ -2316,6 +2344,8 @@ HRESULT STDMETHODCALLTYPE hook_d3d12_CreatePlacedResource1(
         ID3D12Device8* This, ID3D12Heap* heap, UINT64 offset,
         const D3D12_RESOURCE_DESC1* desc, D3D12_RESOURCE_STATES state,
         const D3D12_CLEAR_VALUE* clear, REFIID riid, void** out) {
+    if (!dmn_desc_format_ok(This, (const D3D12_RESOURCE_DESC*)desc))
+        return E_INVALIDARG;
     auto orig = DMN_ORIG(d3d12_CreatePlacedResource1, This);
     if (!orig)
         return E_FAIL;
@@ -2337,6 +2367,8 @@ HRESULT STDMETHODCALLTYPE hook_d3d12_CreatePlacedResource2(
         const D3D12_RESOURCE_DESC1* desc, DMN_D3D12_BARRIER_LAYOUT layout,
         const D3D12_CLEAR_VALUE* clear, UINT32 num_castable,
         const DXGI_FORMAT* castable, REFIID riid, void** out) {
+    if (!dmn_desc_format_ok(This, (const D3D12_RESOURCE_DESC*)desc))
+        return E_INVALIDARG;
     auto orig = DMN_ORIG(d3d12_CreatePlacedResource2, This);
     if (!orig)
         return E_FAIL;
@@ -2686,6 +2718,91 @@ void STDMETHODCALLTYPE hook_cmdlist_CopyTiles(
                  "for packed mips)", skipped);
 }
 
+/* Whether D3DMetal itself supports textures of `format`.  For one it cannot
+ * make, its FORMAT_SUPPORT answer fails or is empty, depending on version. */
+static bool d3dmetal_has_format(ID3D12Device* dev, DXGI_FORMAT format) {
+    auto orig = DMN_ORIG(d3d12_CheckFeatureSupport, dev);
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT fs = {format, D3D12_FORMAT_SUPPORT1_NONE,
+                                            D3D12_FORMAT_SUPPORT2_NONE};
+    return orig &&
+           SUCCEEDED(orig(dev, D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof(fs))) &&
+           fs.Support1 != D3D12_FORMAT_SUPPORT1_NONE;
+}
+
+/* For a texture in a format D3DMetal reports unsupported (the planar and
+ * packed video formats: YUY2, NV12, AYUV, ...) it still builds an
+ * MTLTextureDescriptor, which fails Metal's validation assertion and aborts
+ * the process -- inside GetResourceAllocationInfo as much as inside a create.
+ * Refuse such a description the way the runtime refuses a format the driver
+ * does not support: an invalid-description answer from the size query and
+ * E_INVALIDARG from the creates.  Buffers carry no format and pass. */
+static bool dmn_desc_format_ok(ID3D12Device* dev, const D3D12_RESOURCE_DESC* d) {
+    if (!d || d->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ||
+        d->Format == DXGI_FORMAT_UNKNOWN || d3dmetal_has_format(dev, d->Format))
+        return true;
+    DMN_WARN("refusing a %llux%u texture in DXGI format %d: D3DMetal does not "
+             "support it and aborts on it",
+             (unsigned long long)d->Width, d->Height, (int)d->Format);
+    return false;
+}
+
+/* The runtime's answer for a description it rejects (MSDN: SizeInBytes ==
+ * UINT64_MAX).  The DESC1 variants start with a D3D12_RESOURCE_DESC. */
+template <typename Desc>
+static bool refuse_allocation_info(ID3D12Device* dev,
+                                   D3D12_RESOURCE_ALLOCATION_INFO* ret, UINT n,
+                                   const Desc* descs) {
+    for (UINT i = 0; descs && i < n; i++) {
+        if (!dmn_desc_format_ok(dev, (const D3D12_RESOURCE_DESC*)&descs[i])) {
+            if (ret) {
+                ret->SizeInBytes = UINT64_MAX;
+                ret->Alignment = 0;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+D3D12_RESOURCE_ALLOCATION_INFO* STDMETHODCALLTYPE hook_d3d12_GetResourceAllocationInfo(
+        ID3D12Device* This, D3D12_RESOURCE_ALLOCATION_INFO* ret, UINT visible_mask,
+        UINT n, const D3D12_RESOURCE_DESC* descs) {
+    if (refuse_allocation_info(This, ret, n, descs))
+        return ret;
+    auto orig = DMN_ORIG(d3d12_GetResourceAllocationInfo, This);
+    return orig(This, ret, visible_mask, n, descs);
+}
+
+D3D12_RESOURCE_ALLOCATION_INFO* STDMETHODCALLTYPE hook_d3d12_GetResourceAllocationInfo1(
+        ID3D12Device4* This, D3D12_RESOURCE_ALLOCATION_INFO* ret, UINT visible_mask,
+        UINT n, const D3D12_RESOURCE_DESC* descs,
+        D3D12_RESOURCE_ALLOCATION_INFO1* info1) {
+    if (refuse_allocation_info(This, ret, n, descs))
+        return ret;
+    auto orig = DMN_ORIG(d3d12_GetResourceAllocationInfo1, This);
+    return orig(This, ret, visible_mask, n, descs, info1);
+}
+
+D3D12_RESOURCE_ALLOCATION_INFO* STDMETHODCALLTYPE hook_d3d12_GetResourceAllocationInfo2(
+        ID3D12Device8* This, D3D12_RESOURCE_ALLOCATION_INFO* ret, UINT visible_mask,
+        UINT n, const D3D12_RESOURCE_DESC1* descs,
+        D3D12_RESOURCE_ALLOCATION_INFO1* info1) {
+    if (refuse_allocation_info(This, ret, n, descs))
+        return ret;
+    auto orig = DMN_ORIG(d3d12_GetResourceAllocationInfo2, This);
+    return orig(This, ret, visible_mask, n, descs, info1);
+}
+
+D3D12_RESOURCE_ALLOCATION_INFO* STDMETHODCALLTYPE hook_d3d12_GetResourceAllocationInfo3(
+        ID3D12Device12* This, D3D12_RESOURCE_ALLOCATION_INFO* ret, UINT visible_mask,
+        UINT n, const D3D12_RESOURCE_DESC1* descs, const UINT32* num_castable,
+        const DXGI_FORMAT* const* castable, D3D12_RESOURCE_ALLOCATION_INFO1* info1) {
+    if (refuse_allocation_info(This, ret, n, descs))
+        return ret;
+    auto orig = DMN_ORIG(d3d12_GetResourceAllocationInfo3, This);
+    return orig(This, ret, visible_mask, n, descs, num_castable, castable, info1);
+}
+
 /* GetResourceTiling for a sparse-backed resource comes from the tile model
  * dmn_sparse implements (the framework answers from its tier-0 world);
  * anything else passes through. */
@@ -2721,6 +2838,23 @@ void STDMETHODCALLTYPE hook_d3d12_GetResourceTiling(
         orig(This, res, total_tiles, packed, shape, num_subs, first_sub, subs);
 }
 
+/* D3D12_FORMAT_SUPPORT1/2 use the D3D11_FORMAT_SUPPORT/2 bit assignments, so
+ * the D3D11 tables answer D3D12 once the D3D11-only bits are dropped. */
+static_assert((UINT)D3D12_FORMAT_SUPPORT1_BUFFER == (UINT)D3D11_FORMAT_SUPPORT_BUFFER, "");
+static_assert((UINT)D3D12_FORMAT_SUPPORT1_TEXTURE2D == (UINT)D3D11_FORMAT_SUPPORT_TEXTURE2D, "");
+static_assert((UINT)D3D12_FORMAT_SUPPORT1_RENDER_TARGET == (UINT)D3D11_FORMAT_SUPPORT_RENDER_TARGET, "");
+static_assert((UINT)D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL == (UINT)D3D11_FORMAT_SUPPORT_DEPTH_STENCIL, "");
+static_assert((UINT)D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW ==
+              (UINT)D3D11_FORMAT_SUPPORT_TYPED_UNORDERED_ACCESS_VIEW, "");
+static_assert((UINT)D3D12_FORMAT_SUPPORT1_SHADER_GATHER_COMPARISON ==
+              (UINT)D3D11_FORMAT_SUPPORT_SHADER_GATHER_COMPARISON, "");
+static_assert((UINT)D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_ADD == (UINT)D3D11_FORMAT_SUPPORT2_UAV_ATOMIC_ADD, "");
+static_assert((UINT)D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE == (UINT)D3D11_FORMAT_SUPPORT2_UAV_TYPED_STORE, "");
+static_assert((UINT)D3D12_FORMAT_SUPPORT2_TILED == (UINT)D3D11_FORMAT_SUPPORT2_TILED, "");
+constexpr UINT kD3D11OnlySupport1 =
+    D3D11_FORMAT_SUPPORT_MIP_AUTOGEN | D3D11_FORMAT_SUPPORT_CPU_LOCKABLE;
+constexpr UINT kD3D11OnlySupport2 = D3D11_FORMAT_SUPPORT2_SHAREABLE;
+
 /* D3D12_OPTIONS.TiledResourcesTier: the framework answers 0 (it has no tiled
  * support); with sparse backing available this library serves tier 2
  * through hook_d3d12_CreateReservedResource + hook_queue_UpdateTileMappings,
@@ -2728,20 +2862,39 @@ void STDMETHODCALLTYPE hook_d3d12_GetResourceTiling(
  * (Triton: host tier >= 1 -> forward CreateReservedResource/UpdateTileMappings;
  * tier 0 -> its committed-backing shim), which keeps an old host safe: an
  * unhooked CreateReservedResource there returns an unbacked object. */
-/* Whether D3DMetal itself supports textures of `format`.  For one it cannot
- * make, its FORMAT_SUPPORT answer fails or is empty, depending on version. */
-static bool d3dmetal_has_format(ID3D12Device* dev, DXGI_FORMAT format) {
-    auto orig = DMN_ORIG(d3d12_CheckFeatureSupport, dev);
-    D3D12_FEATURE_DATA_FORMAT_SUPPORT fs = {format, D3D12_FORMAT_SUPPORT1_NONE,
-                                            D3D12_FORMAT_SUPPORT2_NONE};
-    return orig &&
-           SUCCEEDED(orig(dev, D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof(fs))) &&
-           fs.Support1 != D3D12_FORMAT_SUPPORT1_NONE;
-}
-
 HRESULT STDMETHODCALLTYPE hook_d3d12_CheckFeatureSupport(
         ID3D12Device* This, D3D12_FEATURE feature, void* data, UINT size) {
     auto orig = DMN_ORIG(d3d12_CheckFeatureSupport, This);
+    /* FORMAT_SUPPORT is D3DMetal's answer less the capabilities the format
+     * tables know Metal lacks: D3DMetal claims some for every format (all
+     * of them through GPTk 2.1; IA_INDEX_BUFFER, SO_BUFFER and
+     * BACK_BUFFER_CAST on every format since), and a caller that trusts a
+     * claim builds work Metal cannot run.  A format D3DMetal cannot make is
+     * E_FAIL, as on D3D11 (MSDN CheckFormatSupport); D3DMetal answers it
+     * S_OK with no bits.  TILED is dmn_sparse's to report when it is on. */
+    if (feature == D3D12_FEATURE_FORMAT_SUPPORT) {
+        auto* info = static_cast<D3D12_FEATURE_DATA_FORMAT_SUPPORT*>(data);
+        if (!info || size != sizeof(*info))
+            return E_INVALIDARG;
+        HRESULT hr = orig ? orig(This, feature, data, size) : E_FAIL;
+        if (FAILED(hr) || info->Format == DXGI_FORMAT_UNKNOWN)
+            return hr;
+        if (info->Support1 == D3D12_FORMAT_SUPPORT1_NONE) {
+            info->Support2 = D3D12_FORMAT_SUPPORT2_NONE;
+            return E_FAIL;
+        }
+        uint32_t s1 = 0, s2 = 0;
+        if (dmn_format_support((uint32_t)info->Format, &s1)) {
+            if (!dmn_format_support2((uint32_t)info->Format, &s2))
+                s2 = 0;
+            s1 &= ~kD3D11OnlySupport1;
+            s2 &= ~kD3D11OnlySupport2;
+            UINT tiled = dmn_sparse_enabled() ? (s2 & D3D12_FORMAT_SUPPORT2_TILED) : 0;
+            info->Support1 = (D3D12_FORMAT_SUPPORT1)(info->Support1 & s1);
+            info->Support2 = (D3D12_FORMAT_SUPPORT2)((info->Support2 & s2) | tiled);
+        }
+        return hr;
+    }
     HRESULT hr = orig ? orig(This, feature, data, size) : E_FAIL;
     /* Same correction as the D3D11 CheckMultisampleQualityLevels hook. */
     if (SUCCEEDED(hr) && feature == D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS &&
@@ -2889,6 +3042,8 @@ HRESULT STDMETHODCALLTYPE hook_d3d12_CreateReservedResource(
         ID3D12Device* This, const D3D12_RESOURCE_DESC* desc,
         D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE* clear,
         REFIID riid, void** out) {
+    if (!dmn_desc_format_ok(This, desc))
+        return E_INVALIDARG;
     auto orig = DMN_ORIG(d3d12_CreateReservedResource, This);
     if (!desc || !out)
         return orig ? orig(This, desc, state, clear, riid, out) : E_FAIL;
@@ -3493,6 +3648,15 @@ extern "C" void dmn_hooks_after_d3d12_device(void* device) {
         DMN_PATCH(d, ID3D12Device, CreateCommandQueue, d3d12_CreateCommandQueue);
         DMN_PATCH(d, ID3D12Device, CreateReservedResource, d3d12_CreateReservedResource);
         DMN_PATCH(d, ID3D12Device, GetResourceTiling, d3d12_GetResourceTiling);
+        {
+            /* Overloaded (explicit-return slot + by-value wrapper): spell the
+             * virtual's exact member type to pick the slot. */
+            using Grai = D3D12_RESOURCE_ALLOCATION_INFO* (STDMETHODCALLTYPE ID3D12Device::*)(
+                D3D12_RESOURCE_ALLOCATION_INFO*, UINT, UINT, const D3D12_RESOURCE_DESC*);
+            dmn_patch_slot(d, dmn_vindex(static_cast<Grai>(&ID3D12Device::GetResourceAllocationInfo)),
+                           (void*)hook_d3d12_GetResourceAllocationInfo,
+                           h_d3d12_GetResourceAllocationInfo);
+        }
         DMN_PATCH(d, ID3D12Device, CheckFeatureSupport, d3d12_CheckFeatureSupport);
         DMN_PATCH(d, ID3D12Device, CreateCommandList, d3d12_CreateCommandList);
         DMN_PATCH(d, ID3D12Device, CreateGraphicsPipelineState,
@@ -3526,6 +3690,8 @@ extern "C" void dmn_hooks_after_d3d12_device(void* device) {
         DMN_PATCH(d4, ID3D12Device4, CreateReservedResource1,
                   d3d12_CreateReservedResource1);
         DMN_PATCH(d4, ID3D12Device4, CreateCommandList1, d3d12_CreateCommandList1);
+        DMN_PATCH(d4, ID3D12Device4, GetResourceAllocationInfo1,
+                  d3d12_GetResourceAllocationInfo1);
         d4->Release();
     }
     ID3D12Device8* d8 = nullptr;
@@ -3535,6 +3701,8 @@ extern "C" void dmn_hooks_after_d3d12_device(void* device) {
                   d3d12_CreateCommittedResource2);
         DMN_PATCH(d8, ID3D12Device8, CreatePlacedResource1,
                   d3d12_CreatePlacedResource1);
+        DMN_PATCH(d8, ID3D12Device8, GetResourceAllocationInfo2,
+                  d3d12_GetResourceAllocationInfo2);
         d8->Release();
     }
     ID3D12Device9* d9 = nullptr;
@@ -3553,6 +3721,13 @@ extern "C" void dmn_hooks_after_d3d12_device(void* device) {
         DMN_PATCH(d10, ID3D12Device10, CreateReservedResource2,
                   d3d12_CreateReservedResource2);
         d10->Release();
+    }
+    ID3D12Device12* d12 = nullptr;
+    if (SUCCEEDED(dev->QueryInterface(__uuidof(ID3D12Device12),
+                                      reinterpret_cast<void**>(&d12))) && d12) {
+        DMN_PATCH(d12, ID3D12Device12, GetResourceAllocationInfo3,
+                  d3d12_GetResourceAllocationInfo3);
+        d12->Release();
     }
     DMN_INFO("hooks: patched D3D12 device %p", device);
 }

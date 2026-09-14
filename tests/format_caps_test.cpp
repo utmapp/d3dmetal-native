@@ -6,7 +6,12 @@
 // agrees with CheckFormatSupport (they are the same query in D3D11) and that
 // features we do not own still reach D3DMetal.
 #include <d3d11_2.h>
+#include <d3d12.h>
+#include "dmn_d3d12_up.h"
 #include <cstdio>
+#include <cstring>
+#include <cstdint>
+#include <initializer_list>
 
 template<class T> struct Com {
     T* p=nullptr; ~Com(){ if(p)p->Release(); }
@@ -223,6 +228,126 @@ int main(){
     // A null out pointer is an error, not a crash.
     expect(dev->CheckFormatSupport(DXGI_FORMAT_R8G8B8A8_UNORM,nullptr)==E_INVALIDARG,
            "null pFormatSupport rejected");
+
+    // D3D12 FORMAT_SUPPORT is D3DMetal's answer less what the D3D11 table
+    // says Metal lacks, so it never claims more than CheckFormatSupport, and
+    // never a D3D11-only bit (MIP_AUTOGEN, CPU_LOCKABLE are not in
+    // D3D12_FORMAT_SUPPORT1).  D3D9On12 sizes its D3D9 format list from it.
+    {
+        Com<ID3D12Device> d12;
+        if(FAILED(D3D12CreateDevice(nullptr,D3D_FEATURE_LEVEL_11_0,
+                                    __uuidof(ID3D12Device),(void**)&d12))){
+            printf("FAIL D3D12CreateDevice\n"); g_fail++;
+        } else {
+            const UINT kD3D11Only=D3D11_FORMAT_SUPPORT_MIP_AUTOGEN|
+                                  D3D11_FORMAT_SUPPORT_CPU_LOCKABLE;
+            for(DXGI_FORMAT f : kSpread){
+                UINT direct=0;
+                dev->CheckFormatSupport(f,&direct);
+                D3D12_FEATURE_DATA_FORMAT_SUPPORT fs={f,D3D12_FORMAT_SUPPORT1_NONE,
+                                                     D3D12_FORMAT_SUPPORT2_NONE};
+                HRESULT hr=d12->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT,&fs,sizeof(fs));
+                UINT s1=(UINT)fs.Support1;
+                if(hr!=S_OK||!(s1&D3D12_FORMAT_SUPPORT1_TEXTURE2D)||(s1&~direct)||
+                   (s1&kD3D11Only)){
+                    printf("FAIL D3D12 format %d: FORMAT_SUPPORT hr=0x%08x 0x%08x vs D3D11 0x%08x\n",
+                           (int)f,hr,s1,direct);
+                    g_fail++;
+                }
+            }
+            auto s12=[&](DXGI_FORMAT f,UINT* s1,UINT* s2)->HRESULT{
+                D3D12_FEATURE_DATA_FORMAT_SUPPORT fs={f,D3D12_FORMAT_SUPPORT1_NONE,
+                                                     D3D12_FORMAT_SUPPORT2_NONE};
+                HRESULT hr=d12->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT,&fs,sizeof(fs));
+                *s1=(UINT)fs.Support1; if(s2)*s2=(UINT)fs.Support2;
+                return hr;
+            };
+            UINT s1=0,s2=0;
+            s12(DXGI_FORMAT_R8G8B8A8_UNORM,&s1,nullptr);
+            expect((s1&(D3D12_FORMAT_SUPPORT1_RENDER_TARGET|D3D12_FORMAT_SUPPORT1_BLENDABLE))==
+                   (D3D12_FORMAT_SUPPORT1_RENDER_TARGET|D3D12_FORMAT_SUPPORT1_BLENDABLE),
+                   "D3D12 R8G8B8A8_UNORM renders and blends");
+            expect(!(s1&D3D12_FORMAT_SUPPORT1_IA_INDEX_BUFFER),
+                   "D3D12 R8G8B8A8_UNORM is not an index format");
+            s12(DXGI_FORMAT_R32_UINT,&s1,nullptr);
+            expect(s1&D3D12_FORMAT_SUPPORT1_IA_INDEX_BUFFER,"D3D12 R32_UINT is an index format");
+            s12(DXGI_FORMAT_BC1_UNORM,&s1,nullptr);
+            expect(!(s1&D3D12_FORMAT_SUPPORT1_RENDER_TARGET),"D3D12 BC1_UNORM is not a render target");
+            s12(DXGI_FORMAT_R32_TYPELESS,&s1,nullptr);
+            expect(!(s1&D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL),"D3D12 R32_TYPELESS is not depth-stencil");
+            s12(DXGI_FORMAT_R32_UINT,&s1,&s2);
+            expect(!(s2&D3D11_FORMAT_SUPPORT2_SHAREABLE),"D3D12 Support2 has no D3D11-only SHAREABLE");
+
+            // A format D3DMetal cannot make is unsupported: E_FAIL, no bits.
+            for(DXGI_FORMAT f : {DXGI_FORMAT_R8G8_B8G8_UNORM,DXGI_FORMAT_YUY2,DXGI_FORMAT_NV12}){
+                HRESULT hr=s12(f,&s1,&s2);
+                if(!(FAILED(hr)&&s1==0&&s2==0)){
+                    printf("FAIL D3D12 format %d: expected unsupported, hr=0x%08x 0x%08x/0x%08x\n",
+                           (int)f,hr,s1,s2);
+                    g_fail++;
+                }
+            }
+
+            // D3DMetal claims quality levels for BC and video formats here.
+            struct { DXGI_FORMAT f; UINT n; bool want; const char* name; } mcases[] = {
+                { DXGI_FORMAT_R8G8B8A8_UNORM, 4, true,  "D3D12 msaa R8G8B8A8_UNORM x4" },
+                { DXGI_FORMAT_BC1_UNORM,      4, false, "D3D12 msaa BC1_UNORM x4" },
+                { DXGI_FORMAT_YUY2,           4, false, "D3D12 msaa YUY2 x4" },
+            };
+            for(auto& c : mcases){
+                D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS q={c.f,c.n,
+                    D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE,0xdead};
+                HRESULT hr=d12->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS,&q,sizeof(q));
+                bool ok=c.want?(SUCCEEDED(hr)&&q.NumQualityLevels>0)
+                              :(FAILED(hr)||q.NumQualityLevels==0);
+                expect(ok,c.name);
+                if(!ok) printf("     (hr=0x%08x levels=%u)\n",(unsigned)hr,q.NumQualityLevels);
+            }
+
+            // A texture in such a format is refused, not handed to Metal
+            // (which aborts the process on it): GetResourceAllocationInfo
+            // reports an invalid description, the creates E_INVALIDARG.
+            D3D12_RESOURCE_DESC rd={};
+            rd.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            rd.Width=64; rd.Height=64; rd.DepthOrArraySize=1; rd.MipLevels=1;
+            rd.Format=DXGI_FORMAT_YUY2; rd.SampleDesc.Count=1;
+            D3D12_RESOURCE_ALLOCATION_INFO ai=d12->GetResourceAllocationInfo(0,1,&rd);
+            expect(ai.SizeInBytes==UINT64_MAX,"D3D12 YUY2 allocation info is invalid");
+            D3D12_HEAP_PROPERTIES hp={}; hp.Type=D3D12_HEAP_TYPE_DEFAULT;
+            ID3D12Resource* res=nullptr;
+            HRESULT hr=d12->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&rd,
+                D3D12_RESOURCE_STATE_COMMON,nullptr,__uuidof(ID3D12Resource),(void**)&res);
+            expect(hr==E_INVALIDARG&&!res,"D3D12 YUY2 committed create is E_INVALIDARG");
+            if(res) res->Release();
+
+            // The newer allocation-info entry points get the same refusal,
+            // and still answer a supported description.
+            D3D12_RESOURCE_DESC1 rd1={};
+            memcpy(&rd1,&rd,sizeof(rd));
+            D3D12_RESOURCE_DESC ok=rd; ok.Format=DXGI_FORMAT_R8G8B8A8_UNORM;
+            D3D12_RESOURCE_DESC1 ok1={}; memcpy(&ok1,&ok,sizeof(ok));
+            Com<ID3D12Device4> d4;
+            if(SUCCEEDED(d12->QueryInterface(__uuidof(ID3D12Device4),(void**)&d4))){
+                d4->GetResourceAllocationInfo1(&ai,0,1,&rd,nullptr);
+                expect(ai.SizeInBytes==UINT64_MAX,"D3D12 YUY2 allocation info 1 is invalid");
+                d4->GetResourceAllocationInfo1(&ai,0,1,&ok,nullptr);
+                expect(ai.SizeInBytes&&ai.SizeInBytes!=UINT64_MAX,"D3D12 RGBA8 allocation info 1");
+            }
+            Com<ID3D12Device8> d8;
+            if(SUCCEEDED(d12->QueryInterface(__uuidof(ID3D12Device8),(void**)&d8))){
+                d8->GetResourceAllocationInfo2(&ai,0,1,&rd1,nullptr);
+                expect(ai.SizeInBytes==UINT64_MAX,"D3D12 YUY2 allocation info 2 is invalid");
+                d8->GetResourceAllocationInfo2(&ai,0,1,&ok1,nullptr);
+                expect(ai.SizeInBytes&&ai.SizeInBytes!=UINT64_MAX,"D3D12 RGBA8 allocation info 2");
+            }
+            Com<ID3D12Device12> dv12;
+            if(SUCCEEDED(d12->QueryInterface(__uuidof(ID3D12Device12),(void**)&dv12))){
+                UINT32 nc=0; const DXGI_FORMAT* cf=nullptr;
+                dv12->GetResourceAllocationInfo3(&ai,0,1,&rd1,&nc,&cf,nullptr);
+                expect(ai.SizeInBytes==UINT64_MAX,"D3D12 YUY2 allocation info 3 is invalid");
+            }
+        }
+    }
 
     printf(g_fail?"format-caps: %d FAILED\n":"format-caps: OK\n",g_fail);
     return g_fail?1:0;

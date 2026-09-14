@@ -48,7 +48,7 @@ test('device', dmn_device_test, env: ['DMN_LOG=info'], timeout: 300)
 
 format_caps_test = executable('format-caps-test',
   'format_caps_test.cpp',
-  include_directories: test_native_inc,
+  include_directories: [test_native_inc, include_directories('../src')],
   link_with: dmn_lib)
 test('format-caps', format_caps_test, env: ['DMN_LOG=info'], timeout: 300)
 
@@ -345,6 +345,16 @@ present_copy = executable('present-copy-test',
   include_directories: test_native_inc,
   link_with: dmn_lib)
 test('present-copy', present_copy, env: ['DMN_LOG=info'], timeout: 300)
+
+# Diagnostic probe (not a test): packed 16-bit render targets (B4G4R4A4,
+# B5G6R5, B5G5R5A1) cleared and read back, BGRA8 as control.  B4G4R4A4 reads
+# back with its channels rotated on D3DMetal (0xb48f for a clear that packs
+# to 0xfb48), which is every A4R4G4B4/X4R4G4B4 failure in the HLK D3D9
+# alphaprecision, mrt and Colorfill tests.
+packed_rt_probe = executable('packed-rt-probe',
+  'packed_rt_probe.cpp',
+  include_directories: test_native_inc,
+  link_with: dmn_lib)
 
 # Windowless: dmn_open_existing_heap_from_fd — a shm window imported as an
 # ID3D12Heap whose placed buffers alias the caller's pages in both directions
