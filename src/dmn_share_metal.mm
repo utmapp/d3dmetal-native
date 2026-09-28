@@ -188,7 +188,7 @@ int dmn_anon_file(off_t size) {
             snprintf(name, sizeof(name), "/dmn-shm-%d-%x-%x", getpid(), nonce,
                      i);
         }
-        fd = shm_open(name, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0600);
+        fd = shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0600);
         if (fd >= 0) {
             shm_unlink(name); /* anonymous from here on */
             break;
