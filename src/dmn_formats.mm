@@ -17,10 +17,13 @@
  *   3. dmn_format_support() — capability bits -> D3D11_FORMAT_SUPPORT mask.
  *      dxmt's design: which Metal capability implies which D3D bit, which bits
  *      are granted unconditionally, the vertex-attribute and backbuffer/
- *      DISPLAY sets in describe(), and returning E_INVALIDARG for an
- *      unrepresentable format. Neither Apple's tables nor D3DMetal say
+ *      DISPLAY sets in describe(). Neither Apple's tables nor D3DMetal say
  *      anything about D3D semantics, so this layer is reasoned, not sourced —
  *      treat it as the least certain of the three.
+ *   4. kDisallowed — the capabilities MSDN's DXGI format support tables
+ *      mark disallowed for a format at every feature level from 11.0 to
+ *      12.1, cleared from layer 3's answer. Authoritative for what no D3D
+ *      implementation may report.
  *
  * The mapping mirrors the format table D3DMetal itself uses, which is static
  * and device-independent — only the per-entry capability flags vary with the
@@ -852,6 +855,148 @@ uint32_t dmn_format_linear_bpp(uint32_t mtl_pixel_format) {
     return linear_bpp((MTLPixelFormat)mtl_pixel_format);
 }
 
+namespace {
+
+/* == What D3D forbids ===================================================== */
+/* D3D11_FORMAT_SUPPORT / _SUPPORT2 bits that MSDN's "DXGI Format Support for
+ * Direct3D Feature Level 11.0/11.1/12.0/12.1 Hardware" tables mark disallowed
+ * for the format at every level whose table has the column (12.1 has no
+ * Mipmap Auto-Generation), indexed by DXGI_FORMAT.  Generated from those
+ * tables' columns (Buffer -> BUFFER, Shader ld -> SHADER_LOAD, ...,
+ * Shared Resource -> SHAREABLE, Tiled Resource -> TILED). */
+struct DisallowedBits {
+    uint32_t support;
+    uint32_t support2;
+};
+
+constexpr DisallowedBits kDisallowed[] = {
+    {0x3ffdfffe, 0x5ff}, /* UNKNOWN */
+    {0x3fedef0f, 0x1ff}, /* R32G32B32A32_TYPELESS */
+    {0x3d090c04, 0x13f}, /* R32G32B32A32_FLOAT */
+    {0x3d8dae04, 0x03f}, /* R32G32B32A32_UINT */
+    {0x3d8dae04, 0x13f}, /* R32G32B32A32_SINT */
+    {0x3fedef0f, 0x7ff}, /* R32G32B32_TYPELESS */
+    {0x3f090c04, 0x7ff}, /* R32G32B32_FLOAT */
+    {0x3f8dae04, 0x6ff}, /* R32G32B32_UINT */
+    {0x3f8dae04, 0x7ff}, /* R32G32B32_SINT */
+    {0x3fedef0f, 0x1ff}, /* R16G16B16A16_TYPELESS */
+    {0x0d010c0c, 0x13f}, /* R16G16B16A16_FLOAT */
+    {0x3d090c0c, 0x13f}, /* R16G16B16A16_UNORM */
+    {0x3d8dae0c, 0x03f}, /* R16G16B16A16_UINT */
+    {0x3d090c0c, 0x13f}, /* R16G16B16A16_SNORM */
+    {0x3d8dae0c, 0x13f}, /* R16G16B16A16_SINT */
+    {0x3fedef0f, 0x5ff}, /* R32G32_TYPELESS */
+    {0x3d090c04, 0x53f}, /* R32G32_FLOAT */
+    {0x3d8dae04, 0x43f}, /* R32G32_UINT */
+    {0x3d8dae04, 0x53f}, /* R32G32_SINT */
+    {0x3fedef4f, 0x7ff}, /* R32G8X24_TYPELESS */
+    {0x3fccef4f, 0x7ff}, /* D32_FLOAT_S8X24_UINT */
+    {0x3b2de84f, 0x7ff}, /* R32_FLOAT_X8X24_TYPELESS */
+    {0x3fadee4f, 0x7ff}, /* X32_TYPELESS_G8X24_UINT */
+    {0x3fedef0f, 0x1ff}, /* R10G10B10A2_TYPELESS */
+    {0x0c010c0c, 0x13f}, /* R10G10B10A2_UNORM */
+    {0x3d8dae0c, 0x03f}, /* R10G10B10A2_UINT */
+    {0x3d190c0c, 0x53f}, /* R11G11B10_FLOAT */
+    {0x3fedef0f, 0x1ff}, /* R8G8B8A8_TYPELESS */
+    {0x0c010c0c, 0x13f}, /* R8G8B8A8_UNORM */
+    {0x0e010c0f, 0x1ff}, /* R8G8B8A8_UNORM_SRGB */
+    {0x3d8dae0c, 0x03f}, /* R8G8B8A8_UINT */
+    {0x3d090c0c, 0x13f}, /* R8G8B8A8_SNORM */
+    {0x3d8dae0c, 0x13f}, /* R8G8B8A8_SINT */
+    {0x3fedef0f, 0x5ff}, /* R16G16_TYPELESS */
+    {0x3d090c0c, 0x53f}, /* R16G16_FLOAT */
+    {0x3d090c0c, 0x53f}, /* R16G16_UNORM */
+    {0x3d8dae0c, 0x43f}, /* R16G16_UINT */
+    {0x3d090c0c, 0x53f}, /* R16G16_SNORM */
+    {0x3d8dae0c, 0x53f}, /* R16G16_SINT */
+    {0x3fedef0f, 0x1ff}, /* R32_TYPELESS */
+    {0x3fccef4f, 0x1ff}, /* D32_FLOAT */
+    {0x39090804, 0x137}, /* R32_FLOAT */
+    {0x3d8dae00, 0x000}, /* R32_UINT */
+    {0x3d8dae04, 0x100}, /* R32_SINT */
+    {0x3fedef4f, 0x7ff}, /* R24G8_TYPELESS */
+    {0x3fccef4f, 0x7ff}, /* D24_UNORM_S8_UINT */
+    {0x3b2de84f, 0x7ff}, /* R24_UNORM_X8_TYPELESS */
+    {0x3fadee4f, 0x7ff}, /* X24_TYPELESS_G8_UINT */
+    {0x3fedef0f, 0x5ff}, /* R8G8_TYPELESS */
+    {0x3d090c0c, 0x13f}, /* R8G8_UNORM */
+    {0x3d8dae0c, 0x43f}, /* R8G8_UINT */
+    {0x3d090c0c, 0x53f}, /* R8G8_SNORM */
+    {0x3d8dae0c, 0x53f}, /* R8G8_SINT */
+    {0x3fedef0f, 0x1ff}, /* R16_TYPELESS */
+    {0x3d090c0c, 0x13f}, /* R16_FLOAT */
+    {0x3fccef4f, 0x1ff}, /* D16_UNORM */
+    {0x3909080c, 0x13f}, /* R16_UNORM */
+    {0x3d8dae08, 0x03f}, /* R16_UINT */
+    {0x3d090c0c, 0x13f}, /* R16_SNORM */
+    {0x3d8dae0c, 0x13f}, /* R16_SINT */
+    {0x3fedef0f, 0x1ff}, /* R8_TYPELESS */
+    {0x3d090c0c, 0x13f}, /* R8_UNORM */
+    {0x3d8dae0c, 0x03f}, /* R8_UINT */
+    {0x3d090c0c, 0x13f}, /* R8_SNORM */
+    {0x3d8dae0c, 0x13f}, /* R8_SINT */
+    {0x3d190c0f, 0x13f}, /* A8_UNORM */
+    {0x00000000, 0x000}, /* R1_UNORM */
+    {0x3f7dec0f, 0x5ff}, /* R9G9B9E5_SHAREDEXP */
+    {0x3f7dec0f, 0x7ff}, /* R8G8_B8G8_UNORM */
+    {0x3f7dec0f, 0x7ff}, /* G8R8_G8B8_UNORM */
+    {0x3fedef1f, 0x1ff}, /* BC1_TYPELESS */
+    {0x3f6dec1f, 0x1ff}, /* BC1_UNORM */
+    {0x3f6dec1f, 0x1ff}, /* BC1_UNORM_SRGB */
+    {0x3fedef1f, 0x1ff}, /* BC2_TYPELESS */
+    {0x3f6dec1f, 0x1ff}, /* BC2_UNORM */
+    {0x3f6dec1f, 0x1ff}, /* BC2_UNORM_SRGB */
+    {0x3fedef1f, 0x1ff}, /* BC3_TYPELESS */
+    {0x3f6dec1f, 0x1ff}, /* BC3_UNORM */
+    {0x3f6dec1f, 0x1ff}, /* BC3_UNORM_SRGB */
+    {0x3fedef1f, 0x5ff}, /* BC4_TYPELESS */
+    {0x3f6dec1f, 0x5ff}, /* BC4_UNORM */
+    {0x3f6dec1f, 0x5ff}, /* BC4_SNORM */
+    {0x3fedef1f, 0x5ff}, /* BC5_TYPELESS */
+    {0x3f6dec1f, 0x5ff}, /* BC5_UNORM */
+    {0x3f6dec1f, 0x5ff}, /* BC5_SNORM */
+    {0x3d190c0c, 0x53f}, /* B5G6R5_UNORM */
+    {0x3d190c0c, 0x53f}, /* B5G5R5A1_UNORM */
+    {0x0c010c0c, 0x13f}, /* B8G8R8A8_UNORM */
+    {0x0f090c0c, 0x1ff}, /* B8G8R8X8_UNORM */
+    {0x0ee5ffdf, 0x1ff}, /* R10G10B10_XR_BIAS_A2_UNORM */
+    {0x3fedef0f, 0x1ff}, /* B8G8R8A8_TYPELESS */
+    {0x0e010c0f, 0x1ff}, /* B8G8R8A8_UNORM_SRGB */
+    {0x3fedef0f, 0x1ff}, /* B8G8R8X8_TYPELESS */
+    {0x3f090c0f, 0x1ff}, /* B8G8R8X8_UNORM_SRGB */
+    {0x3fedef1f, 0x5ff}, /* BC6H_TYPELESS */
+    {0x3f6dec1f, 0x5ff}, /* BC6H_UF16 */
+    {0x3f6dec1f, 0x5ff}, /* BC6H_SF16 */
+    {0x3fedef1f, 0x5ff}, /* BC7_TYPELESS */
+    {0x3f6dec1f, 0x5ff}, /* BC7_UNORM */
+    {0x3f6dec1f, 0x5ff}, /* BC7_UNORM_SRGB */
+    {0x057d0cdf, 0x37f}, /* AYUV */
+    {0x057dfcdf, 0x37f}, /* Y410 */
+    {0x057decdf, 0x37f}, /* Y416 */
+    {0x057d3cdf, 0x37f}, /* NV12 */
+    {0x057d3cdf, 0x37f}, /* P010 */
+    {0x057d3cdf, 0x37f}, /* P016 */
+    {0x07ffffdf, 0x3ff}, /* 420_OPAQUE */
+    {0x057dfcdf, 0x37f}, /* YUY2 */
+    {0x057dfcdf, 0x37f}, /* Y210 */
+    {0x057dfcdf, 0x37f}, /* Y216 */
+    {0x057d3cdf, 0x37f}, /* NV11 */
+    {0x1ffdffdf, 0x7ff}, /* AI44 */
+    {0x1ffdffdf, 0x7ff}, /* IA44 */
+    {0x1ffdffdf, 0x7ff}, /* P8 */
+    {0x1ffdffdf, 0x7ff}, /* A8P8 */
+    {0x3d190c0c, 0x53f}, /* B4G4R4A4_UNORM */
+};
+static_assert(sizeof(kDisallowed) / sizeof(kDisallowed[0]) ==
+              DXGI_FORMAT_B4G4R4A4_UNORM + 1, "one entry per DXGI_FORMAT up to B4G4R4A4");
+
+DisallowedBits disallowed(uint32_t dxgi_format) {
+    constexpr size_t n = sizeof(kDisallowed) / sizeof(kDisallowed[0]);
+    return dxgi_format < n ? kDisallowed[dxgi_format] : DisallowedBits{0, 0};
+}
+
+} /* namespace */
+
 bool dmn_format_support(uint32_t dxgi_format, uint32_t* out_support) {
     /* UNKNOWN is legal and means "structured/raw buffer": no texture caps. */
     if (dxgi_format == DXGI_FORMAT_UNKNOWN) {
@@ -949,7 +1094,7 @@ bool dmn_format_support(uint32_t dxgi_format, uint32_t* out_support) {
         break;
     }
 
-    *out_support = support;
+    *out_support = support & ~disallowed(dxgi_format).support;
     return true;
 }
 
@@ -975,13 +1120,9 @@ bool dmn_format_support2(uint32_t dxgi_format, uint32_t* out_support2) {
         DMN_FMT_SUPPORT2_UAV_ATOMIC_SIGNED_MIN_OR_MAX |
         DMN_FMT_SUPPORT2_UAV_ATOMIC_UNSIGNED_MIN_OR_MAX;
 
-    /* UNKNOWN here is the raw/structured-buffer UAV, which supports the whole
-     * atomic set and typed access. */
+    /* Raw and structured buffers have no typed-UAV capabilities. */
     if (dxgi_format == DXGI_FORMAT_UNKNOWN) {
-        *out_support2 = kAtomicBits |
-                        DMN_FMT_SUPPORT2_UAV_TYPED_LOAD |
-                        DMN_FMT_SUPPORT2_UAV_TYPED_STORE |
-                        DMN_FMT_SUPPORT2_SHAREABLE;
+        *out_support2 = 0;
         return true;
     }
 
@@ -1001,11 +1142,9 @@ bool dmn_format_support2(uint32_t dxgi_format, uint32_t* out_support2) {
                     DMN_FMT_SUPPORT2_UAV_TYPED_STORE;
     if (caps & kCapAtomic)
         support2 |= kAtomicBits | DMN_FMT_SUPPORT2_SHAREABLE;
-    if (caps & kCapBlend)
-        support2 |= DMN_FMT_SUPPORT2_OUTPUT_MERGER_LOGIC_OP; /* UNCHECKED */
     if (caps & kCapSparse)
         support2 |= DMN_FMT_SUPPORT2_TILED;
 
-    *out_support2 = support2;
+    *out_support2 = support2 & ~disallowed(dxgi_format).support2;
     return true;
 }

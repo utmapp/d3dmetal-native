@@ -74,7 +74,7 @@ enum DmnFormatSupport2 : uint32_t {
 
 /* Fill *out_support with the D3D11_FORMAT_SUPPORT mask for a DXGI_FORMAT.
  * Returns false when the format has no Metal representation at all (video,
- * palettized, R1_UNORM, ...), which the caller reports as E_INVALIDARG.
+ * palettized, R1_UNORM, ...), which the caller reports as E_FAIL.
  * DXGI_FORMAT_UNKNOWN is *not* such a case: it is legal and answers
  * BUFFER | CPU_LOCKABLE. */
 bool dmn_format_support(uint32_t dxgi_format, uint32_t* out_support);

@@ -1726,13 +1726,8 @@ HRESULT STDMETHODCALLTYPE hook_d3d11_CreateBuffer(
  * and 0 otherwise — those are the only two values it returns, always with
  * S_OK. We replace the answer outright rather than filtering one; there is
  * nothing in its reply worth preserving. dmn_formats.mm has the tables.
- *
- * One deliberate behavioural difference: for a valid-but-unrepresentable
- * DXGI_FORMAT (NV12, P8, R1_UNORM, ...) D3DMetal returns S_OK with 0, whereas
- * we follow dxmt and return E_INVALIDARG. MSDN reserves E_INVALIDARG for
- * values that are not valid DXGI_FORMATs at all, so S_OK-with-0 is arguably
- * the more conformant answer; this is the first thing to try if an app trips
- * over a video-format query. */
+ * A format Metal cannot represent (NV12, P8, R1_UNORM, ...) is E_FAIL, MSDN's
+ * answer for a format the device does not support. */
 HRESULT STDMETHODCALLTYPE hook_d3d11_CheckFormatSupport(
         ID3D11Device* This, DXGI_FORMAT format, UINT* out) {
     (void)This;
@@ -1741,7 +1736,7 @@ HRESULT STDMETHODCALLTYPE hook_d3d11_CheckFormatSupport(
     uint32_t support = 0;
     if (!dmn_format_support((uint32_t)format, &support)) {
         *out = 0;
-        return E_INVALIDARG;
+        return E_FAIL;
     }
     *out = support;
     return S_OK;
@@ -1810,7 +1805,7 @@ HRESULT STDMETHODCALLTYPE hook_d3d11_CheckFeatureSupport(
         uint32_t support2 = 0;
         if (!dmn_format_support2((uint32_t)info->InFormat, &support2)) {
             info->OutFormatSupport2 = 0;
-            return E_INVALIDARG;
+            return E_FAIL;
         }
         info->OutFormatSupport2 = support2;
         return S_OK;

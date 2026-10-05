@@ -34,10 +34,12 @@ static void expect_bits(ID3D11Device* dev,DXGI_FORMAT f,const char* name,
     if(sup&deny){ printf("FAIL %s: 0x%08x has forbidden 0x%08x\n",name,sup,sup&deny); g_fail++; }
 }
 
-static void expect_invalid(ID3D11Device* dev,DXGI_FORMAT f,const char* name){
+// MSDN: CheckFormatSupport returns E_FAIL for a format the device does
+// not support.
+static void expect_unsupported(ID3D11Device* dev,DXGI_FORMAT f,const char* name){
     UINT sup=0xdeadbeef;
     HRESULT hr=dev->CheckFormatSupport(f,&sup);
-    if(hr!=E_INVALIDARG){ printf("FAIL %s: expected E_INVALIDARG, got 0x%08x\n",name,hr); g_fail++; }
+    if(hr!=E_FAIL||sup){ printf("FAIL %s: expected E_FAIL and no bits, got 0x%08x 0x%08x\n",name,hr,sup); g_fail++; }
 }
 
 int main(){
@@ -103,9 +105,9 @@ int main(){
         0,D3D11_FORMAT_SUPPORT_DEPTH_STENCIL);
 
     // No Metal representation at all.
-    expect_invalid(dev.ptr(),DXGI_FORMAT_NV12,"NV12");
-    expect_invalid(dev.ptr(),DXGI_FORMAT_P8,"P8");
-    expect_invalid(dev.ptr(),DXGI_FORMAT_R1_UNORM,"R1_UNORM");
+    expect_unsupported(dev.ptr(),DXGI_FORMAT_NV12,"NV12");
+    expect_unsupported(dev.ptr(),DXGI_FORMAT_P8,"P8");
+    expect_unsupported(dev.ptr(),DXGI_FORMAT_R1_UNORM,"R1_UNORM");
 
     // A plain color format: renderable, blendable, displayable, mip-genable.
     expect_bits(dev.ptr(),DXGI_FORMAT_R8G8B8A8_UNORM,"RGBA8_UNORM",
@@ -121,12 +123,42 @@ int main(){
         D3D11_FORMAT_SUPPORT_RENDER_TARGET|D3D11_FORMAT_SUPPORT_BUFFER|
         D3D11_FORMAT_SUPPORT_MIP_AUTOGEN|D3D11_FORMAT_SUPPORT_BLENDABLE);
 
-    // Depth-stencil: comparison sampling, never a color target or a buffer.
+    // Depth-stencil: a target, never a color target or a buffer.  Comparison
+    // sampling belongs to the single-plane view (R24_UNORM_X8_TYPELESS), not
+    // the D* format, which is not shader-readable at all.
     expect_bits(dev.ptr(),DXGI_FORMAT_D24_UNORM_S8_UINT,"D24S8",
-        D3D11_FORMAT_SUPPORT_DEPTH_STENCIL|
-        D3D11_FORMAT_SUPPORT_SHADER_SAMPLE_COMPARISON,
+        D3D11_FORMAT_SUPPORT_DEPTH_STENCIL,
         D3D11_FORMAT_SUPPORT_RENDER_TARGET|D3D11_FORMAT_SUPPORT_BUFFER|
-        D3D11_FORMAT_SUPPORT_BLENDABLE);
+        D3D11_FORMAT_SUPPORT_BLENDABLE|D3D11_FORMAT_SUPPORT_SHADER_LOAD|
+        D3D11_FORMAT_SUPPORT_SHADER_SAMPLE_COMPARISON|D3D11_FORMAT_SUPPORT_TEXTURE3D);
+    expect_bits(dev.ptr(),DXGI_FORMAT_R24_UNORM_X8_TYPELESS,"R24_UNORM_X8_TYPELESS",
+        D3D11_FORMAT_SUPPORT_SHADER_SAMPLE_COMPARISON,
+        D3D11_FORMAT_SUPPORT_DEPTH_STENCIL);
+
+    // Capabilities MSDN's DXGI format support tables disallow outright.
+    expect_bits(dev.ptr(),DXGI_FORMAT_R8G8B8A8_TYPELESS,"R8G8B8A8_TYPELESS",
+        D3D11_FORMAT_SUPPORT_TEXTURE2D,
+        D3D11_FORMAT_SUPPORT_RENDER_TARGET|D3D11_FORMAT_SUPPORT_SHADER_SAMPLE|
+        D3D11_FORMAT_SUPPORT_SHADER_LOAD|D3D11_FORMAT_SUPPORT_BUFFER);
+    expect_bits(dev.ptr(),DXGI_FORMAT_R32_UINT,"R32_UINT (no filtering)",
+        D3D11_FORMAT_SUPPORT_SHADER_LOAD,
+        D3D11_FORMAT_SUPPORT_SHADER_SAMPLE|D3D11_FORMAT_SUPPORT_MIP_AUTOGEN);
+    expect_bits(dev.ptr(),DXGI_FORMAT_BC1_UNORM,"BC1_UNORM (no 1D, no MSAA load)",
+        D3D11_FORMAT_SUPPORT_TEXTURE2D,
+        D3D11_FORMAT_SUPPORT_TEXTURE1D|D3D11_FORMAT_SUPPORT_MULTISAMPLE_LOAD);
+    {
+        D3D11_FEATURE_DATA_FORMAT_SUPPORT2 f={DXGI_FORMAT_R32_FLOAT,0};
+        dev->CheckFeatureSupport(D3D11_FEATURE_FORMAT_SUPPORT2,&f,sizeof(f));
+        expect(!(f.OutFormatSupport2&D3D11_FORMAT_SUPPORT2_OUTPUT_MERGER_LOGIC_OP),
+               "R32_FLOAT has no logic op");
+        D3D11_FEATURE_DATA_FORMAT_SUPPORT2 g={DXGI_FORMAT_R32G32_UINT,0};
+        dev->CheckFeatureSupport(D3D11_FEATURE_FORMAT_SUPPORT2,&g,sizeof(g));
+        expect(!(g.OutFormatSupport2&D3D11_FORMAT_SUPPORT2_UAV_ATOMIC_ADD),
+               "R32G32_UINT has no typed UAV atomics");
+        D3D11_FEATURE_DATA_FORMAT_SUPPORT2 n={DXGI_FORMAT_NV12,0xdeadbeef};
+        HRESULT hr=dev->CheckFeatureSupport(D3D11_FEATURE_FORMAT_SUPPORT2,&n,sizeof(n));
+        expect(hr==E_FAIL&&!n.OutFormatSupport2,"NV12 FORMAT_SUPPORT2 is E_FAIL");
+    }
     expect_bits(dev.ptr(),DXGI_FORMAT_D32_FLOAT,"D32_FLOAT",
         D3D11_FORMAT_SUPPORT_DEPTH_STENCIL,
         D3D11_FORMAT_SUPPORT_RENDER_TARGET|D3D11_FORMAT_SUPPORT_BUFFER);
