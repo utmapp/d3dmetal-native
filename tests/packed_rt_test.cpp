@@ -2,15 +2,16 @@
  * Copyright 2026 Turing Software LLC
  * SPDX-License-Identifier: MIT
  *
- * Diagnostic probe (not a test): packed 16-bit render targets in isolation.
- * Clear a B4G4R4A4, B5G6R5 and B5G5R5A1 render target to a known colour,
+ * Every packed 16-bit format the device advertises as a render target must
+ * render it: clear a B4G4R4A4, B5G6R5 and B5G5R5A1 target to a known colour,
  * copy it into a readback buffer and decode the pixel; BGRA8 is the control.
- * On D3DMetal the B4G4R4A4 pixel comes back with its channels rotated
- * (0xb48f where DXGI packing puts the clear at 0xfb48), which is every
- * A4R4G4B4/X4R4G4B4 failure in the HLK D3D9 alphaprecision, mrt and
- * Colorfill tests; the other three formats round-trip.
+ * A format without D3D12_FORMAT_SUPPORT1_RENDER_TARGET is skipped.
  *
- * Prints one line per format; exit status 1 if any format decodes wrong.
+ * D3DMetal stores B4G4R4A4 as MTLPixelFormatABGR4Unorm, whose nibble order
+ * differs from DXGI's; it swizzles reads but cannot swizzle render writes,
+ * so a clear comes back rotated (0xb48f where DXGI packing puts it at
+ * 0xfb48) -- every A4R4G4B4/X4R4G4B4 failure in the HLK D3D9 alphaprecision,
+ * mrt and Colorfill tests.
  */
 #include <cstdint>
 #include <cstdio>
@@ -92,6 +93,13 @@ static unsigned decode_channel(uint32_t px, unsigned shift, unsigned bits) {
 }
 
 static bool probe(ID3D12Device* dev, Submit& sub, const Fmt& fmt) {
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT fs{};
+    fs.Format = fmt.f;
+    if (FAILED(dev->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof(fs))) ||
+        !(fs.Support1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET)) {
+        printf("PACKEDRT: %-9s not advertised as a render target; skipped\n", fmt.name);
+        return true;
+    }
     D3D12_HEAP_PROPERTIES hpDef{};
     hpDef.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC rd{};
@@ -223,7 +231,7 @@ int main() {
     for (const Fmt& f : kFmts)
         if (!probe(dev.ptr(), sub, f))
             bad++;
-    EXPECT(bad == 0, "a packed render target decoded wrong");
+    EXPECT(bad == 0, "an advertised packed render target decoded wrong");
     T_PASS();
     return 0;
 }

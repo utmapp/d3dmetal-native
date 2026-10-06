@@ -147,7 +147,10 @@ void build_table(id<MTLDevice> dev, CapTable& t) {
     /* Packed 16-bit: resolvable, but not shader-writable. */
     cap(MTLPixelFormatB5G6R5Unorm, kCapPacked16);
     cap(MTLPixelFormatA1BGR5Unorm, kCapPacked16);
-    cap(MTLPixelFormatABGR4Unorm, kCapPacked16);
+    /* Sample-only: DXGI B4G4R4A4 is ABGR4Unorm with a different nibble
+     * order.  D3DMetal swizzles reads, but render writes cannot be swizzled,
+     * so a target of it comes back channel-rotated (packed-rt-test). */
+    cap(MTLPixelFormatABGR4Unorm, kCapFilter | kCapSparse);
     cap(MTLPixelFormatBGR5A1Unorm, kCapPacked16);
 
     cap(MTLPixelFormatR32Uint, kCapInt32 | kCapBufAll);

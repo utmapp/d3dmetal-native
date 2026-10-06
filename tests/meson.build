@@ -346,15 +346,20 @@ present_copy = executable('present-copy-test',
   link_with: dmn_lib)
 test('present-copy', present_copy, env: ['DMN_LOG=info'], timeout: 300)
 
-# Diagnostic probe (not a test): packed 16-bit render targets (B4G4R4A4,
-# B5G6R5, B5G5R5A1) cleared and read back, BGRA8 as control.  B4G4R4A4 reads
-# back with its channels rotated on D3DMetal (0xb48f for a clear that packs
-# to 0xfb48), which is every A4R4G4B4/X4R4G4B4 failure in the HLK D3D9
-# alphaprecision, mrt and Colorfill tests.
-packed_rt_probe = executable('packed-rt-probe',
-  'packed_rt_probe.cpp',
+# Every packed 16-bit format advertised as a render target round-trips a
+# clear (B4G4R4A4 is not advertised: D3DMetal renders it channel-rotated).
+packed_rt_test = executable('packed-rt-test',
+  'packed_rt_test.cpp',
   include_directories: test_native_inc,
   link_with: dmn_lib)
+test('packed-rt', packed_rt_test, env: ['DMN_LOG=info'], timeout: 120)
+
+# Packed 16-bit formats sample correctly after a CPU upload in DXGI packing.
+packed_sample_test = executable('packed-sample-test',
+  'packed_sample_test.cpp',
+  include_directories: test_native_inc,
+  link_with: dmn_lib)
+test('packed-sample', packed_sample_test, env: ['DMN_LOG=info'], timeout: 120)
 
 # Windowless: dmn_open_existing_heap_from_fd — a shm window imported as an
 # ID3D12Heap whose placed buffers alias the caller's pages in both directions
