@@ -3174,6 +3174,25 @@ void patch_d3d12_queue(IUnknown* obj) {
     }
 }
 
+/* == DXIL subroutine inlining ============================================= */
+
+/* A shader stage's bytecode after dmn_dxil_inline_subroutines, owned for
+ * the duration of one pipeline create. */
+struct DmnNormalizedStage {
+    void* code = nullptr;
+    ~DmnNormalizedStage() { free(code); }
+    bool apply(D3D12_SHADER_BYTECODE& bc) {
+        size_t n = 0;
+        if (!bc.pShaderBytecode ||
+            !dmn_dxil_inline_subroutines(bc.pShaderBytecode, bc.BytecodeLength,
+                                         &code, &n))
+            return false;
+        bc.pShaderBytecode = code;
+        bc.BytecodeLength = n;
+        return true;
+    }
+};
+
 /* == DXIL input-layout placeholder resolution ============================= */
 
 /* The guest UMD cannot read semantic names out of a bare DXIL program part
@@ -3189,6 +3208,15 @@ HRESULT STDMETHODCALLTYPE hook_d3d12_CreateGraphicsPipelineState(
     auto orig = DMN_ORIG(d3d12_CreateGraphicsPipelineState, This);
     if (!orig)
         return E_FAIL;
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC norm;
+    DmnNormalizedStage stages[2];
+    if (desc) {
+        norm = *desc;
+        bool changed = stages[0].apply(norm.VS);
+        changed = stages[1].apply(norm.PS) || changed;
+        if (changed)
+            desc = &norm;
+    }
     if (!desc || !desc->InputLayout.NumElements ||
         desc->InputLayout.NumElements > 64 ||
         !desc->InputLayout.pInputElementDescs || !desc->VS.pShaderBytecode)

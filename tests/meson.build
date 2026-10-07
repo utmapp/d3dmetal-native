@@ -94,6 +94,23 @@ d3d12_minprec_test = executable('d3d12-minprec-test',
   link_with: dmn_lib)
 test('d3d12-minprec', d3d12_minprec_test, env: ['DMN_LOG=info'], timeout: 300)
 
+# A ps_2_x shader through the runtime's in-driver DXBC conversion (internal
+# functions for its subroutines) builds and renders: the shim inlines it
+# before Metal Shader Converter, which crashes on such a module.
+d3d12_dxconv_subroutine_test = executable('d3d12-dxconv-subroutine-test',
+  ['d3d12_dxconv_subroutine_test.cpp'],
+  include_directories: test_native_inc,
+  link_with: dmn_lib)
+test('d3d12-dxconv-subroutine', d3d12_dxconv_subroutine_test, env: ['DMN_LOG=info'], timeout: 300)
+
+# A guest-built DXIL container whose part offset or size wraps the 32-bit
+# bounds check is rejected instead of read out of bounds.
+dxil_container_bounds_test = executable('dxil-container-bounds-test',
+  ['dxil_container_bounds_test.cpp'],
+  include_directories: test_native_inc,
+  link_with: dmn_lib)
+test('dxil-container-bounds', dxil_container_bounds_test, timeout: 60)
+
 # SV_Barycentrics (SM 6.1) draw + readback: host twin of the guest's
 # barydraw.exe, backing Triton's OPTIONS3.BarycentricsSupported forward.
 d3d12_bary_test = executable('d3d12-bary-test',

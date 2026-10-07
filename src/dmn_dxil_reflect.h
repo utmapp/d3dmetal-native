@@ -1,5 +1,5 @@
 /*
- * DXIL container input-signature reflection (see dmn_dxil_reflect.cpp).
+ * DXIL container reflection and normalization (see dmn_dxil_reflect.cpp).
  */
 
 #ifndef DMN_DXIL_REFLECT_H
@@ -22,6 +22,14 @@ struct dmn_dxil_semantic {
  * Returns the number of entries written (0 on any failure). */
 int dmn_dxil_input_semantics(const void *container, size_t size,
                              struct dmn_dxil_semantic *out, int cap);
+
+/* For a minimal container (one DXIL part, zero digest -- the shape the guest
+ * UMD wraps a bare DXIL program in) whose module defines internal
+ * functions, inline them and turn the globals they shared into locals.
+ * Returns 1 and a malloc'd container in *out / *out_size (caller frees)
+ * when it rewrote the module, 0 to keep the input. */
+int dmn_dxil_inline_subroutines(const void *container, size_t size,
+                                void **out, size_t *out_size);
 
 #ifdef __cplusplus
 }
