@@ -217,6 +217,19 @@ static_assert(offsetof(dmn_shared_texture_handle, fd) == kPodFdOffset &&
               offsetof(dmn_shared_buffer_handle, fd) == kPodFdOffset &&
               offsetof(dmn_shared_fence_handle, fd) == kPodFdOffset,
               "shared-handle PODs must start {u32 magic, u32 version, i32 fd}");
+/* The PODs are a cross-process, cross-library ABI: peers built separately
+ * (dxmt, the Neptune render server) declare the same layout on their own. */
+static_assert(sizeof(dmn_shared_texture_handle) == 72 &&
+              offsetof(dmn_shared_texture_handle, stride) == 48 &&
+              offsetof(dmn_shared_texture_handle, offset) == 64,
+              "dmn_shared_texture_handle ABI drift");
+static_assert(sizeof(dmn_shared_buffer_handle) == 40 &&
+              offsetof(dmn_shared_buffer_handle, size) == 24 &&
+              offsetof(dmn_shared_buffer_handle, offset) == 32,
+              "dmn_shared_buffer_handle ABI drift");
+static_assert(sizeof(dmn_shared_fence_handle) == 24 &&
+              offsetof(dmn_shared_fence_handle, initial_value) == 16,
+              "dmn_shared_fence_handle ABI drift");
 
 template <class Pod>
 HRESULT vend_pod_owned(Pod pod, HANDLE* out) {

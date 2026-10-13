@@ -42,13 +42,6 @@
 #include "dmn_private.h"
 #include "dmn_share.h"
 
-/* Layout parity with the public PODs — the HANDLE the caller ships is exactly
- * these bytes. */
-static_assert(sizeof(DmnShareTexPOD) == sizeof(dmn_shared_texture_handle),
-              "texture POD layout drift");
-static_assert(sizeof(DmnShareFencePOD) == sizeof(dmn_shared_fence_handle),
-              "fence POD layout drift");
-
 /* == Shadow heap ==========================================================
  * D3DMTexture::Finalize initializes a new Shared-storage texture by zeroing
  * `[[tex heap] newBufferWithLength:[heap size] options:[heap resourceOptions]

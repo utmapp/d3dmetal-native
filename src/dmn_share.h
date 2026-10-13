@@ -20,28 +20,6 @@
 #include <cstddef>
 #include <cstdint>
 
-/* Internal mirror of the public PODs (include/d3dmetal_native.h). Kept as a
- * separate declaration so this header has no include-order dependency; the
- * static_asserts in dmn_share_metal.mm check the layouts stay identical. */
-struct DmnShareTexPOD {
-    uint32_t magic, version;
-    int32_t  fd;
-    uint32_t width, height;
-    uint32_t dxgi_format;
-    uint32_t mip_levels, array_size, sample_count;
-    uint32_t bind_flags, misc_flags, cpu_access;
-    uint64_t stride;
-    uint64_t size;
-    uint64_t offset;
-};
-
-struct DmnShareFencePOD {
-    uint32_t magic, version;
-    int32_t  fd;
-    uint32_t flags;
-    uint64_t initial_value;
-};
-
 /* == Arm record (thread-local; set by hooks, consumed by the swizzle) ===== */
 
 enum DmnShareKind {
