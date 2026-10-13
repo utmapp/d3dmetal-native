@@ -257,6 +257,17 @@ int main(){
         expect(hr==S_OK,"D3D11_OPTIONS forwards to D3DMetal");
     }
 
+    // A texture in a format Metal has no pixel format for is refused, not
+    // handed to D3DMetal, whose descriptor validation aborts the process.
+    for(DXGI_FORMAT f : {DXGI_FORMAT_YUY2,DXGI_FORMAT_NV12,DXGI_FORMAT_P8}){
+        D3D11_TEXTURE2D_DESC td={};
+        td.Width=64; td.Height=64; td.MipLevels=1; td.ArraySize=1; td.Format=f;
+        td.SampleDesc.Count=1; td.Usage=D3D11_USAGE_DEFAULT; td.BindFlags=D3D11_BIND_SHADER_RESOURCE;
+        Com<ID3D11Texture2D> t;
+        HRESULT hr=dev->CreateTexture2D(&td,nullptr,&t);
+        if(hr!=E_INVALIDARG){ printf("FAIL CreateTexture2D format %d: hr=0x%08x\n",(int)f,hr); g_fail++; }
+    }
+
     // A null out pointer is an error, not a crash.
     expect(dev->CheckFormatSupport(DXGI_FORMAT_R8G8B8A8_UNORM,nullptr)==E_INVALIDARG,
            "null pFormatSupport rejected");

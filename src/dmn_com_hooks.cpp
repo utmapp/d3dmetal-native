@@ -1453,6 +1453,30 @@ bool open_shared_d3d11(ID3D11Device* dev, HANDLE handle, REFIID iid, void** out,
     return false;
 }
 
+/* Whether D3DMetal itself supports textures of `format`: its own
+ * CheckFormatSupport answers 0 for a format it cannot make. */
+static bool d3dmetal_has_format(ID3D11Device* dev, DXGI_FORMAT format) {
+    auto orig = DMN_ORIG(d3d11_CheckFormatSupport, dev);
+    UINT support = 0;
+    return orig && SUCCEEDED(orig(dev, format, &support)) && support;
+}
+
+/* A texture in a format Metal has no pixel format for (the planar and packed
+ * video formats, P8, R1_UNORM) cannot exist here; D3DMetal's D3D12 creates
+ * abort on such a format inside Metal validation (dmn_desc_format_ok), and its
+ * D3D11 ones take the same descriptor path.  Refuse it the way a driver
+ * refuses an unsupported format.  The format table decides, so that whether
+ * a create is attempted never depends on what a given D3DMetal version
+ * reports about itself. */
+static bool d3d11_format_ok(DXGI_FORMAT format) {
+    uint32_t support = 0;
+    if (dmn_format_support((uint32_t)format, &support))
+        return true;
+    DMN_WARN("refusing a D3D11 texture in DXGI format %d, which has no Metal "
+             "pixel format", (int)format);
+    return false;
+}
+
 /* == D3D11 producer thunks ================================================= */
 HRESULT STDMETHODCALLTYPE hook_d3d11_CreateTexture2D(
         ID3D11Device* This, const D3D11_TEXTURE2D_DESC* desc,
@@ -1460,6 +1484,8 @@ HRESULT STDMETHODCALLTYPE hook_d3d11_CreateTexture2D(
     auto orig = DMN_ORIG(d3d11_CreateTexture2D, This);
     if (!orig)
         return E_FAIL;
+    if (desc && !d3d11_format_ok(desc->Format))
+        return E_INVALIDARG;
     /* is_armed: a consumer reconstruct is mid-flight; pass straight to the
      * swizzle instead of re-detecting a producer create. */
     if (!desc || dmn_share_is_armed() || !is_shared_misc(desc->MiscFlags))
@@ -1494,6 +1520,8 @@ HRESULT STDMETHODCALLTYPE hook_d3d11_CreateTexture2D1(
     auto orig = DMN_ORIG(d3d11_CreateTexture2D1, This);
     if (!orig)
         return E_FAIL;
+    if (desc && !d3d11_format_ok(desc->Format))
+        return E_INVALIDARG;
     if (!desc || dmn_share_is_armed() || !is_shared_misc(desc->MiscFlags))
         return orig(This, desc, init, out);
     if (!share_shape_ok(desc->MipLevels, desc->ArraySize, desc->SampleDesc.Count,
@@ -1747,6 +1775,8 @@ HRESULT STDMETHODCALLTYPE hook_d3d11_CreateTexture1D(
     auto orig = DMN_ORIG(d3d11_CreateTexture1D, This);
     if (!orig)
         return E_FAIL;
+    if (desc && !d3d11_format_ok(desc->Format))
+        return E_INVALIDARG;
     if (desc && is_shared_misc(desc->MiscFlags)) {
         DMN_ERROR("hooks: CreateTexture1D with a SHARED misc flag: only 2D "
                   "textures can be shared");
@@ -1761,6 +1791,8 @@ HRESULT STDMETHODCALLTYPE hook_d3d11_CreateTexture3D(
     auto orig = DMN_ORIG(d3d11_CreateTexture3D, This);
     if (!orig)
         return E_FAIL;
+    if (desc && !d3d11_format_ok(desc->Format))
+        return E_INVALIDARG;
     if (desc && is_shared_misc(desc->MiscFlags)) {
         DMN_ERROR("hooks: CreateTexture3D with a SHARED misc flag: only 2D "
                   "textures can be shared");
@@ -1801,28 +1833,21 @@ HRESULT STDMETHODCALLTYPE hook_d3d11_CreateBuffer(
  * and 0 otherwise — those are the only two values it returns, always with
  * S_OK. We replace the answer outright rather than filtering one; there is
  * nothing in its reply worth preserving. dmn_formats.mm has the tables.
- * A format Metal cannot represent (NV12, P8, R1_UNORM, ...) is E_FAIL, MSDN's
- * answer for a format the device does not support. */
+ * A format Metal cannot represent (NV12, P8, R1_UNORM, ...), or that D3DMetal
+ * cannot make, is E_FAIL, MSDN's answer for a format the device does not
+ * support. */
 HRESULT STDMETHODCALLTYPE hook_d3d11_CheckFormatSupport(
         ID3D11Device* This, DXGI_FORMAT format, UINT* out) {
-    (void)This;
     if (!out)
         return E_INVALIDARG;
     uint32_t support = 0;
-    if (!dmn_format_support((uint32_t)format, &support)) {
+    if (!dmn_format_support((uint32_t)format, &support) ||
+        (format != DXGI_FORMAT_UNKNOWN && !d3dmetal_has_format(This, format))) {
         *out = 0;
         return E_FAIL;
     }
     *out = support;
     return S_OK;
-}
-
-/* Whether D3DMetal itself supports textures of `format`: its own
- * CheckFormatSupport answers 0 for a format it cannot make. */
-static bool d3dmetal_has_format(ID3D11Device* dev, DXGI_FORMAT format) {
-    auto orig = DMN_ORIG(d3d11_CheckFormatSupport, dev);
-    UINT support = 0;
-    return orig && SUCCEEDED(orig(dev, format, &support)) && support;
 }
 
 /* D3DMetal answers quality levels for formats it does not support and for
