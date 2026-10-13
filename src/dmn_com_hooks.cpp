@@ -877,6 +877,35 @@ uint64_t kmtx_extra(UINT misc) {
     return wants_kmtx(misc) ? (uint64_t)dmn_share_page_align(1) : 0;
 }
 
+/* The POD carries D3D11 bind flags whichever API made the resource, so a
+ * consumer of either API is created with the views the producer allowed. */
+UINT d12_flags_to_bind(D3D12_RESOURCE_FLAGS f) {
+    UINT bind = 0;
+    if (!(f & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE))
+        bind |= D3D11_BIND_SHADER_RESOURCE;
+    if (f & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)
+        bind |= D3D11_BIND_RENDER_TARGET;
+    if (f & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)
+        bind |= D3D11_BIND_DEPTH_STENCIL;
+    if (f & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
+        bind |= D3D11_BIND_UNORDERED_ACCESS;
+    return bind;
+}
+
+D3D12_RESOURCE_FLAGS bind_to_d12_flags(UINT bind) {
+    UINT f = 0;
+    if (bind & D3D11_BIND_RENDER_TARGET)
+        f |= D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    if (bind & D3D11_BIND_DEPTH_STENCIL)
+        f |= D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    if (bind & D3D11_BIND_UNORDERED_ACCESS)
+        f |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    /* DENY_SHADER_RESOURCE is only legal alongside ALLOW_DEPTH_STENCIL. */
+    if (!(bind & D3D11_BIND_SHADER_RESOURCE) && (bind & D3D11_BIND_DEPTH_STENCIL))
+        f |= D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;
+    return (D3D12_RESOURCE_FLAGS)f;
+}
+
 /* A shared surface is backed by one linear 2D Metal texture over shared
  * memory, which has one mip, one slice and one sample.  That is also the
  * shape D3D11 guarantees to share without ExtendedResourceSharing (which the
@@ -1285,7 +1314,7 @@ HRESULT import_texture_d3d12(ID3D12Device* dev, const dmn_shared_texture_handle*
     rd.Format = (DXGI_FORMAT)pod->dxgi_format;
     rd.SampleDesc.Count = pod->sample_count ? pod->sample_count : 1;
     rd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    rd.Flags = bind_to_d12_flags(pod->bind_flags);
 
     D3D12_HEAP_PROPERTIES hp{};
     hp.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -2053,6 +2082,9 @@ D3D11_TEXTURE2D_DESC d12_desc_to_11(const DescT& desc) {
     d.ArraySize = desc.DepthOrArraySize ? desc.DepthOrArraySize : 1;
     d.Format = desc.Format;
     d.SampleDesc.Count = desc.SampleDesc.Count ? desc.SampleDesc.Count : 1;
+    d.Usage = D3D11_USAGE_DEFAULT;
+    d.BindFlags = d12_flags_to_bind(desc.Flags);
+    d.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
     return d;
 }
 
@@ -2074,7 +2106,8 @@ HRESULT d12_create_shared(const DescT* desc, void** out, OrigCall&& call) {
         if (!captured)
             return fail_unshared("D3D12 SHARED buffer create", out);
         record_buffer(reinterpret_cast<IUnknown*>(*out), desc->Width,
-                      0, 0, 0, arm);
+                      d12_flags_to_bind(desc->Flags), D3D11_RESOURCE_MISC_SHARED, 0,
+                      arm);
         arm_fd_close(arm);
         return hr;
     }
@@ -2189,7 +2222,9 @@ HRESULT d12_place_on_synth(DmnSynthHeap* sh, UINT64 offset, const DescT* desc,
          * caller, who already has its own handle to them. */
         if (!sh->imported)
             record_buffer(reinterpret_cast<IUnknown*>(*out), desc->Width,
-                          0, 0, 0, arm, sh->fd_off + offset);
+                          d12_flags_to_bind(desc->Flags),
+                          D3D11_RESOURCE_MISC_SHARED, 0, arm,
+                          sh->fd_off + offset);
         return hr;
     }
 

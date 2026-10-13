@@ -228,6 +228,14 @@ shared_contract_test = executable('shared-contract-test',
   link_with: dmn_lib)
 test('shared-contract', shared_contract_test, env: ['DMN_LOG=info'], timeout: 300)
 
+# A shared texture's view rights cross the POD both ways: a D3D12 export
+# records its resource flags as bind flags, and either API opens it with them.
+shared_flags_test = executable('shared-flags-test',
+  'shared_flags_test.cpp',
+  include_directories: test_native_inc,
+  link_with: dmn_lib)
+test('shared-flags', shared_flags_test, env: ['DMN_LOG=info'], timeout: 300)
+
 # Regression: rendering to an opened shared surface must not discard the
 # contents it already had (create-with-no-initial-data marks it undefined, so
 # the first attach loads with a clear).
