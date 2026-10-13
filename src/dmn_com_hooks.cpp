@@ -2946,7 +2946,9 @@ void STDMETHODCALLTYPE hook_d3d12_GetResourceTiling(
             packed->NumStandardMips = (UINT8)t.standard_mips;
             packed->NumPackedMips = (UINT8)t.packed_mips;
             packed->NumTilesForPackedMips = t.packed_tiles;
-            packed->StartTileIndexInOverallResource = t.packed_start_tile;
+            /* D3D12_PACKED_MIP_INFO: 0 when nothing is packed. */
+            packed->StartTileIndexInOverallResource =
+                t.packed_mips ? t.packed_start_tile : 0;
         }
         if (shape) { shape->WidthInTexels = t.tile_w; shape->HeightInTexels = t.tile_h; shape->DepthInTexels = 1; }
         for (uint32_t i = 0; subs && i < n; i++) {

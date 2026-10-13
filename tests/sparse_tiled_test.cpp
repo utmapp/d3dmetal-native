@@ -152,9 +152,11 @@ int main() {
         c.dev->GetResourceTiling(tex, &total, &pm, &ts, &nsub, 0, &st);
         CHECK(total == 64 && ts.WidthInTexels == 128 && ts.HeightInTexels == 128 && ts.DepthInTexels == 1,
               "GetResourceTiling RGBA8: %u tiles of %ux%ux%u", total, ts.WidthInTexels, ts.HeightInTexels, ts.DepthInTexels);
-        CHECK(pm.NumStandardMips == 1 && pm.NumPackedMips == 0 && pm.NumTilesForPackedMips == 0,
-              "GetResourceTiling RGBA8: %u standard, %u packed mips in %u tiles",
-              pm.NumStandardMips, pm.NumPackedMips, pm.NumTilesForPackedMips);
+        CHECK(pm.NumStandardMips == 1 && pm.NumPackedMips == 0 && pm.NumTilesForPackedMips == 0 &&
+                  pm.StartTileIndexInOverallResource == 0,
+              "GetResourceTiling RGBA8: %u standard, %u packed mips in %u tiles from %u",
+              pm.NumStandardMips, pm.NumPackedMips, pm.NumTilesForPackedMips,
+              pm.StartTileIndexInOverallResource);
         CHECK(nsub == 1 && st.WidthInTiles == 8 && st.HeightInTiles == 8 && st.DepthInTiles == 1 && st.StartTileIndexInOverallResource == 0,
               "GetResourceTiling RGBA8 sub 0: %ux%ux%u tiles from %u", st.WidthInTiles, st.HeightInTiles, st.DepthInTiles,
               st.StartTileIndexInOverallResource);
