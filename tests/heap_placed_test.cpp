@@ -15,7 +15,8 @@
  *  3d. A GPU write through a placed buffer lands in the heap's object and in
  *     no other live shared object's.
  *  3e. A texture placed at a nonzero offset exports/opens with that offset.
- *  3f. 1D/3D placements are created but refuse to export (no window backing).
+ *  3f. 1D/3D placements, and committed SHARED 3D textures, are created but
+ *      refuse to export (no shared backing).
  *  3g. Residency calls and UpdateTileMappings accept the heap without
  *     reaching the framework.
  *  4. CreateCommittedResource1 (ID3D12Device4) shared create, when available.
@@ -459,6 +460,35 @@ int main() {
         } else {
             printf("HEAP: 3D placed create not supported here (0x%08x); "
                    "export refusal not exercised\n", (unsigned)hr);
+        }
+    }
+
+    /* 3f') The same holds for a COMMITTED SHARED 3D texture: no shared
+     * backing exists, so export is refused rather than handed to D3DMetal's
+     * passthrough stub. */
+    {
+        D3D12_RESOURCE_DESC v = tex_desc(16, 16);
+        v.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+        v.DepthOrArraySize = 4;
+        v.Flags = D3D12_RESOURCE_FLAG_NONE;
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        Com<ID3D12Resource> vol;
+        HRESULT hr = dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_SHARED, &v,
+                                                  D3D12_RESOURCE_STATE_COMMON,
+                                                  nullptr, __uuidof(ID3D12Resource),
+                                                  (void**)&vol);
+        if (SUCCEEDED(hr) && vol) {
+            HANDLE hv = (HANDLE)0x1;
+            HRESULT hx = dev->CreateSharedHandle(vol.ptr(), nullptr, 0, nullptr,
+                                                 &hv);
+            EXPECT(hx == E_INVALIDARG && hv == nullptr,
+                   "exporting a committed SHARED 3D texture vended a handle "
+                   "with no shared backing behind it");
+            printf("HEAP: committed SHARED 3D created unshared, export refused\n");
+        } else {
+            printf("HEAP: committed SHARED 3D create not supported here "
+                   "(0x%08x); export refusal not exercised\n", (unsigned)hr);
         }
     }
 

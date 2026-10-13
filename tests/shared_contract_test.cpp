@@ -299,6 +299,19 @@ int test_reject_unshareable_shapes(ID3D11Device* dev) {
         printf(T_TAG ": MISC_SHARED %s rejected (0x%08x): OK\n", c.name,
                (unsigned)hr);
     }
+    D3D11_TEXTURE3D_DESC vd{};
+    vd.Width = vd.Height = vd.Depth = 16;
+    vd.MipLevels = 1;
+    vd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    vd.Usage = D3D11_USAGE_DEFAULT;
+    vd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    vd.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
+    Com<ID3D11Texture3D> vol;
+    if (SUCCEEDED(dev->CreateTexture3D(&vd, nullptr, &vol))) {
+        fprintf(stderr, T_TAG ": MISC_SHARED Texture3D create SUCCEEDED; D3D11 "
+                "shares only 2D textures\n");
+        return 1;
+    }
     D3D11_FEATURE_DATA_D3D11_OPTIONS opt{};
     if (SUCCEEDED(dev->CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS, &opt,
                                            sizeof(opt))) &&

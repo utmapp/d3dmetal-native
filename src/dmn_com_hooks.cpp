@@ -123,13 +123,13 @@ std::unordered_map<void*, dmn_shared_texture_handle> g_tex_reg; /* identity -> P
 std::unordered_map<void*, dmn_shared_buffer_handle>  g_buf_reg;
 std::unordered_map<void*, int> g_owned_fds; /* identity -> registry-owned dup */
 
-/* Resources placed in a SHARED heap with a dimension the window machinery
- * cannot back (1D/3D). They are real committed resources — correct memory,
- * correct lifetime — but they do NOT alias the heap and must not export: a
- * handle for them would hand a peer memory that is not theirs. Registered so
- * CreateSharedHandle fails them loudly instead of falling through to
- * D3DMetal's fake-passthrough handle. */
-std::unordered_set<void*> g_unshared_placed; /* under g_reg_mtx */
+/* D3D12 resources created SHARED (committed, or placed in a SHARED heap) with
+ * a dimension the shared-memory machinery cannot back (1D/3D). D3D12 lets any
+ * resource be shared, so the create stands as a real private resource, but it
+ * must not export: a handle for it would hand a peer memory that is not the
+ * resource's. Registered so CreateSharedHandle fails them loudly instead of
+ * falling through to D3DMetal's fake-passthrough handle. */
+std::unordered_set<void*> g_unshared; /* under g_reg_mtx */
 
 /* Every registration stores its OWN duplicate of the backing fd in its POD
  * (closed at eviction). This is what makes re-export from an OPENED resource
@@ -254,7 +254,7 @@ HRESULT vend_pod_owned(Pod pod, HANDLE* out) {
  * is validated by the evict-contract meson test against the vendored
  * framework, not re-probed at runtime. */
 
-enum EvictKind { EV_TEX, EV_BUF, EV_FENCE, EV_UNSHARED_PLACED, EV_SPARSE };
+enum EvictKind { EV_TEX, EV_BUF, EV_FENCE, EV_UNSHARED, EV_SPARSE };
 
 /* {7D3A1F7B-9C44-4A6E-8F21-5D0E6B3CA942} — private-data slot for the sentinel. */
 const GUID kDmnEvictGuid = {0x7d3a1f7b, 0x9c44, 0x4a6e,
@@ -265,7 +265,7 @@ const char* evict_kind_name(int kind) {
     case EV_TEX:   return "texture";
     case EV_BUF:   return "buffer";
     case EV_FENCE: return "fence";
-    case EV_UNSHARED_PLACED: return "unshared-placement";
+    case EV_UNSHARED: return "unshareable";
     case EV_SPARSE: return "sparse-reserved";
     default:       return "?";
     }
@@ -289,10 +289,10 @@ void evict_identity(void* id, int kind) {
     case EV_FENCE:
         dmn_fd3d_fence_destroy(id);
         break;
-    case EV_UNSHARED_PLACED:
+    case EV_UNSHARED:
         {
             std::lock_guard<std::mutex> lk(g_reg_mtx);
-            g_unshared_placed.erase(id);
+            g_unshared.erase(id);
         }
         break;
     case EV_SPARSE:
@@ -1187,6 +1187,20 @@ HRESULT fail_unshared(const char* what, void** out) {
     return E_FAIL;
 }
 
+/* Record a successfully created resource that carries a SHARED flag but has
+ * no shared backing (see g_unshared). */
+void register_unshared(void** out) {
+    if (!out || !*out)
+        return;
+    auto* res = reinterpret_cast<IUnknown*>(*out);
+    void* id = dmn_com_identity(res);
+    {
+        std::lock_guard<std::mutex> lk(g_reg_mtx);
+        g_unshared.insert(id);
+    }
+    attach_evict_sentinel(res, id, EV_UNSHARED);
+}
+
 /* == Import (consumer reconstruction) ===================================== */
 HRESULT import_texture_d3d11(ID3D11Device* dev, const dmn_shared_texture_handle* pod,
                              REFIID iid, void** out) {
@@ -1725,17 +1739,19 @@ HRESULT STDMETHODCALLTYPE hook_d3d11_CreateUnorderedAccessView1(
     return hr;
 }
 
-/* 1D/3D shared textures have no backing implementation: warn loudly instead
- * of letting the app discover a silently unshared resource at export time. */
+/* D3D11 shares only 2D textures (D3D11_RESOURCE_MISC_SHARED: "The only
+ * resources that can be shared are 2D non-mipmapped textures"). */
 HRESULT STDMETHODCALLTYPE hook_d3d11_CreateTexture1D(
         ID3D11Device* This, const D3D11_TEXTURE1D_DESC* desc,
         const D3D11_SUBRESOURCE_DATA* init, ID3D11Texture1D** out) {
     auto orig = DMN_ORIG(d3d11_CreateTexture1D, This);
     if (!orig)
         return E_FAIL;
-    if (desc && is_shared_misc(desc->MiscFlags))
-        DMN_WARN("hooks: CreateTexture1D with a SHARED misc flag is not "
-                 "supported; the texture is created UNSHARED");
+    if (desc && is_shared_misc(desc->MiscFlags)) {
+        DMN_ERROR("hooks: CreateTexture1D with a SHARED misc flag: only 2D "
+                  "textures can be shared");
+        return E_INVALIDARG;
+    }
     return orig(This, desc, init, out);
 }
 
@@ -1745,9 +1761,11 @@ HRESULT STDMETHODCALLTYPE hook_d3d11_CreateTexture3D(
     auto orig = DMN_ORIG(d3d11_CreateTexture3D, This);
     if (!orig)
         return E_FAIL;
-    if (desc && is_shared_misc(desc->MiscFlags))
-        DMN_WARN("hooks: CreateTexture3D with a SHARED misc flag is not "
-                 "supported; the texture is created UNSHARED");
+    if (desc && is_shared_misc(desc->MiscFlags)) {
+        DMN_ERROR("hooks: CreateTexture3D with a SHARED misc flag: only 2D "
+                  "textures can be shared");
+        return E_INVALIDARG;
+    }
     return orig(This, desc, init, out);
 }
 
@@ -2132,9 +2150,13 @@ HRESULT d12_create_shared(const DescT* desc, void** out, OrigCall&& call) {
         arm_fd_close(arm);
         return hr;
     }
-    DMN_WARN("hooks: D3D12 SHARED create with unsupported dimension %d passes "
-             "through UNSHARED", (int)desc->Dimension);
-    return call();
+    DMN_WARN("hooks: D3D12 SHARED create with dimension %d has no shared "
+             "backing; it is created UNSHARED and cannot be exported",
+             (int)desc->Dimension);
+    HRESULT hr = call();
+    if (SUCCEEDED(hr))
+        register_unshared(out);
+    return hr;
 }
 
 /* Heap properties for a placed->committed translation.
@@ -2260,15 +2282,8 @@ HRESULT d12_place_on_synth(DmnSynthHeap* sh, UINT64 offset, const DescT* desc,
              "window backing; it is created UNSHARED (does not alias the heap, "
              "cannot be exported)", (int)desc->Dimension);
     HRESULT hr = commit(); /* unarmed: a plain private committed resource */
-    if (SUCCEEDED(hr) && out && *out) {
-        auto* res = reinterpret_cast<IUnknown*>(*out);
-        void* id = dmn_com_identity(res);
-        {
-            std::lock_guard<std::mutex> lk(g_reg_mtx);
-            g_unshared_placed.insert(id);
-        }
-        attach_evict_sentinel(res, id, EV_UNSHARED_PLACED);
-    }
+    if (SUCCEEDED(hr))
+        register_unshared(out);
     return hr;
 }
 
@@ -3428,20 +3443,19 @@ HRESULT STDMETHODCALLTYPE hook_d3d12_CreateSharedHandle(
             return S_OK;
         if (SUCCEEDED(return_buffer_pod(unk, out, /*nt=*/true)))
             return S_OK;
-        /* A 1D/3D resource placed in a SHARED heap has no shared backing (see
-         * d12_place_on_synth). A handle for it would point a peer at memory
-         * that is not the resource's — fail here, where the app can see it,
-         * instead of at first use of a blank surface. */
+        /* A SHARED 1D/3D resource has no shared backing (see g_unshared).
+         * Fail here, where the app can see it, instead of at first use of a
+         * blank surface. */
         void* id = dmn_com_identity(unk);
         bool unshared;
         {
             std::lock_guard<std::mutex> lk(g_reg_mtx);
-            unshared = g_unshared_placed.count(id) != 0;
+            unshared = g_unshared.count(id) != 0;
         }
         if (unshared) {
-            DMN_ERROR("hooks: CreateSharedHandle on a 1D/3D resource placed in "
-                      "a SHARED heap — no shared backing exists for that "
-                      "dimension, refusing to vend a handle");
+            DMN_ERROR("hooks: CreateSharedHandle on a SHARED 1D/3D resource — "
+                      "no shared backing exists for that dimension, refusing "
+                      "to vend a handle");
             *out = nullptr;
             return E_INVALIDARG;
         }
