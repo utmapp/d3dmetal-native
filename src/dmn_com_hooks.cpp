@@ -775,6 +775,8 @@ HRESULT STDMETHODCALLTYPE hook_d3d12_CreateCommandQueue(ID3D12Device*,
     const D3D12_COMMAND_QUEUE_DESC*, REFIID, void**);
 HRESULT STDMETHODCALLTYPE hook_d3d12_CreateGraphicsPipelineState(ID3D12Device*,
     const D3D12_GRAPHICS_PIPELINE_STATE_DESC*, REFIID, void**);
+HRESULT STDMETHODCALLTYPE hook_d3d12_CreateComputePipelineState(ID3D12Device*,
+    const D3D12_COMPUTE_PIPELINE_STATE_DESC*, REFIID, void**);
 HRESULT STDMETHODCALLTYPE hook_d3d12_CreateCommandQueue1(ID3D12Device9*,
     const D3D12_COMMAND_QUEUE_DESC*, REFIID, REFIID, void**);
 HRESULT STDMETHODCALLTYPE hook_d3d12_SetEventOnMultipleFenceCompletion(ID3D12Device1*,
@@ -863,6 +865,7 @@ DMN_HOOK_STATE(d3d12_CreateCommandList);
 DMN_HOOK_STATE(d3d12_CreateCommandList1);
 DMN_HOOK_STATE(d3d12_CreateCommandQueue1);
 DMN_HOOK_STATE(d3d12_CreateGraphicsPipelineState);
+DMN_HOOK_STATE(d3d12_CreateComputePipelineState);
 DMN_HOOK_STATE(d3d12_SetEventOnMultipleFenceCompletion);
 DMN_HOOK_STATE(queue_Signal);
 DMN_HOOK_STATE(queue_Wait);
@@ -3332,7 +3335,9 @@ struct DmnNormalizedStage {
 };
 
 /* In-driver-converted DXIL reaches D3DMetal with its subroutines inlined
- * (see dmn_dxil_inline_subroutines). */
+ * (see dmn_dxil_inline_subroutines).  The runtime converts DXBC of every
+ * stage that way -- D3D12 titles shipping FXC bytecode, D3D11On12,
+ * D3D9On12 -- so every stage of both pipeline kinds goes through it. */
 HRESULT STDMETHODCALLTYPE hook_d3d12_CreateGraphicsPipelineState(
         ID3D12Device* This, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc,
         REFIID riid, void** out) {
@@ -3340,12 +3345,31 @@ HRESULT STDMETHODCALLTYPE hook_d3d12_CreateGraphicsPipelineState(
     if (!orig)
         return E_FAIL;
     D3D12_GRAPHICS_PIPELINE_STATE_DESC norm;
-    DmnNormalizedStage stages[2];
+    DmnNormalizedStage stages[5];
     if (desc) {
         norm = *desc;
-        bool changed = stages[0].apply(norm.VS);
-        changed = stages[1].apply(norm.PS) || changed;
+        bool changed = false;
+        D3D12_SHADER_BYTECODE* bcs[5] = {&norm.VS, &norm.PS, &norm.DS,
+                                         &norm.HS, &norm.GS};
+        for (int i = 0; i < 5; i++)
+            changed = stages[i].apply(*bcs[i]) || changed;
         if (changed)
+            desc = &norm;
+    }
+    return orig(This, desc, riid, out);
+}
+
+HRESULT STDMETHODCALLTYPE hook_d3d12_CreateComputePipelineState(
+        ID3D12Device* This, const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc,
+        REFIID riid, void** out) {
+    auto orig = DMN_ORIG(d3d12_CreateComputePipelineState, This);
+    if (!orig)
+        return E_FAIL;
+    D3D12_COMPUTE_PIPELINE_STATE_DESC norm;
+    DmnNormalizedStage cs;
+    if (desc) {
+        norm = *desc;
+        if (cs.apply(norm.CS))
             desc = &norm;
     }
     return orig(This, desc, riid, out);
@@ -3763,6 +3787,8 @@ extern "C" void dmn_hooks_after_d3d12_device(void* device) {
         DMN_PATCH(d, ID3D12Device, CreateCommandList, d3d12_CreateCommandList);
         DMN_PATCH(d, ID3D12Device, CreateGraphicsPipelineState,
                   d3d12_CreateGraphicsPipelineState);
+        DMN_PATCH(d, ID3D12Device, CreateComputePipelineState,
+                  d3d12_CreateComputePipelineState);
         d->Release();
     }
     /* Newer device interfaces (declared in dmn_d3d12_up.h) that add shared
