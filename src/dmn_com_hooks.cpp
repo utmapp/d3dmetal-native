@@ -877,6 +877,22 @@ uint64_t kmtx_extra(UINT misc) {
     return wants_kmtx(misc) ? (uint64_t)dmn_share_page_align(1) : 0;
 }
 
+/* A shared surface is backed by one linear 2D Metal texture over shared
+ * memory, which has one mip, one slice and one sample.  That is also the
+ * shape D3D11 guarantees to share without ExtendedResourceSharing (which the
+ * CheckFeatureSupport hook therefore clears).  Anything else is refused
+ * before it is armed: a substitute of the wrong shape leaves D3DMetal
+ * addressing mips, slices or samples the texture does not have.  A MipLevels
+ * of 0 asks for the full chain. */
+bool share_shape_ok(UINT mips, UINT array, UINT samples, const char* what) {
+    if (mips == 1 && array <= 1 && samples <= 1)
+        return true;
+    DMN_ERROR("hooks: %s: a shared texture is a single linear 2D surface; "
+              "mips=%u array=%u samples=%u cannot be shared", what, mips,
+              array, samples);
+    return false;
+}
+
 /* Patch the per-class fence methods and attach the eviction sentinel. Shared
  * producer fences and imports get identical treatment: slot-merged reads,
  * re-export, and (D3D12) CPU-signal mirroring. */
@@ -1145,7 +1161,10 @@ HRESULT fail_unshared(const char* what, void** out) {
 /* == Import (consumer reconstruction) ===================================== */
 HRESULT import_texture_d3d11(ID3D11Device* dev, const dmn_shared_texture_handle* pod,
                              REFIID iid, void** out) {
-    if (!pod_version_ok(pod->version, "texture"))
+    if (!pod_version_ok(pod->version, "texture") ||
+        !share_shape_ok(pod->mip_levels ? pod->mip_levels : 1,
+                        pod->array_size, pod->sample_count,
+                        "D3D11 texture import"))
         return E_INVALIDARG;
     D3D11_TEXTURE2D_DESC td{};
     td.Width = pod->width;
@@ -1252,7 +1271,10 @@ HRESULT import_buffer_d3d11(ID3D11Device* dev, const dmn_shared_buffer_handle* p
 
 HRESULT import_texture_d3d12(ID3D12Device* dev, const dmn_shared_texture_handle* pod,
                              REFIID riid, void** out) {
-    if (!pod_version_ok(pod->version, "texture"))
+    if (!pod_version_ok(pod->version, "texture") ||
+        !share_shape_ok(pod->mip_levels ? pod->mip_levels : 1,
+                        pod->array_size, pod->sample_count,
+                        "D3D12 texture import"))
         return E_INVALIDARG;
     D3D12_RESOURCE_DESC rd{};
     rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -1399,6 +1421,9 @@ HRESULT STDMETHODCALLTYPE hook_d3d11_CreateTexture2D(
      * swizzle instead of re-detecting a producer create. */
     if (!desc || dmn_share_is_armed() || !is_shared_misc(desc->MiscFlags))
         return orig(This, desc, init, out);
+    if (!share_shape_ok(desc->MipLevels, desc->ArraySize, desc->SampleDesc.Count,
+                        "CreateTexture2D MISC_SHARED"))
+        return E_INVALIDARG;
 
     DMN_INFO("hooks: CreateTexture2D MISC_SHARED %ux%u fmt=%u", desc->Width,
              desc->Height, desc->Format);
@@ -1428,6 +1453,9 @@ HRESULT STDMETHODCALLTYPE hook_d3d11_CreateTexture2D1(
         return E_FAIL;
     if (!desc || dmn_share_is_armed() || !is_shared_misc(desc->MiscFlags))
         return orig(This, desc, init, out);
+    if (!share_shape_ok(desc->MipLevels, desc->ArraySize, desc->SampleDesc.Count,
+                        "CreateTexture2D1 MISC_SHARED"))
+        return E_INVALIDARG;
 
     DMN_INFO("hooks: CreateTexture2D1 MISC_SHARED %ux%u fmt=%u", desc->Width,
              desc->Height, desc->Format);
@@ -1787,8 +1815,8 @@ HRESULT STDMETHODCALLTYPE hook_d3d11_CheckMultisampleQualityLevels1(
 }
 
 /* FORMAT_SUPPORT and FORMAT_SUPPORT2 must agree with CheckFormatSupport, so
- * they come from the same tables. Every other feature is D3DMetal's to answer
- * — forward it untouched. */
+ * they come from the same tables. Every other feature is D3DMetal's to answer,
+ * less what the sharing layer cannot back. */
 HRESULT STDMETHODCALLTYPE hook_d3d11_CheckFeatureSupport(
         ID3D11Device* This, D3D11_FEATURE feature, void* data, UINT size) {
     if (feature == D3D11_FEATURE_FORMAT_SUPPORT) {
@@ -1811,7 +1839,14 @@ HRESULT STDMETHODCALLTYPE hook_d3d11_CheckFeatureSupport(
         return S_OK;
     }
     auto orig = DMN_ORIG(d3d11_CheckFeatureSupport, This);
-    return orig ? orig(This, feature, data, size) : E_FAIL;
+    HRESULT hr = orig ? orig(This, feature, data, size) : E_FAIL;
+    /* Extended sharing (mips, arrays, more formats) is what share_shape_ok
+     * refuses; only the baseline D3D11.1 shared shape can be honoured. */
+    if (SUCCEEDED(hr) && feature == D3D11_FEATURE_D3D11_OPTIONS && data &&
+        size == sizeof(D3D11_FEATURE_DATA_D3D11_OPTIONS))
+        static_cast<D3D11_FEATURE_DATA_D3D11_OPTIONS*>(data)
+            ->ExtendedResourceSharing = FALSE;
+    return hr;
 }
 
 /* == D3D11 consumer thunks ================================================= */
@@ -2044,6 +2079,9 @@ HRESULT d12_create_shared(const DescT* desc, void** out, OrigCall&& call) {
         return hr;
     }
     if (desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
+        if (!share_shape_ok(desc->MipLevels, desc->DepthOrArraySize,
+                            desc->SampleDesc.Count, "D3D12 SHARED texture create"))
+            return E_INVALIDARG;
         DMN_INFO("hooks: D3D12 SHARED texture create %llux%u fmt=%u",
                  (unsigned long long)desc->Width, desc->Height, desc->Format);
         dmn_share_arm_producer(0);
@@ -2163,6 +2201,9 @@ HRESULT d12_place_on_synth(DmnSynthHeap* sh, UINT64 offset, const DescT* desc,
     }
 
     if (desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
+        if (!share_shape_ok(desc->MipLevels, desc->DepthOrArraySize,
+                            desc->SampleDesc.Count, "texture placed in a SHARED heap"))
+            return E_INVALIDARG;
         DMN_INFO("hooks: placed texture on shared heap offset=%llu %llux%u "
                  "fmt=%u", (unsigned long long)offset,
                  (unsigned long long)desc->Width, desc->Height, desc->Format);

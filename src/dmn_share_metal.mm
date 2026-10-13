@@ -1091,6 +1091,16 @@ id<MTLTexture> substitute_texture_window(id<MTLDevice> device,
 id<MTLTexture> substitute(id<MTLDevice> device, MTLTextureDescriptor* desc) {
     if (!device || !desc)
         return nil;
+    /* make_linear_texture builds one level, one slice, one sample. */
+    if (desc.mipmapLevelCount > 1 || desc.sampleCount > 1 ||
+        desc.arrayLength > 1 || desc.depth > 1) {
+        DMN_ERROR("share: descriptor has %lu mips, %lu slices, depth %lu, "
+                  "%lu samples; a linear shared surface has one of each",
+                  (unsigned long)desc.mipmapLevelCount,
+                  (unsigned long)desc.arrayLength, (unsigned long)desc.depth,
+                  (unsigned long)desc.sampleCount);
+        return nil;
+    }
     if (t_arm.alloc_new)
         return substitute_producer(device, desc);
     return t_arm.derive_layout ? substitute_texture_window(device, desc)
