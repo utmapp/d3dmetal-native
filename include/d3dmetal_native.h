@@ -378,6 +378,24 @@ int32_t dmn_open_existing_heap_from_fd(void* device, int fd,
                                        uint32_t heap_type, uint32_t heap_flags,
                                        const void* iid, void** out_heap);
 
+/* == DXIL reflection ===================================================== */
+/* The input signature of a DXIL shader container, through the framework's own
+ * DXC reflection: one entry per element, register first.  An embedder that
+ * receives input layouts it must match to a DXIL vertex shader by register
+ * (the Neptune render server resolves its guest's register-tagged layout
+ * names with it) can name each register here. */
+typedef struct dmn_dxil_semantic {
+    uint32_t reg;    /* input-signature register */
+    uint32_t index;  /* SemanticIndex */
+    char name[64];   /* SemanticName, NUL-terminated */
+} dmn_dxil_semantic;
+
+/* Fill out[0..cap) with the container's input-signature elements; returns how
+ * many were written, 0 on any failure. Plain host (SysV) calling
+ * convention. */
+int dmn_dxil_input_semantics(const void* container, size_t size,
+                             dmn_dxil_semantic* out, int cap);
+
 #ifdef __cplusplus
 }
 #endif

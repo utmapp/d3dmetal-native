@@ -8,20 +8,11 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "d3dmetal_native.h" /* dmn_dxil_input_semantics */
+
 #ifdef __cplusplus
 extern "C" {
 #endif
-
-struct dmn_dxil_semantic {
-    uint32_t reg;    /* input-signature register (row) */
-    uint32_t index;  /* SemanticIndex */
-    char name[64];   /* SemanticName */
-};
-
-/* Fill out[] with the input-signature semantics of the DXIL container.
- * Returns the number of entries written (0 on any failure). */
-int dmn_dxil_input_semantics(const void *container, size_t size,
-                             struct dmn_dxil_semantic *out, int cap);
 
 /* For a minimal container (one DXIL part, zero digest -- the shape the guest
  * UMD wraps a bare DXIL program in) whose module defines internal

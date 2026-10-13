@@ -3331,15 +3331,8 @@ struct DmnNormalizedStage {
     }
 };
 
-/* == DXIL input-layout placeholder resolution ============================= */
-
-/* The guest UMD cannot read semantic names out of a bare DXIL program part
- * (they live in bitcode metadata, not ISG1), so for DXIL vertex shaders it
- * sends register-tagged placeholders ("NPTA<reg>") in the input layout.
- * D3DMetal matches layout elements to the VS BY NAME against the module
- * metadata and silently produces a no-op PSO on mismatch, so resolve the
- * placeholders here via DXC reflection.  Elements whose register the VS
- * does not consume are dropped -- same policy as the guest's DXBC path. */
+/* In-driver-converted DXIL reaches D3DMetal with its subroutines inlined
+ * (see dmn_dxil_inline_subroutines). */
 HRESULT STDMETHODCALLTYPE hook_d3d12_CreateGraphicsPipelineState(
         ID3D12Device* This, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc,
         REFIID riid, void** out) {
@@ -3355,58 +3348,7 @@ HRESULT STDMETHODCALLTYPE hook_d3d12_CreateGraphicsPipelineState(
         if (changed)
             desc = &norm;
     }
-    if (!desc || !desc->InputLayout.NumElements ||
-        desc->InputLayout.NumElements > 64 ||
-        !desc->InputLayout.pInputElementDescs || !desc->VS.pShaderBytecode)
-        return orig(This, desc, riid, out);
-
-    bool placeholders = false;
-    for (UINT i = 0; i < desc->InputLayout.NumElements; i++) {
-        const char* n = desc->InputLayout.pInputElementDescs[i].SemanticName;
-        if (n && !strncmp(n, "NPTA", 4)) {
-            placeholders = true;
-            break;
-        }
-    }
-    if (!placeholders)
-        return orig(This, desc, riid, out);
-
-    dmn_dxil_semantic sem[64];
-    int nSem = dmn_dxil_input_semantics(desc->VS.pShaderBytecode,
-                                        desc->VS.BytecodeLength, sem, 64);
-    if (nSem <= 0) {
-        DMN_WARN("pso: NPTA placeholders but VS reflection failed -- "
-                 "pipeline will not bind vertex inputs");
-        return orig(This, desc, riid, out);
-    }
-
-    D3D12_INPUT_ELEMENT_DESC elems[64];
-    UINT n = 0;
-    for (UINT i = 0; i < desc->InputLayout.NumElements; i++) {
-        D3D12_INPUT_ELEMENT_DESC e = desc->InputLayout.pInputElementDescs[i];
-        const char* nm = e.SemanticName;
-        if (nm && !strncmp(nm, "NPTA", 4)) {
-            unsigned reg = (unsigned)strtoul(nm + 4, nullptr, 10);
-            const dmn_dxil_semantic* hit = nullptr;
-            for (int s = 0; s < nSem; s++)
-                if (sem[s].reg == reg) {
-                    hit = &sem[s];
-                    break;
-                }
-            if (!hit)
-                continue; /* register unused by this VS: drop the element */
-            e.SemanticName = hit->name;
-            e.SemanticIndex = hit->index;
-        }
-        elems[n++] = e;
-    }
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC patched = *desc;
-    patched.InputLayout.pInputElementDescs = elems;
-    patched.InputLayout.NumElements = n;
-    DMN_INFO("pso: resolved %u NPTA input-layout elements via VS reflection "
-             "(%d signature rows, %u kept)",
-             desc->InputLayout.NumElements, nSem, n);
-    return orig(This, &patched, riid, out);
+    return orig(This, desc, riid, out);
 }
 
 HRESULT STDMETHODCALLTYPE hook_d3d12_CreateCommandQueue(

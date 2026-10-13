@@ -1,14 +1,13 @@
 /*
  * DXIL container reflection via the framework's own libdxcompiler.dylib.
  *
- * The guest D3D12 UMD receives BARE DXIL program parts (no ISG1), so it
- * cannot know input-signature semantic names; it sends register-tagged
- * placeholder names ("NPTA<reg>") in the input layout instead.  D3DMetal
- * matches input-layout elements to the vertex shader BY NAME against the
- * module metadata (a mismatch silently produces a no-op PSO), so the
- * CreateGraphicsPipelineState hook resolves the placeholders here: reflect
- * the VS container with IDxcContainerReflection -> ID3D12ShaderReflection
- * and look the real name/index up by register.
+ * dmn_dxil_input_semantics (public, d3dmetal_native.h) names a DXIL vertex
+ * shader's input registers: reflect the container with
+ * IDxcContainerReflection -> ID3D12ShaderReflection.  The Neptune render
+ * server uses it to resolve its guest's register-tagged input-layout names,
+ * which a guest holding only a bare DXIL program part cannot know; D3DMetal
+ * matches layout elements to the shader BY NAME (a mismatch silently
+ * produces a no-op PSO).
  *
  * ABI: libdxcompiler.dylib is a NATIVE darwin build -- its DxcCreateInstance
  * and every interface it returns are SysV/Itanium, NOT the ms_abi the rest

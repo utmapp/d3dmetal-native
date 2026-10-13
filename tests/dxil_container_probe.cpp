@@ -19,7 +19,8 @@
  *      against the module metadata and that a mismatch is a SILENT no-op PSO
  *   R  dmn_dxil_input_semantics() directly on both container shapes
  *   P  the production contract: NPTA<reg> placeholder layout names resolved
- *      to real semantics by the CreateGraphicsPipelineState hook -- must draw
+ *      by register through dmn_dxil_input_semantics, as the Neptune render
+ *      server does -- must draw
  *
  * The compute path executes (WaveActiveSum: 32 lanes must read 496) so a
  * lazily-failing PSO cannot masquerade as a pass.  Prints one PASS/FAIL line
@@ -575,11 +576,27 @@ int main(int argc, char **argv)
     }
 
     /* P: the production contract -- the guest sends register-tagged
-     * placeholders (NPTA<reg>) and the CreateGraphicsPipelineState hook
-     * resolves them to real names via DXC reflection.  Must render. */
-    bool P = tryGraphics(vsMin, cbVsMin, psMin, cbPsMin, "NPTA0", "NPTA1",
-                         true, "P draw placeholders");
-    printf("P verdict: NPTA placeholder resolution %s\n",
+     * placeholders (NPTA<reg>) and the render server names each register
+     * through dmn_dxil_input_semantics on the minimal container before the
+     * desc reaches D3D12.  Must render. */
+    bool P = false;
+    {
+        dmn_dxil_semantic sem[8];
+        const int n = dmn_dxil_input_semantics(vsMin, cbVsMin, sem, 8);
+        const char *name0 = nullptr, *name1 = nullptr;
+        for (int i = 0; i < n; i++) {
+            if (sem[i].reg == 0 && sem[i].index == 0)
+                name0 = sem[i].name;
+            if (sem[i].reg == 1 && sem[i].index == 0)
+                name1 = sem[i].name;
+        }
+        if (name0 && name1)
+            P = tryGraphics(vsMin, cbVsMin, psMin, cbPsMin, name0, name1,
+                            true, "P draw resolved placeholders");
+        else
+            printf("P: reflection did not name registers 0 and 1\n");
+    }
+    printf("P verdict: placeholder resolution by register %s\n",
            P ? "WORKS" : "FAILED");
 
     printf("DXILPROBE: A=%d B=%d C=%d D=%d E=%d F=%d G=%d P=%d\n", A, B, C, D,
