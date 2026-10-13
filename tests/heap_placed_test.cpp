@@ -130,6 +130,18 @@ int main() {
     Com<ID3D12Heap> heap;
     CK(dev->CreateHeap(&hd, __uuidof(ID3D12Heap), (void**)&heap), "CreateHeap(SHARED)");
 
+    /* ID3D12Object::GetPrivateData: an absent GUID is DXGI_ERROR_NOT_FOUND. */
+    {
+        static const GUID kAbsent = {0x6f1e4c2a, 0x93b5, 0x4d07,
+                                     {0xa1, 0x58, 0x2c, 0x7e, 0x0b, 0x94, 0xd3, 0x61}};
+        UINT n = 4;
+        uint32_t v = 0;
+        HRESULT hr = heap->GetPrivateData(kAbsent, &n, &v);
+        printf("HEAP: GetPrivateData(absent) -> 0x%08x size %u\n", (unsigned)hr, n);
+        EXPECT(hr == DXGI_ERROR_NOT_FOUND && n == 0,
+               "GetPrivateData of an absent GUID is not DXGI_ERROR_NOT_FOUND");
+    }
+
     /* 2) Placed texture on it -> export. */
     const UINT kW = 192, kH = 96;
     D3D12_RESOURCE_DESC rd = tex_desc(kW, kH);

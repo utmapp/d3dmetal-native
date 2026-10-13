@@ -536,7 +536,7 @@ HRESULT STDMETHODCALLTYPE sheap_GetPrivateData(DmnSynthHeap* self, REFGUID guid,
         return S_OK;
     }
     *size = 0;
-    return E_FAIL; /* DXGI_ERROR_NOT_FOUND shape; nothing here inspects it */
+    return DXGI_ERROR_NOT_FOUND;
 }
 
 HRESULT STDMETHODCALLTYPE sheap_SetPrivateData(DmnSynthHeap* self, REFGUID guid,
@@ -2199,9 +2199,10 @@ HRESULT d12_create_shared(const DescT* desc, void** out, OrigCall&& call) {
 
 /* Heap properties for a placed->committed translation.
  *
- * dmn_open_existing_heap_from_fd clamps an imported heap's type to UPLOAD, but
- * D3D12 forbids ALLOW_UNORDERED_ACCESS and the render-target/depth-stencil
- * flags on UPLOAD and READBACK heaps, so a placement carrying one of them
+ * An imported heap is typically UPLOAD or READBACK (the import keeps the
+ * caller's type, defaulting to UPLOAD), but D3D12 forbids
+ * ALLOW_UNORDERED_ACCESS and the render-target/depth-stencil flags on UPLOAD
+ * and READBACK heaps, so a placement carrying one of them
  * cannot be committed against those properties. Promote to DEFAULT: the Metal
  * allocation is substituted with a window into the heap's shm object either
  * way, so these properties only have to satisfy the framework's validation.
