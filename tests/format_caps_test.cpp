@@ -352,6 +352,35 @@ int main(){
             expect(hr==E_INVALIDARG&&!res,"D3D12 YUY2 committed create is E_INVALIDARG");
             if(res) res->Release();
 
+            // Every CreateReservedResource variant refuses it too.
+            {
+                D3D12_RESOURCE_DESC rr=rd;
+                rr.Layout=D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
+                res=nullptr;
+                hr=d12->CreateReservedResource(&rr,D3D12_RESOURCE_STATE_COMMON,nullptr,
+                    __uuidof(ID3D12Resource),(void**)&res);
+                expect(hr==E_INVALIDARG&&!res,"D3D12 YUY2 reserved create is E_INVALIDARG");
+                if(res) res->Release();
+                Com<ID3D12Device4> r4;
+                if(SUCCEEDED(d12->QueryInterface(__uuidof(ID3D12Device4),(void**)&r4))){
+                    res=nullptr;
+                    hr=r4->CreateReservedResource1(&rr,D3D12_RESOURCE_STATE_COMMON,nullptr,
+                        nullptr,__uuidof(ID3D12Resource),(void**)&res);
+                    expect(hr==E_INVALIDARG&&!res,"D3D12 YUY2 reserved create 1 is E_INVALIDARG");
+                    if(res) res->Release();
+                }
+                Com<ID3D12Device10> r10;
+                if(SUCCEEDED(d12->QueryInterface(__uuidof(ID3D12Device10),(void**)&r10))){
+                    res=nullptr;
+                    hr=r10->CreateReservedResource2(&rr,0 /* D3D12_BARRIER_LAYOUT_COMMON */,
+                        nullptr,nullptr,0,nullptr,__uuidof(ID3D12Resource),(void**)&res);
+                    expect(hr==E_INVALIDARG&&!res,"D3D12 YUY2 reserved create 2 is E_INVALIDARG");
+                    if(res) res->Release();
+                } else {
+                    expect(false,"ID3D12Device10 exposed");
+                }
+            }
+
             // The newer allocation-info entry points get the same refusal,
             // and still answer a supported description.
             D3D12_RESOURCE_DESC1 rd1={};

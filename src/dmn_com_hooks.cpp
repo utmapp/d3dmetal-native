@@ -2952,6 +2952,8 @@ HRESULT d12_create_reserved(ID3D12Device* This, const D3D12_RESOURCE_DESC* desc,
         D3D12_RESOURCE_DESC cd = *desc;
         cd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
         D3D12_RESOURCE_ALLOCATION_INFO ai = This->GetResourceAllocationInfo(0, 1, &cd);
+        if (ai.SizeInBytes == UINT64_MAX)
+            return E_INVALIDARG;
         UINT64 need = ai.SizeInBytes ? ai.SizeInBytes : (64ull << 20);
         need = (need + 0xFFFFFull) & ~0xFFFFFull; /* 1 MiB granularity */
         std::lock_guard<std::mutex> lk(dummy_mtx);
@@ -3067,6 +3069,8 @@ HRESULT STDMETHODCALLTYPE hook_d3d12_CreateReservedResource1(
         ID3D12Device4* This, const D3D12_RESOURCE_DESC* desc,
         D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE* clear,
         DMN_ID3D12ProtectedResourceSession* session, REFIID riid, void** out) {
+    if (!dmn_desc_format_ok(This, desc))
+        return E_INVALIDARG;
     auto orig = DMN_ORIG(d3d12_CreateReservedResource1, This);
     if (!desc || !out || session)
         return orig ? orig(This, desc, state, clear, session, riid, out) : E_FAIL;
@@ -3096,6 +3100,8 @@ HRESULT STDMETHODCALLTYPE hook_d3d12_CreateReservedResource2(
         DMN_D3D12_BARRIER_LAYOUT layout, const D3D12_CLEAR_VALUE* clear,
         DMN_ID3D12ProtectedResourceSession* session, UINT32 num_castable,
         const DXGI_FORMAT* castable, REFIID riid, void** out) {
+    if (!dmn_desc_format_ok(This, desc))
+        return E_INVALIDARG;
     auto orig = DMN_ORIG(d3d12_CreateReservedResource2, This);
     if (!desc || !out || session)
         return orig ? orig(This, desc, layout, clear, session, num_castable, castable, riid, out)
