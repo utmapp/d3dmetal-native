@@ -1,19 +1,10 @@
 /*
- * DXIL container reflection via the framework's own libdxcompiler.dylib.
- *
- * dmn_dxil_input_semantics (public, d3dmetal_native.h) names a DXIL vertex
- * shader's input registers: reflect the container with
- * IDxcContainerReflection -> ID3D12ShaderReflection.  The Neptune render
- * server uses it to resolve its guest's register-tagged input-layout names,
- * which a guest holding only a bare DXIL program part cannot know; D3DMetal
- * matches layout elements to the shader BY NAME (a mismatch silently
- * produces a no-op PSO).
+ * DXIL module normalization via the framework's own libdxcompiler.dylib.
  *
  * ABI: libdxcompiler.dylib is a NATIVE darwin build -- its DxcCreateInstance
  * and every interface it returns are SysV/Itanium, NOT the ms_abi the rest
  * of the D3D world here uses.  All interfaces are therefore declared locally
- * with default convention; only the plain data structs are reused from the
- * vendored d3d12shader.h.
+ * with default convention.
  *
  * dmn_init already preloads libdxcompiler.dylib by absolute path, so the
  * leaf dlopen here resolves to the loaded image.
@@ -27,7 +18,6 @@
 #include <vector>
 
 #include <unknwn.h>
-#include <d3d12shader.h> /* D3D12_SHADER_DESC / D3D12_SIGNATURE_PARAMETER_DESC */
 
 #include "dmn_log.h"
 #include "dmn_dxil_reflect.h"
@@ -36,10 +26,8 @@ namespace {
 
 /* SysV/Itanium declarations of the DXC interfaces we touch.  Slot order
  * follows the shipped library: a plain 3-slot IUnknown with NO virtual
- * destructor, then the interface methods; Apple's IDxcContainerReflection
- * carries a GetPartContent between GetPartKind and FindFirstPartKind.
- * Single inheritance, no overloads, so clang lays the vtables out the same
- * way. */
+ * destructor, then the interface methods.  Single inheritance, no overloads,
+ * so clang lays the vtables out the same way. */
 struct SysUnknown {
     virtual int32_t QueryInterface(const GUID &iid, void **ppv) = 0;
     virtual uint32_t AddRef() = 0;
@@ -58,27 +46,6 @@ struct SysDxcBlob : public SysUnknown {
     virtual uint64_t Pad8() { return 0; }
 };
 
-struct SysDxcContainerReflection : public SysUnknown {
-    virtual int32_t Load(SysDxcBlob *pContainer) = 0;
-    virtual int32_t GetPartCount(uint32_t *pResult) = 0;
-    virtual int32_t GetPartKind(uint32_t idx, uint32_t *pResult) = 0;
-    virtual int32_t GetPartContent(uint32_t idx, void **ppResult) = 0;
-    virtual int32_t FindFirstPartKind(uint32_t kind, uint32_t *pResult) = 0;
-    virtual int32_t GetPartReflection(uint32_t idx, const GUID &iid,
-                                      void **ppvObject) = 0;
-};
-
-struct SysShaderReflection : public SysUnknown {
-    virtual int32_t GetDesc(D3D12_SHADER_DESC *desc) = 0;
-    virtual void *GetConstantBufferByIndex(uint32_t index) = 0;
-    virtual void *GetConstantBufferByName(const char *name) = 0;
-    virtual int32_t GetResourceBindingDesc(uint32_t index, void *desc) = 0;
-    virtual int32_t GetInputParameterDesc(
-        uint32_t index, D3D12_SIGNATURE_PARAMETER_DESC *desc) = 0;
-    virtual int32_t GetOutputParameterDesc(
-        uint32_t index, D3D12_SIGNATURE_PARAMETER_DESC *desc) = 0;
-};
-
 struct SysDxcOptimizer : public SysUnknown {
     virtual int32_t GetAvailablePassCount(uint32_t *pCount) = 0;
     virtual int32_t GetAvailablePass(uint32_t index, void **ppResult) = 0;
@@ -94,16 +61,6 @@ const GUID kClsidDxcOptimizer = {
 const GUID kIidDxcOptimizer = {
     0x25740e2e, 0x9cba, 0x401b,
     {0x91, 0x19, 0x4f, 0xb4, 0x2f, 0x39, 0xf2, 0x70}};
-
-const GUID kClsidDxcContainerReflection = {
-    0xb9f54489, 0x55b8, 0x400c,
-    {0xba, 0x3a, 0x16, 0x75, 0xe4, 0x72, 0x8b, 0x91}};
-const GUID kIidDxcContainerReflection = {
-    0xd2c21b26, 0x8350, 0x4bdc,
-    {0x97, 0x6a, 0x33, 0x1c, 0xe6, 0xf4, 0xc5, 0x4c}};
-const GUID kIidShaderReflection = {
-    0x5a58797d, 0xa72c, 0x478d,
-    {0x8b, 0xa2, 0xef, 0xc6, 0xb0, 0xef, 0xe8, 0x8e}};
 
 /* Non-owning SysDxcBlob view over caller memory. */
 struct PinnedBlob final : public SysDxcBlob {
@@ -380,65 +337,6 @@ scanLocalFunctions(const uint8_t *bc, size_t size)
 }
 
 } // namespace
-
-extern "C" int
-dmn_dxil_input_semantics(const void *container, size_t size,
-                         struct dmn_dxil_semantic *out, int cap)
-{
-    PFN_SysDxcCreateInstance create = dxcCreateInstance();
-    if (!create)
-        return 0;
-
-    PinnedBlob blob(container, size);
-    SysDxcContainerReflection *refl = nullptr;
-    int32_t hr = create(&kClsidDxcContainerReflection,
-                        &kIidDxcContainerReflection, (void **)&refl);
-    if (hr < 0 || !refl) {
-        DMN_WARN("dxil-reflect: DxcCreateInstance failed 0x%08x",
-                 (unsigned)hr);
-        return 0;
-    }
-
-    int n = 0;
-    SysShaderReflection *sr = nullptr;
-    uint32_t partIdx = 0;
-    hr = refl->Load(&blob);
-    if (hr < 0) {
-        DMN_WARN("dxil-reflect: Load failed 0x%08x", (unsigned)hr);
-        goto out;
-    }
-    hr = refl->FindFirstPartKind(0x4C495844u /* 'DXIL' */, &partIdx);
-    if (hr < 0) {
-        DMN_WARN("dxil-reflect: no DXIL part (0x%08x)", (unsigned)hr);
-        goto out;
-    }
-    hr = refl->GetPartReflection(partIdx, kIidShaderReflection, (void **)&sr);
-    if (hr < 0 || !sr) {
-        DMN_WARN("dxil-reflect: GetPartReflection failed 0x%08x",
-                 (unsigned)hr);
-        goto out;
-    }
-    {
-        D3D12_SHADER_DESC sd = {};
-        if (sr->GetDesc(&sd) < 0)
-            goto out;
-        for (uint32_t i = 0; i < sd.InputParameters && n < cap; i++) {
-            D3D12_SIGNATURE_PARAMETER_DESC pd = {};
-            if (sr->GetInputParameterDesc(i, &pd) < 0 || !pd.SemanticName)
-                continue;
-            out[n].reg = pd.Register;
-            out[n].index = pd.SemanticIndex;
-            snprintf(out[n].name, sizeof(out[n].name), "%s", pd.SemanticName);
-            n++;
-        }
-    }
-
-out:
-    if (sr)
-        sr->Release();
-    refl->Release();
-    return n;
-}
 
 /* The runtime's in-driver DXBC conversion (dxilconv ConvertInDriver) leaves
  * optimization to the driver: a shader's call/label subroutines arrive as

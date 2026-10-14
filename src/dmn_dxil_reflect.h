@@ -1,5 +1,5 @@
 /*
- * DXIL container reflection and normalization (see dmn_dxil_reflect.cpp).
+ * DXIL container normalization (see dmn_dxil_reflect.cpp).
  */
 
 #ifndef DMN_DXIL_REFLECT_H
@@ -8,7 +8,6 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "d3dmetal_native.h" /* dmn_dxil_input_semantics */
 
 #ifdef __cplusplus
 extern "C" {
