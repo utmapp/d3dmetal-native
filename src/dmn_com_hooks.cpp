@@ -119,8 +119,8 @@ namespace {
 
 /* == Live-handle registries =============================================== */
 std::mutex g_reg_mtx;
-std::unordered_map<void*, dmn_shared_texture_handle> g_tex_reg; /* identity -> POD */
-std::unordered_map<void*, dmn_shared_buffer_handle>  g_buf_reg;
+std::unordered_map<void*, dxn_shared_texture> g_tex_reg; /* identity -> POD */
+std::unordered_map<void*, dxn_shared_buffer>  g_buf_reg;
 std::unordered_map<void*, int> g_owned_fds; /* identity -> registry-owned dup */
 
 /* D3D12 resources created SHARED (committed, or placed in a SHARED heap) with
@@ -211,25 +211,10 @@ void free_pod(void* id) {
 std::mutex g_nt_mtx;
 std::unordered_set<void*> g_nt_handles;
 
-/* dmn_shared_handle_close() reads the fd through this common prefix. */
-constexpr size_t kPodFdOffset = 8;
-static_assert(offsetof(dmn_shared_texture_handle, fd) == kPodFdOffset &&
-              offsetof(dmn_shared_buffer_handle, fd) == kPodFdOffset &&
-              offsetof(dmn_shared_fence_handle, fd) == kPodFdOffset,
-              "shared-handle PODs must start {u32 magic, u32 version, i32 fd}");
-/* The PODs are a cross-process, cross-library ABI: peers built separately
- * (dxmt, the Neptune render server) declare the same layout on their own. */
-static_assert(sizeof(dmn_shared_texture_handle) == 72 &&
-              offsetof(dmn_shared_texture_handle, stride) == 48 &&
-              offsetof(dmn_shared_texture_handle, offset) == 64,
-              "dmn_shared_texture_handle ABI drift");
-static_assert(sizeof(dmn_shared_buffer_handle) == 40 &&
-              offsetof(dmn_shared_buffer_handle, size) == 24 &&
-              offsetof(dmn_shared_buffer_handle, offset) == 32,
-              "dmn_shared_buffer_handle ABI drift");
-static_assert(sizeof(dmn_shared_fence_handle) == 24 &&
-              offsetof(dmn_shared_fence_handle, initial_value) == 16,
-              "dmn_shared_fence_handle ABI drift");
+/* dmn_shared_handle_close() reads the fd through the common descriptor
+ * prefix (dxn_shared_header); directx-native asserts every descriptor's
+ * layout, which is the cross-process, cross-library ABI. */
+constexpr size_t kPodFdOffset = offsetof(dxn_shared_header, fd);
 
 template <class Pod>
 HRESULT vend_pod_owned(Pod pod, HANDLE* out) {
@@ -1034,41 +1019,46 @@ void patch_shared_resource_exports(IUnknown* res) {
 
 /* Record a shared texture (producer, or consumer re-registration for
  * re-export). `init_kmtx` distinguishes who initializes the mutex page. */
-void record_texture_pod(IUnknown* tex, const dmn_shared_texture_handle& pod,
+void record_texture_pod(IUnknown* tex, const dxn_shared_texture& pod,
                         bool init_kmtx) {
     void* id = dmn_com_identity(tex);
-    dmn_shared_texture_handle rec = pod;
+    dxn_shared_texture rec = pod;
     rec.fd = register_owned_fd(id, pod.fd);
     {
         std::lock_guard<std::mutex> lk(g_reg_mtx);
         g_tex_reg[id] = rec;
     }
     patch_shared_resource_exports(tex);
-    if (wants_kmtx(rec.misc_flags))
+    if (wants_kmtx(rec.meta.misc_flags))
         dmn_kmtx_register(id, rec.fd, dmn_share_page_align((size_t)rec.size),
                           init_kmtx);
     attach_evict_sentinel(tex, id, EV_TEX);
     DMN_INFO("hooks: recorded shared texture identity=%p fd=%d %ux%u stride=%llu",
-             id, rec.fd, rec.width, rec.height, (unsigned long long)rec.stride);
+             id, rec.fd, rec.meta.width, rec.meta.height, (unsigned long long)rec.planes[0].pitch);
 }
 
 void record_texture(IUnknown* tex, const D3D11_TEXTURE2D_DESC& d,
                     const DmnShareArm& arm, uint64_t offset = 0) {
-    dmn_shared_texture_handle pod{};
-    pod.magic = DMN_SHARED_TEXTURE_MAGIC;
-    pod.version = DMN_SHARED_HANDLE_VERSION;
-    pod.offset = offset;
+    dxn_shared_texture pod{};
+    pod.magic = DXN_SHARED_TEXTURE_MAGIC;
+    pod.version = DXN_SHARED_VERSION;
+    pod.struct_size = sizeof(pod);
+    pod.planes[0].offset = offset;
     pod.fd = arm.out_fd;
-    pod.width = d.Width;
-    pod.height = d.Height;
-    pod.dxgi_format = d.Format;
-    pod.mip_levels = d.MipLevels ? d.MipLevels : 1;
-    pod.array_size = d.ArraySize ? d.ArraySize : 1;
-    pod.sample_count = d.SampleDesc.Count ? d.SampleDesc.Count : 1;
-    pod.bind_flags = d.BindFlags;
-    pod.misc_flags = d.MiscFlags;
-    pod.cpu_access = d.CPUAccessFlags;
-    pod.stride = arm.out_stride;
+    pod.meta.width = d.Width;
+    pod.meta.height = d.Height;
+    pod.meta.dxgi_format = d.Format;
+    pod.meta.mip_levels = d.MipLevels ? d.MipLevels : 1;
+    pod.meta.array_size = d.ArraySize ? d.ArraySize : 1;
+    pod.meta.sample_count = d.SampleDesc.Count ? d.SampleDesc.Count : 1;
+    pod.meta.sample_quality = d.SampleDesc.Quality;
+    pod.meta.usage = d.Usage;
+    pod.meta.bind_flags = d.BindFlags;
+    pod.meta.misc_flags = d.MiscFlags;
+    pod.meta.cpu_access_flags = d.CPUAccessFlags;
+    /* One linear plane of shared memory. */
+    pod.plane_count = 1;
+    pod.planes[0].pitch = arm.out_stride;
     pod.size = arm.out_size;
     record_texture_pod(tex, pod, /*init_kmtx=*/true);
 }
@@ -1078,7 +1068,7 @@ void record_texture(IUnknown* tex, const D3D11_TEXTURE2D_DESC& d,
  * the eviction sentinel. Producer captures and consumer imports, both APIs.
  * The export patch is a no-op for D3D12 buffers, which have no IDXGIResource
  * and export device-side. */
-void register_buffer_pod(IUnknown* res, dmn_shared_buffer_handle pod) {
+void register_buffer_pod(IUnknown* res, dxn_shared_buffer pod) {
     void* id = dmn_com_identity(res);
     pod.fd = register_owned_fd(id, pod.fd);
     {
@@ -1093,14 +1083,15 @@ void register_buffer_pod(IUnknown* res, dmn_shared_buffer_handle pod) {
 
 void record_buffer(IUnknown* res, uint64_t size, uint32_t bind, uint32_t misc,
                    uint32_t cpu, const DmnShareArm& arm, uint64_t offset = 0) {
-    dmn_shared_buffer_handle pod{};
-    pod.magic = DMN_SHARED_BUFFER_MAGIC;
-    pod.version = DMN_SHARED_HANDLE_VERSION;
+    dxn_shared_buffer pod{};
+    pod.magic = DXN_SHARED_BUFFER_MAGIC;
+    pod.version = DXN_SHARED_VERSION;
+    pod.struct_size = sizeof(pod);
     pod.fd = arm.out_fd;
     pod.size = arm.out_size ? arm.out_size : size;
     pod.bind_flags = bind;
     pod.misc_flags = misc;
-    pod.cpu_access = cpu;
+    pod.cpu_access_flags = cpu;
     pod.offset = offset;
     register_buffer_pod(res, pod);
 }
@@ -1108,12 +1099,24 @@ void record_buffer(IUnknown* res, uint64_t size, uint32_t bind, uint32_t misc,
 /* A handle from a peer built against another POD layout must not be parsed:
  * the fields past the header would be read from wherever that peer's struct
  * ends. */
-bool pod_version_ok(uint32_t version, const char* what) {
-    if (version == DMN_SHARED_HANDLE_VERSION)
+/* The caller has dispatched on the magic; the version and size must match
+ * this build's directx-native exactly. */
+template <class Pod>
+bool pod_version_ok(const Pod* pod, const char* what) {
+    if (pod->version == DXN_SHARED_VERSION && pod->struct_size == sizeof(Pod))
         return true;
-    DMN_ERROR("hooks: %s handle has POD version %u, this build speaks %u; "
-              "refusing to import it", what, version,
-              (unsigned)DMN_SHARED_HANDLE_VERSION);
+    DMN_ERROR("hooks: %s handle has descriptor version %u size %u, this build "
+              "speaks %u size %zu; refusing to import it", what, pod->version,
+              pod->struct_size, (unsigned)DXN_SHARED_VERSION, sizeof(Pod));
+    return false;
+}
+
+/* A shm-backed texture is exactly one linear plane. */
+bool texture_planes_ok(const dxn_shared_texture* pod) {
+    if (pod->plane_count == 1)
+        return true;
+    DMN_ERROR("hooks: texture handle has %u planes; only single-plane shm "
+              "textures can be imported", pod->plane_count);
     return false;
 }
 
@@ -1125,7 +1128,7 @@ HRESULT return_texture_pod(IUnknown* res, HANDLE* out, bool nt) {
     if (!out)
         return E_INVALIDARG;
     void* id = dmn_com_identity(res);
-    dmn_shared_texture_handle pod;
+    dxn_shared_texture pod;
     {
         std::lock_guard<std::mutex> lk(g_reg_mtx);
         auto it = g_tex_reg.find(id);
@@ -1145,7 +1148,7 @@ HRESULT return_buffer_pod(IUnknown* res, HANDLE* out, bool nt) {
     if (!out)
         return E_INVALIDARG;
     void* id = dmn_com_identity(res);
-    dmn_shared_buffer_handle pod;
+    dxn_shared_buffer pod;
     {
         std::lock_guard<std::mutex> lk(g_reg_mtx);
         auto it = g_buf_reg.find(id);
@@ -1165,7 +1168,7 @@ HRESULT return_buffer_pod(IUnknown* res, HANDLE* out, bool nt) {
 HRESULT return_fence_pod(IUnknown* fenceObj, HANDLE* out) {
     if (!out)
         return E_INVALIDARG;
-    dmn_shared_fence_handle pod;
+    dxn_shared_fence pod;
     if (!dmn_fd3d_export(fenceObj, &pod))
         return E_FAIL; /* not one of ours */
     HRESULT hr = vend_pod_owned(pod, out);
@@ -1218,26 +1221,26 @@ void register_unshared(void** out) {
 }
 
 /* == Import (consumer reconstruction) ===================================== */
-HRESULT import_texture_d3d11(ID3D11Device* dev, const dmn_shared_texture_handle* pod,
+HRESULT import_texture_d3d11(ID3D11Device* dev, const dxn_shared_texture* pod,
                              REFIID iid, void** out) {
-    if (!pod_version_ok(pod->version, "texture") ||
-        !share_shape_ok(pod->mip_levels ? pod->mip_levels : 1,
-                        pod->array_size, pod->sample_count,
+    if (!pod_version_ok(pod, "texture") || !texture_planes_ok(pod) ||
+        !share_shape_ok(pod->meta.mip_levels ? pod->meta.mip_levels : 1,
+                        pod->meta.array_size, pod->meta.sample_count,
                         "D3D11 texture import"))
         return E_INVALIDARG;
     D3D11_TEXTURE2D_DESC td{};
-    td.Width = pod->width;
-    td.Height = pod->height;
-    td.MipLevels = pod->mip_levels ? pod->mip_levels : 1;
-    td.ArraySize = pod->array_size ? pod->array_size : 1;
-    td.Format = (DXGI_FORMAT)pod->dxgi_format;
-    td.SampleDesc.Count = pod->sample_count ? pod->sample_count : 1;
+    td.Width = pod->meta.width;
+    td.Height = pod->meta.height;
+    td.MipLevels = pod->meta.mip_levels ? pod->meta.mip_levels : 1;
+    td.ArraySize = pod->meta.array_size ? pod->meta.array_size : 1;
+    td.Format = (DXGI_FORMAT)pod->meta.dxgi_format;
+    td.SampleDesc.Count = pod->meta.sample_count ? pod->meta.sample_count : 1;
     td.Usage = D3D11_USAGE_DEFAULT;
-    td.BindFlags = pod->bind_flags
-                       ? pod->bind_flags
+    td.BindFlags = pod->meta.bind_flags
+                       ? pod->meta.bind_flags
                        : (D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET);
-    td.CPUAccessFlags = pod->cpu_access;
-    td.MiscFlags = pod->misc_flags;
+    td.CPUAccessFlags = pod->meta.cpu_access_flags;
+    td.MiscFlags = pod->meta.misc_flags;
 
     /* Initial data, pointing at the sentinel. Creating the texture with none
      * leaves D3DMetal treating it as undefined, and the first render pass that
@@ -1252,13 +1255,13 @@ HRESULT import_texture_d3d11(ID3D11Device* dev, const dmn_shared_texture_handle*
         init.resize(subresources);
         for (auto& s : init) {
             s.pSysMem = sentinel;
-            s.SysMemPitch = (UINT)pod->stride;
+            s.SysMemPitch = (UINT)pod->planes[0].pitch;
             s.SysMemSlicePitch = (UINT)pod->size;
         }
     }
 
     ID3D11Texture2D* tex = nullptr;
-    dmn_share_arm_consumer(pod->fd, pod->stride, pod->size, pod->offset);
+    dmn_share_arm_consumer(pod->fd, pod->planes[0].pitch, pod->size, pod->planes[0].offset);
     HRESULT hr = dev->CreateTexture2D(&td, init.empty() ? nullptr : init.data(),
                                       &tex);
     DmnShareArm arm{};
@@ -1285,16 +1288,16 @@ HRESULT import_texture_d3d11(ID3D11Device* dev, const dmn_shared_texture_handle*
     return hr;
 }
 
-HRESULT import_buffer_d3d11(ID3D11Device* dev, const dmn_shared_buffer_handle* pod,
+HRESULT import_buffer_d3d11(ID3D11Device* dev, const dxn_shared_buffer* pod,
                             REFIID iid, void** out) {
-    if (!pod_version_ok(pod->version, "buffer"))
+    if (!pod_version_ok(pod, "buffer"))
         return E_INVALIDARG;
     D3D11_BUFFER_DESC bd{};
     bd.ByteWidth = (UINT)pod->size;
     bd.Usage = D3D11_USAGE_DEFAULT;
     bd.BindFlags = pod->bind_flags ? pod->bind_flags
                                    : D3D11_BIND_UNORDERED_ACCESS;
-    bd.CPUAccessFlags = pod->cpu_access;
+    bd.CPUAccessFlags = pod->cpu_access_flags;
     bd.MiscFlags = pod->misc_flags;
 
     ID3D11Buffer* buf = nullptr;
@@ -1328,28 +1331,28 @@ HRESULT import_buffer_d3d11(ID3D11Device* dev, const dmn_shared_buffer_handle* p
     return hr;
 }
 
-HRESULT import_texture_d3d12(ID3D12Device* dev, const dmn_shared_texture_handle* pod,
+HRESULT import_texture_d3d12(ID3D12Device* dev, const dxn_shared_texture* pod,
                              REFIID riid, void** out) {
-    if (!pod_version_ok(pod->version, "texture") ||
-        !share_shape_ok(pod->mip_levels ? pod->mip_levels : 1,
-                        pod->array_size, pod->sample_count,
+    if (!pod_version_ok(pod, "texture") || !texture_planes_ok(pod) ||
+        !share_shape_ok(pod->meta.mip_levels ? pod->meta.mip_levels : 1,
+                        pod->meta.array_size, pod->meta.sample_count,
                         "D3D12 texture import"))
         return E_INVALIDARG;
     D3D12_RESOURCE_DESC rd{};
     rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    rd.Width = pod->width;
-    rd.Height = pod->height;
-    rd.DepthOrArraySize = (UINT16)(pod->array_size ? pod->array_size : 1);
-    rd.MipLevels = (UINT16)(pod->mip_levels ? pod->mip_levels : 1);
-    rd.Format = (DXGI_FORMAT)pod->dxgi_format;
-    rd.SampleDesc.Count = pod->sample_count ? pod->sample_count : 1;
+    rd.Width = pod->meta.width;
+    rd.Height = pod->meta.height;
+    rd.DepthOrArraySize = (UINT16)(pod->meta.array_size ? pod->meta.array_size : 1);
+    rd.MipLevels = (UINT16)(pod->meta.mip_levels ? pod->meta.mip_levels : 1);
+    rd.Format = (DXGI_FORMAT)pod->meta.dxgi_format;
+    rd.SampleDesc.Count = pod->meta.sample_count ? pod->meta.sample_count : 1;
     rd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-    rd.Flags = bind_to_d12_flags(pod->bind_flags);
+    rd.Flags = bind_to_d12_flags(pod->meta.bind_flags);
 
     D3D12_HEAP_PROPERTIES hp{};
     hp.Type = D3D12_HEAP_TYPE_DEFAULT;
 
-    dmn_share_arm_consumer(pod->fd, pod->stride, pod->size, pod->offset);
+    dmn_share_arm_consumer(pod->fd, pod->planes[0].pitch, pod->size, pod->planes[0].offset);
     HRESULT hr = dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
                                               D3D12_RESOURCE_STATE_COMMON,
                                               nullptr, riid, out);
@@ -1361,7 +1364,7 @@ HRESULT import_texture_d3d12(ID3D12Device* dev, const dmn_shared_texture_handle*
         /* Register for re-export via ID3D12Device::CreateSharedHandle. */
         auto* res = reinterpret_cast<IUnknown*>(*out);
         void* id = dmn_com_identity(res);
-        dmn_shared_texture_handle rec = *pod;
+        dxn_shared_texture rec = *pod;
         rec.fd = register_owned_fd(id, pod->fd);
         {
             std::lock_guard<std::mutex> lk(g_reg_mtx);
@@ -1372,9 +1375,9 @@ HRESULT import_texture_d3d12(ID3D12Device* dev, const dmn_shared_texture_handle*
     return hr;
 }
 
-HRESULT import_buffer_d3d12(ID3D12Device* dev, const dmn_shared_buffer_handle* pod,
+HRESULT import_buffer_d3d12(ID3D12Device* dev, const dxn_shared_buffer* pod,
                             REFIID riid, void** out) {
-    if (!pod_version_ok(pod->version, "buffer"))
+    if (!pod_version_ok(pod, "buffer"))
         return E_INVALIDARG;
     D3D12_RESOURCE_DESC rd{};
     rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
@@ -1413,9 +1416,9 @@ HRESULT import_buffer_d3d12(ID3D12Device* dev, const dmn_shared_buffer_handle* p
  * The framework is never involved, and placements on the opened heap window
  * the same shm object as the exporter's, so cross-process placements at one
  * offset alias exactly like local ones. */
-HRESULT import_heap_d3d12(ID3D12Device* dev, const dmn_shared_buffer_handle* pod,
+HRESULT import_heap_d3d12(ID3D12Device* dev, const dxn_shared_buffer* pod,
                           REFIID riid, void** out) {
-    if (!pod_version_ok(pod->version, "heap"))
+    if (!pod_version_ok(pod, "heap"))
         return E_INVALIDARG;
     if (!pod->size || pod->size > (1ull << 32) ||
         (pod->offset & (dmn_share_page_align(1) - 1))) {
@@ -1456,14 +1459,14 @@ HRESULT import_heap_d3d12(ID3D12Device* dev, const dmn_shared_buffer_handle* pod
 bool open_shared_d3d11(ID3D11Device* dev, HANDLE handle, REFIID iid, void** out,
                        HRESULT* out_hr) {
     uint32_t magic = *reinterpret_cast<uint32_t*>(handle);
-    if (magic == DMN_SHARED_BUFFER_MAGIC) {
+    if (magic == DXN_SHARED_BUFFER_MAGIC) {
         *out_hr = import_buffer_d3d11(
-            dev, reinterpret_cast<dmn_shared_buffer_handle*>(handle), iid, out);
+            dev, reinterpret_cast<dxn_shared_buffer*>(handle), iid, out);
         return true;
     }
-    if (magic == DMN_SHARED_TEXTURE_MAGIC) {
+    if (magic == DXN_SHARED_TEXTURE_MAGIC) {
         *out_hr = import_texture_d3d11(
-            dev, reinterpret_cast<dmn_shared_texture_handle*>(handle), iid, out);
+            dev, reinterpret_cast<dxn_shared_texture*>(handle), iid, out);
         return true;
     }
     return false;
@@ -2021,10 +2024,10 @@ HRESULT STDMETHODCALLTYPE hook_d3d11_CreateFence(
 HRESULT STDMETHODCALLTYPE hook_d3d11_OpenSharedFence(
         ID3D11Device5* This, HANDLE handle, REFIID iid, void** out) {
     if (handle && out &&
-        *reinterpret_cast<uint32_t*>(handle) == DMN_SHARED_FENCE_MAGIC) {
+        *reinterpret_cast<uint32_t*>(handle) == DXN_SHARED_FENCE_MAGIC) {
         ID3D11Fence* f = nullptr;
         HRESULT hr = dmn_fd3d_import_d3d11(
-            This, reinterpret_cast<dmn_shared_fence_handle*>(handle), &f);
+            This, reinterpret_cast<dxn_shared_fence*>(handle), &f);
         if (FAILED(hr) || !f)
             return hr;
         track_fence_d3d11(f); /* a consumer-only process patches only here */
@@ -3430,9 +3433,10 @@ HRESULT STDMETHODCALLTYPE hook_d3d12_CreateSharedHandle(
     if (DmnSynthHeap* sh = as_synth_heap(reinterpret_cast<ID3D12Heap*>(object))) {
         if (!out)
             return E_INVALIDARG;
-        dmn_shared_buffer_handle pod{};
-        pod.magic = DMN_SHARED_BUFFER_MAGIC;
-        pod.version = DMN_SHARED_HANDLE_VERSION;
+        dxn_shared_buffer pod{};
+        pod.magic = DXN_SHARED_BUFFER_MAGIC;
+        pod.version = DXN_SHARED_VERSION;
+        pod.struct_size = sizeof(pod);
         pod.fd = sh->fd; /* vend_pod_owned dups it */
         pod.size = sh->size;
         pod.offset = sh->fd_off;
@@ -3477,10 +3481,10 @@ HRESULT STDMETHODCALLTYPE hook_d3d12_OpenSharedHandle(
         ID3D12Device* This, HANDLE handle, REFIID riid, void** out) {
     if (handle && out) {
         uint32_t magic = *reinterpret_cast<uint32_t*>(handle);
-        if (magic == DMN_SHARED_FENCE_MAGIC) {
+        if (magic == DXN_SHARED_FENCE_MAGIC) {
             ID3D12Fence* f = nullptr;
             HRESULT hr = dmn_fd3d_import_d3d12(
-                This, reinterpret_cast<dmn_shared_fence_handle*>(handle), &f);
+                This, reinterpret_cast<dxn_shared_fence*>(handle), &f);
             if (FAILED(hr) || !f)
                 return hr;
             track_fence_d3d12(f); /* a consumer-only process patches only here */
@@ -3488,11 +3492,11 @@ HRESULT STDMETHODCALLTYPE hook_d3d12_OpenSharedHandle(
             f->Release();
             return hr;
         }
-        if (magic == DMN_SHARED_TEXTURE_MAGIC)
+        if (magic == DXN_SHARED_TEXTURE_MAGIC)
             return import_texture_d3d12(
-                This, reinterpret_cast<dmn_shared_texture_handle*>(handle), riid, out);
-        if (magic == DMN_SHARED_BUFFER_MAGIC) {
-            auto* pod = reinterpret_cast<dmn_shared_buffer_handle*>(handle);
+                This, reinterpret_cast<dxn_shared_texture*>(handle), riid, out);
+        if (magic == DXN_SHARED_BUFFER_MAGIC) {
+            auto* pod = reinterpret_cast<dxn_shared_buffer*>(handle);
             /* The riid says what the handle referred to: a heap handle is
              * opened as a (synthetic) heap, anything else as a buffer. */
             if (dmn_iid_eq(riid, __uuidof(ID3D12Heap)))
@@ -3654,7 +3658,7 @@ HRESULT dmn_hooks_f12_seoc_orig(ID3D12Fence* fence, UINT64 value, HANDLE ev) {
     return orig ? orig(fence, value, ev) : fence->SetEventOnCompletion(value, ev);
 }
 
-bool dmn_res_lookup_buffer_pod(IUnknown* res, dmn_shared_buffer_handle* out) {
+bool dmn_res_lookup_buffer_pod(IUnknown* res, dxn_shared_buffer* out) {
     void* id = dmn_com_identity(res);
     std::lock_guard<std::mutex> lk(g_reg_mtx);
     auto it = g_buf_reg.find(id);

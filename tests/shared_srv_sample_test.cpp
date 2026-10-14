@@ -155,7 +155,7 @@ int run() {
     HANDLE texH = nullptr;
     CK(dxgiRes->GetSharedHandle(&texH), "GetSharedHandle");
     EXPECT(texH != nullptr, "GetSharedHandle returned null (shared tex not intercepted)");
-    dmn_shared_texture_handle wire = {};
+    dxn_shared_texture wire = {};
     memcpy(&wire, texH, sizeof(wire));
 
     /* Reopen the surface (consumer-reconstruct path) and sample its SRV. Same

@@ -80,7 +80,7 @@ int producer_d11(int sock) {
         fprintf(stderr, "XFENCE: prod fence CreateSharedHandle FAILED\n");
         return 1;
     }
-    dmn_shared_fence_handle pod;
+    dxn_shared_fence pod;
     memcpy(&pod, h, sizeof(pod));
     if (!send_with_fd(sock, &pod, sizeof(pod), pod.fd)) {
         fprintf(stderr, "XFENCE: prod send FAILED: %s\n", strerror(errno));
@@ -126,7 +126,7 @@ int producer_d12(int sock) {
         fprintf(stderr, "XFENCE: prod CreateSharedHandle FAILED\n");
         return 1;
     }
-    dmn_shared_fence_handle pod;
+    dxn_shared_fence pod;
     memcpy(&pod, h, sizeof(pod));
     if (!send_with_fd(sock, &pod, sizeof(pod), pod.fd)) {
         fprintf(stderr, "XFENCE: prod send FAILED: %s\n", strerror(errno));
@@ -151,14 +151,14 @@ int producer_d12(int sock) {
  * and poll the returned fence for each value, acking the producer per tick. */
 template <class FenceT, class OpenFn>
 int consume(int sock, const char* who, OpenFn open) {
-    dmn_shared_fence_handle pod;
+    dxn_shared_fence pod;
     int fd = -1;
     if (!recv_with_fd(sock, &pod, sizeof(pod), &fd)) {
         fprintf(stderr, "XFENCE: %s recv FAILED: %s\n", who, strerror(errno));
         return 1;
     }
     pod.fd = fd; /* the received fd is the resource's token */
-    if (pod.magic != DMN_SHARED_FENCE_MAGIC) {
+    if (pod.magic != DXN_SHARED_FENCE_MAGIC) {
         fprintf(stderr, "XFENCE: %s bad magic 0x%08x\n", who, pod.magic);
         return 1;
     }
@@ -200,7 +200,7 @@ int consumer_d12(int sock) {
         return 1;
     }
     return consume<ID3D12Fence>(sock, "D3D12 consumer",
-        [&](const dmn_shared_fence_handle* pod, Com<ID3D12Fence>& out) {
+        [&](const dxn_shared_fence* pod, Com<ID3D12Fence>& out) {
             return dev->OpenSharedHandle((HANDLE)pod, __uuidof(ID3D12Fence),
                                          (void**)&out);
         });
@@ -221,7 +221,7 @@ int consumer_d11(int sock) {
         return 1;
     }
     return consume<ID3D11Fence>(sock, "D3D11 consumer",
-        [&](const dmn_shared_fence_handle* pod, Com<ID3D11Fence>& out) {
+        [&](const dxn_shared_fence* pod, Com<ID3D11Fence>& out) {
             return dev5->OpenSharedFence((HANDLE)pod, __uuidof(ID3D11Fence),
                                          (void**)&out);
         });

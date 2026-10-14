@@ -9,6 +9,10 @@ test_native_inc = include_directories(
   '../include/native/directx',
 )
 
+# d3dmetal_native.h includes the directx-native headers.
+directx_native_hdr = directx_native_dep.partial_dependency(includes: true,
+                                                          compile_args: true)
+
 cocoa_deps = dependency('appleframeworks',
   modules: ['AppKit', 'QuartzCore', 'Metal', 'MetalKit'])
 
@@ -16,7 +20,8 @@ cocoa_deps = dependency('appleframeworks',
 # runtime init path): member-pointer slot decoding, and D3DMetal's
 # private-data release-on-destroy contract that registry eviction rides on.
 abi_check = executable('abi-check-test', 'abi_check_test.cpp',
-  include_directories: [test_native_inc, include_directories('../src')])
+  include_directories: [test_native_inc, include_directories('../src')],
+  dependencies: [directx_native_hdr])
 test('abi-check', abi_check, timeout: 30)
 
 # The COM invariants every registry in the library keys on: identity resolved
@@ -25,31 +30,35 @@ test('abi-check', abi_check, timeout: 30)
 # own dmn_com_identity().
 com_contract = executable('com-contract-test', 'com_contract_test.cpp',
   include_directories: [test_native_inc, include_directories('../src')],
-  link_with: dmn_lib)
+  link_with: dmn_lib,
+  dependencies: [directx_native_hdr])
 test('com-contract', com_contract, env: ['DMN_LOG=info'],
      is_parallel: false, timeout: 300)
 
 evict_contract = executable('evict-contract-test', 'evict_contract_test.cpp',
   include_directories: test_native_inc,
-  link_with: dmn_lib)
+  link_with: dmn_lib,
+  dependencies: [directx_native_hdr])
 test('evict-contract', evict_contract, env: ['DMN_LOG=info'], timeout: 300)
 
 dmn_smoke = executable('dmn-smoke', 'dmn_smoke.c',
   include_directories: include_directories('../include'),
-  link_with: dmn_lib)
+  link_with: dmn_lib,
+  dependencies: [directx_native_hdr])
 test('smoke', dmn_smoke, env: ['DMN_LOG=info'], timeout: 120)
 
 dmn_device_test = executable('dmn-device-test',
   ['dmn_device_test.cpp', 'cocoa_window.mm'],
   include_directories: test_native_inc,
   link_with: dmn_lib,
-  dependencies: [cocoa_deps])
+  dependencies: [cocoa_deps, directx_native_hdr])
 test('device', dmn_device_test, env: ['DMN_LOG=info'], timeout: 300)
 
 format_caps_test = executable('format-caps-test',
   'format_caps_test.cpp',
   include_directories: [test_native_inc, include_directories('../src')],
-  link_with: dmn_lib)
+  link_with: dmn_lib,
+  dependencies: [directx_native_hdr])
 test('format-caps', format_caps_test, env: ['DMN_LOG=info'], timeout: 300)
 
 # What container shapes does D3DMetal accept for SM 6.0 DXIL shaders?  The
@@ -58,7 +67,8 @@ test('format-caps', format_caps_test, env: ['DMN_LOG=info'], timeout: 300)
 dxil_container_probe = executable('dxil-container-probe',
   'dxil_container_probe.cpp',
   include_directories: test_native_inc,
-  link_with: dmn_lib)
+  link_with: dmn_lib,
+  dependencies: [directx_native_hdr])
 test('dxil-container-probe', dxil_container_probe, env: ['DMN_LOG=info'],
      timeout: 300)
 
@@ -68,20 +78,21 @@ test('dxil-container-probe', dxil_container_probe, env: ['DMN_LOG=info'],
 blend_state1_test = executable('blend-state1-test',
   'blend_state1_test.cpp',
   include_directories: test_native_inc,
-  link_with: dmn_lib)
+  link_with: dmn_lib,
+  dependencies: [directx_native_hdr])
 test('blend-state1', blend_state1_test, env: ['DMN_LOG=info'], timeout: 300)
 
 d3d11_triangle = executable('d3d11-triangle',
   ['d3d11_triangle.cpp', 'cocoa_window.mm'],
   include_directories: test_native_inc,
   link_with: dmn_lib,
-  dependencies: [cocoa_deps])
+  dependencies: [cocoa_deps, directx_native_hdr])
 
 d3d11_cube = executable('d3d11-cube',
   ['d3d11_cube.cpp', 'cocoa_window.mm'],
   include_directories: test_native_inc,
   link_with: dmn_lib,
-  dependencies: [cocoa_deps])
+  dependencies: [cocoa_deps, directx_native_hdr])
 
 # A placed BUFFER in a plain DEFAULT heap -- the shape Triton gives every guest
 # buffer, and the one heap-placed-test does not cover (it uses SHARED heaps,
@@ -91,7 +102,8 @@ d3d11_cube = executable('d3d11-cube',
 d3d12_minprec_test = executable('d3d12-minprec-test',
   ['d3d12_minprec_test.cpp'],
   include_directories: [test_native_inc, include_directories('../src')],
-  link_with: dmn_lib)
+  link_with: dmn_lib,
+  dependencies: [directx_native_hdr])
 test('d3d12-minprec', d3d12_minprec_test, env: ['DMN_LOG=info'], timeout: 300)
 
 # A ps_2_x shader through the runtime's in-driver DXBC conversion (internal
@@ -100,7 +112,8 @@ test('d3d12-minprec', d3d12_minprec_test, env: ['DMN_LOG=info'], timeout: 300)
 d3d12_dxconv_subroutine_test = executable('d3d12-dxconv-subroutine-test',
   ['d3d12_dxconv_subroutine_test.cpp'],
   include_directories: test_native_inc,
-  link_with: dmn_lib)
+  link_with: dmn_lib,
+  dependencies: [directx_native_hdr])
 test('d3d12-dxconv-subroutine', d3d12_dxconv_subroutine_test, env: ['DMN_LOG=info'], timeout: 300)
 
 # A guest-built DXIL container whose part offset or size wraps the 32-bit
@@ -108,7 +121,8 @@ test('d3d12-dxconv-subroutine', d3d12_dxconv_subroutine_test, env: ['DMN_LOG=inf
 dxil_container_bounds_test = executable('dxil-container-bounds-test',
   ['dxil_container_bounds_test.cpp'],
   include_directories: test_native_inc,
-  link_with: dmn_lib)
+  link_with: dmn_lib,
+  dependencies: [directx_native_hdr])
 test('dxil-container-bounds', dxil_container_bounds_test, timeout: 60)
 
 # SV_Barycentrics (SM 6.1) draw + readback: host twin of the guest's
@@ -116,7 +130,8 @@ test('dxil-container-bounds', dxil_container_bounds_test, timeout: 60)
 d3d12_bary_test = executable('d3d12-bary-test',
   ['d3d12_bary_test.cpp'],
   include_directories: [test_native_inc, include_directories('../src')],
-  link_with: dmn_lib)
+  link_with: dmn_lib,
+  dependencies: [directx_native_hdr])
 test('d3d12-bary', d3d12_bary_test, env: ['DMN_LOG=info'], timeout: 300)
 
 # Native 16-bit shader ops (SM 6.2 float16_t) compute + readback: host twin
@@ -124,7 +139,8 @@ test('d3d12-bary', d3d12_bary_test, env: ['DMN_LOG=info'], timeout: 300)
 d3d12_native16_test = executable('d3d12-native16-test',
   ['d3d12_native16_test.cpp'],
   include_directories: [test_native_inc, include_directories('../src')],
-  link_with: dmn_lib)
+  link_with: dmn_lib,
+  dependencies: [directx_native_hdr])
 test('d3d12-native16', d3d12_native16_test, env: ['DMN_LOG=info'], timeout: 300)
 
 # SM 6.6 64-bit integer atomics (typed R32G32_UINT UAV, group shared, raw):
@@ -132,19 +148,21 @@ test('d3d12-native16', d3d12_native16_test, env: ['DMN_LOG=info'], timeout: 300)
 d3d12_atomic64_test = executable('d3d12-atomic64-test',
   ['d3d12_atomic64_test.cpp'],
   include_directories: [test_native_inc, include_directories('../src')],
-  link_with: dmn_lib)
+  link_with: dmn_lib,
+  dependencies: [directx_native_hdr])
 test('d3d12-atomic64', d3d12_atomic64_test, env: ['DMN_LOG=info'], timeout: 300)
 
 d3d12_defbuf_test = executable('d3d12-defbuf-test',
   ['d3d12_defbuf_test.cpp'],
   include_directories: [test_native_inc, include_directories('../src')],
-  link_with: dmn_lib)
+  link_with: dmn_lib,
+  dependencies: [directx_native_hdr])
 
 d3d12_triangle = executable('d3d12-triangle',
   ['d3d12_triangle.cpp', 'cocoa_window.mm'],
   include_directories: test_native_inc,
   link_with: dmn_lib,
-  dependencies: [cocoa_deps])
+  dependencies: [cocoa_deps, directx_native_hdr])
 
 # Windowed end-to-end demo: D3D12 compute fills a shared texture, a D3D11
 # triangle samples it, fence-gated. Forks a D3D12 producer; parent is the
@@ -153,7 +171,7 @@ shared_compute_triangle = executable('shared-compute-triangle',
   ['shared_compute_triangle.cpp', 'cocoa_window.mm'],
   include_directories: test_native_inc,
   link_with: dmn_lib,
-  dependencies: [cocoa_deps])
+  dependencies: [cocoa_deps, directx_native_hdr])
 # Headless self-check of the data path (no window/present); run without
 # DMN_HEADLESS for the on-screen demo.
 test('shared-compute-triangle', shared_compute_triangle,
@@ -166,7 +184,8 @@ test('shared-compute-triangle', shared_compute_triangle,
 d3d12_sharedbuf = executable('d3d12-sharedbuf-test',
   'd3d12_sharedbuf_test.cpp',
   include_directories: test_native_inc,
-  link_with: dmn_lib)
+  link_with: dmn_lib,
+  dependencies: [directx_native_hdr])
 test('d3d12-sharedbuf', d3d12_sharedbuf, env: ['DMN_LOG=info'], timeout: 300)
 
 # The shared-texture impostor is duck-typed and must forward the selectors it
@@ -176,7 +195,7 @@ shadow_heap_forward = executable('shadow-heap-forward-test',
   'shadow_heap_forward_test.mm',
   include_directories: [test_native_inc, include_directories('../src')],
   link_with: dmn_lib,
-  dependencies: [cocoa_deps])
+  dependencies: [cocoa_deps, directx_native_hdr])
 test('shadow-heap-forward', shadow_heap_forward, timeout: 60)
 
 # SHARED (impostor-backed) textures at the resource shapes of the Subnautica 2
@@ -186,14 +205,16 @@ test('shadow-heap-forward', shadow_heap_forward, timeout: 60)
 d3d12_lumen_shapes = executable('d3d12-lumen-shapes-test',
   'd3d12_lumen_shapes_test.cpp',
   include_directories: test_native_inc,
-  link_with: dmn_lib)
+  link_with: dmn_lib,
+  dependencies: [directx_native_hdr])
 test('d3d12-lumen-shapes', d3d12_lumen_shapes, env: ['DMN_LOG=warn'],
   timeout: 300)
 
 d3d11_sharedbuf = executable('d3d11-sharedbuf-test',
   'd3d11_sharedbuf_test.cpp',
   include_directories: test_native_inc,
-  link_with: dmn_lib)
+  link_with: dmn_lib,
+  dependencies: [directx_native_hdr])
 test('d3d11-sharedbuf', d3d11_sharedbuf, env: ['DMN_LOG=info'], timeout: 300)
 
 # Windowless: D3D12 producer fence (queue Signal -> helper-queue Wait +
@@ -201,20 +222,23 @@ test('d3d11-sharedbuf', d3d11_sharedbuf, env: ['DMN_LOG=info'], timeout: 300)
 d3d12_mesh = executable('d3d12-mesh-test',
   'd3d12_mesh_test.cpp',
   include_directories: test_native_inc,
-  link_with: dmn_lib)
+  link_with: dmn_lib,
+  dependencies: [directx_native_hdr])
 test('d3d12-mesh', d3d12_mesh, env: ['DMN_LOG=info'], timeout: 300)
 
 d3d12_fence = executable('d3d12-fence-test',
   'd3d12_fence_test.cpp',
   include_directories: test_native_inc,
-  link_with: dmn_lib)
+  link_with: dmn_lib,
+  dependencies: [directx_native_hdr])
 test('d3d12-fence', d3d12_fence, env: ['DMN_LOG=info'], timeout: 300)
 
 # Windowless producer (D3D11) + pure consumer, forked in one binary; no Cocoa.
 shared_texture_test = executable('shared-texture-test',
   'shared_texture_test.cpp',
   include_directories: test_native_inc,
-  link_with: dmn_lib)
+  link_with: dmn_lib,
+  dependencies: [directx_native_hdr])
 test('shared-texture', shared_texture_test, env: ['DMN_LOG=info'],
      is_parallel: false, timeout: 300)
 
@@ -225,7 +249,8 @@ test('shared-texture', shared_texture_test, env: ['DMN_LOG=info'],
 shared_contract_test = executable('shared-contract-test',
   'shared_contract_test.cpp',
   include_directories: test_native_inc,
-  link_with: dmn_lib)
+  link_with: dmn_lib,
+  dependencies: [directx_native_hdr])
 test('shared-contract', shared_contract_test, env: ['DMN_LOG=info'], timeout: 300)
 
 # A shared texture's view rights cross the POD both ways: a D3D12 export
@@ -233,7 +258,8 @@ test('shared-contract', shared_contract_test, env: ['DMN_LOG=info'], timeout: 30
 shared_flags_test = executable('shared-flags-test',
   'shared_flags_test.cpp',
   include_directories: test_native_inc,
-  link_with: dmn_lib)
+  link_with: dmn_lib,
+  dependencies: [directx_native_hdr])
 test('shared-flags', shared_flags_test, env: ['DMN_LOG=info'], timeout: 300)
 
 # Regression: rendering to an opened shared surface must not discard the
@@ -242,7 +268,8 @@ test('shared-flags', shared_flags_test, env: ['DMN_LOG=info'], timeout: 300)
 shared_open_preserve = executable('shared-open-preserve-test',
   'shared_open_preserve_test.cpp',
   include_directories: test_native_inc,
-  link_with: dmn_lib)
+  link_with: dmn_lib,
+  dependencies: [directx_native_hdr])
 test('shared-open-preserve', shared_open_preserve,
      env: ['DMN_LOG=info'], timeout: 300)
 
@@ -250,7 +277,8 @@ test('shared-open-preserve', shared_open_preserve,
 shared_srv_sample_test = executable('shared-srv-sample-test',
   'shared_srv_sample_test.cpp',
   include_directories: test_native_inc,
-  link_with: dmn_lib)
+  link_with: dmn_lib,
+  dependencies: [directx_native_hdr])
 test('shared-srv-sample', shared_srv_sample_test, env: ['DMN_LOG=info'], timeout: 300)
 # The same sample with the impostor residency set switched off, so the
 # per-command-buffer useResources: path (macOS < 15, sparse textures) keeps a
@@ -264,7 +292,8 @@ test('shared-srv-sample-no-residency-set', shared_srv_sample_test,
 error_paths = executable('error-paths-test',
   'error_paths_test.cpp',
   include_directories: test_native_inc,
-  link_with: dmn_lib)
+  link_with: dmn_lib,
+  dependencies: [directx_native_hdr])
 test('error-paths', error_paths, env: ['DMN_LOG=warn'],
      is_parallel: false, timeout: 300)
 
@@ -273,7 +302,8 @@ test('error-paths', error_paths, env: ['DMN_LOG=warn'],
 fence_xapi = executable('fence-xapi-test',
   'fence_xapi_test.cpp',
   include_directories: test_native_inc,
-  link_with: dmn_lib)
+  link_with: dmn_lib,
+  dependencies: [directx_native_hdr])
 test('fence-xapi-d11d12', fence_xapi, args: ['d11d12'],
      env: ['DMN_LOG=info'], is_parallel: false, timeout: 300)
 test('fence-xapi-d12d11', fence_xapi, args: ['d12d11'],
@@ -286,7 +316,8 @@ test('fence-xapi-d12d11', fence_xapi, args: ['d12d11'],
 fence_release_race = executable('fence-release-race-test',
   'fence_release_race_test.cpp',
   include_directories: test_native_inc,
-  link_with: dmn_lib)
+  link_with: dmn_lib,
+  dependencies: [directx_native_hdr])
 test('fence-release-race', fence_release_race, env: ['DMN_LOG=warn'],
      is_parallel: false, timeout: 600)
 
@@ -296,7 +327,8 @@ test('fence-release-race', fence_release_race, env: ['DMN_LOG=warn'],
 fence_gpuwait = executable('fence-gpuwait-test',
   'fence_gpuwait_test.cpp',
   include_directories: test_native_inc,
-  link_with: dmn_lib)
+  link_with: dmn_lib,
+  dependencies: [directx_native_hdr])
 test('fence-gpuwait', fence_gpuwait, env: ['DMN_LOG=info'],
      is_parallel: false, timeout: 300)
 
@@ -305,7 +337,8 @@ test('fence-gpuwait', fence_gpuwait, env: ['DMN_LOG=info'],
 keyed_mutex = executable('keyed-mutex-test',
   'keyed_mutex_test.cpp',
   include_directories: test_native_inc,
-  link_with: dmn_lib)
+  link_with: dmn_lib,
+  dependencies: [directx_native_hdr])
 test('keyed-mutex', keyed_mutex, env: ['DMN_LOG=info'],
      is_parallel: false, timeout: 300)
 
@@ -314,7 +347,8 @@ test('keyed-mutex', keyed_mutex, env: ['DMN_LOG=info'],
 shared_reexport = executable('shared-reexport-test',
   'shared_reexport_test.cpp',
   include_directories: test_native_inc,
-  link_with: dmn_lib)
+  link_with: dmn_lib,
+  dependencies: [directx_native_hdr])
 test('shared-reexport', shared_reexport, env: ['DMN_LOG=info'], timeout: 300)
 
 # Windowless: shared texture/buffer/fence create-destroy churn; asserts fd
@@ -322,7 +356,8 @@ test('shared-reexport', shared_reexport, env: ['DMN_LOG=info'], timeout: 300)
 lifecycle_churn = executable('lifecycle-churn-test',
   'lifecycle_churn_test.cpp',
   include_directories: test_native_inc,
-  link_with: dmn_lib)
+  link_with: dmn_lib,
+  dependencies: [directx_native_hdr])
 test('lifecycle-churn', lifecycle_churn, env: ['DMN_LOG=warn'],
      is_parallel: false, timeout: 600)
 
@@ -332,7 +367,8 @@ test('lifecycle-churn', lifecycle_churn, env: ['DMN_LOG=warn'],
 mt_stress = executable('mt-stress-test',
   'mt_stress_test.cpp',
   include_directories: test_native_inc,
-  link_with: dmn_lib)
+  link_with: dmn_lib,
+  dependencies: [directx_native_hdr])
 test('mt-stress', mt_stress, env: ['DMN_LOG=warn'],
      is_parallel: false, timeout: 600)
 
@@ -340,7 +376,8 @@ test('mt-stress', mt_stress, env: ['DMN_LOG=warn'],
 # initial state, wake-one auto-reset, and the pollable dup_fd view.
 event_api = executable('event-api-test', 'event_api_test.cpp',
   include_directories: test_native_inc,
-  link_with: dmn_lib)
+  link_with: dmn_lib,
+  dependencies: [directx_native_hdr])
 test('event-api', event_api, env: ['DMN_LOG=info'], timeout: 120)
 
 # Windowless: event-driven fence paths — SetEventOnCompletion + dmn_event_wait
@@ -350,7 +387,8 @@ test('event-api', event_api, env: ['DMN_LOG=info'], timeout: 120)
 fence_events = executable('fence-events-test',
   'fence_events_test.cpp',
   include_directories: test_native_inc,
-  link_with: dmn_lib)
+  link_with: dmn_lib,
+  dependencies: [directx_native_hdr])
 test('fence-events', fence_events, env: ['DMN_LOG=info'], timeout: 300)
 
 # Windowless: D3D12 shared heap + placed resource (the heap-class swizzle
@@ -358,7 +396,8 @@ test('fence-events', fence_events, env: ['DMN_LOG=info'], timeout: 300)
 heap_placed = executable('heap-placed-test',
   'heap_placed_test.cpp',
   include_directories: [test_native_inc, include_directories('../src')],
-  link_with: dmn_lib)
+  link_with: dmn_lib,
+  dependencies: [directx_native_hdr])
 test('heap-placed', heap_placed, env: ['DMN_LOG=info'], timeout: 300)
 
 # Windowless: the companion-present copy — CopyResource with a SUBSTITUTED
@@ -368,7 +407,8 @@ test('heap-placed', heap_placed, env: ['DMN_LOG=info'], timeout: 300)
 present_copy = executable('present-copy-test',
   'present_copy_test.cpp',
   include_directories: test_native_inc,
-  link_with: dmn_lib)
+  link_with: dmn_lib,
+  dependencies: [directx_native_hdr])
 test('present-copy', present_copy, env: ['DMN_LOG=info'], timeout: 300)
 
 # Every packed 16-bit format advertised as a render target round-trips a
@@ -376,14 +416,16 @@ test('present-copy', present_copy, env: ['DMN_LOG=info'], timeout: 300)
 packed_rt_test = executable('packed-rt-test',
   'packed_rt_test.cpp',
   include_directories: test_native_inc,
-  link_with: dmn_lib)
+  link_with: dmn_lib,
+  dependencies: [directx_native_hdr])
 test('packed-rt', packed_rt_test, env: ['DMN_LOG=info'], timeout: 120)
 
 # Packed 16-bit formats sample correctly after a CPU upload in DXGI packing.
 packed_sample_test = executable('packed-sample-test',
   'packed_sample_test.cpp',
   include_directories: test_native_inc,
-  link_with: dmn_lib)
+  link_with: dmn_lib,
+  dependencies: [directx_native_hdr])
 test('packed-sample', packed_sample_test, env: ['DMN_LOG=info'], timeout: 120)
 
 # Windowless: dmn_open_existing_heap_from_fd — a shm window imported as an
@@ -393,7 +435,8 @@ test('packed-sample', packed_sample_test, env: ['DMN_LOG=info'], timeout: 120)
 heap_import = executable('heap-import-test',
   'heap_import_test.cpp',
   include_directories: [test_native_inc, include_directories('../src')],
-  link_with: dmn_lib)
+  link_with: dmn_lib,
+  dependencies: [directx_native_hdr])
 test('heap-import', heap_import, env: ['DMN_LOG=info'], timeout: 300)
 
 # Windowless: how much memory does each shared path actually cost? Holds N large
@@ -417,7 +460,7 @@ shared_footprint = executable('shared-footprint-test',
   ['shared_footprint_test.cpp', 'metal_alloc_size.mm'],
   include_directories: [test_native_inc, include_directories('../src')],
   link_with: dmn_lib,
-  dependencies: [cocoa_deps])
+  dependencies: [cocoa_deps, directx_native_hdr])
 test('shared-footprint', shared_footprint, env: ['DMN_LOG=error'],
      is_parallel: false, timeout: 2400)
 
@@ -426,7 +469,8 @@ test('shared-footprint', shared_footprint, env: ['DMN_LOG=error'],
 d3d11_variants = executable('d3d11-variants-test',
   'd3d11_variants_test.cpp',
   include_directories: test_native_inc,
-  link_with: dmn_lib)
+  link_with: dmn_lib,
+  dependencies: [directx_native_hdr])
 test('d3d11-variants', d3d11_variants, env: ['DMN_LOG=info'], timeout: 300)
 
 # Diagnostic probe (not a test): D3DMetal pool behaviour on release.
@@ -434,14 +478,14 @@ pool_probe = executable('pool-probe',
   ['pool_probe.cpp', 'metal_alloc_size.mm'],
   include_directories: [test_native_inc, include_directories('../src')],
   link_with: dmn_lib,
-  dependencies: [cocoa_deps])
+  dependencies: [cocoa_deps, directx_native_hdr])
 
 # Diagnostic probe (not a test): the backend's own tiled-resource support.
 tiled_probe = executable('tiled-probe',
   ['tiled_probe.cpp', 'metal_alloc_size.mm'],
   include_directories: [test_native_inc, include_directories('../src')],
   link_with: dmn_lib,
-  dependencies: [cocoa_deps])
+  dependencies: [cocoa_deps, directx_native_hdr])
 
 # Diagnostic probe (not a test): what the machine actually holds for committed
 # textures vs how much of them the GPU touches (host-wide page counters), and
@@ -450,14 +494,14 @@ resident_probe = executable('resident-probe',
   ['resident_probe.cpp', 'metal_alloc_size.mm'],
   include_directories: [test_native_inc, include_directories('../src')],
   link_with: dmn_lib,
-  dependencies: [cocoa_deps])
+  dependencies: [cocoa_deps, directx_native_hdr])
 # Diagnostic probe (not a test): is an unreferenced D3D12 heap / untouched
 # texture still made resident by the backend on GPU work? (Yes.)
 heapres_probe = executable('heapres-probe',
   ['heapres_probe.cpp', 'metal_alloc_size.mm'],
   include_directories: [test_native_inc, include_directories('../src')],
   link_with: dmn_lib,
-  dependencies: [cocoa_deps])
+  dependencies: [cocoa_deps, directx_native_hdr])
 
 # Sparse-backed reserved resources: tier-2 content semantics through the
 # hooks (mapped region holds data, unmapped reads zero, unmap reads zero
@@ -466,7 +510,7 @@ sparse_tiled = executable('sparse-tiled-test',
   ['sparse_tiled_test.cpp', 'metal_alloc_size.mm'],
   include_directories: [test_native_inc, include_directories('../src')],
   link_with: dmn_lib,
-  dependencies: [cocoa_deps])
+  dependencies: [cocoa_deps, directx_native_hdr])
 test('sparse-tiled', sparse_tiled, env: ['DMN_LOG=warn'], is_parallel: false, timeout: 120)
 
 # How the sparse module sizes itself: when chunks open, where a texture lands,
@@ -477,7 +521,7 @@ sparse_sizing = executable('sparse-sizing-test',
   ['sparse_sizing_test.cpp', 'metal_alloc_size.mm'],
   include_directories: [test_native_inc, include_directories('../src')],
   link_with: dmn_lib,
-  dependencies: [cocoa_deps])
+  dependencies: [cocoa_deps, directx_native_hdr])
 test('sparse-sizing', sparse_sizing, env: ['DMN_LOG=warn'], is_parallel: false, timeout: 300)
 
 # Diagnostic probe (not a test): a streaming title's reserved-resource pattern
@@ -488,7 +532,7 @@ sparse_pool_probe = executable('sparse-pool-probe',
   ['sparse_pool_probe.cpp', 'metal_alloc_size.mm'],
   include_directories: [test_native_inc, include_directories('../src')],
   link_with: dmn_lib,
-  dependencies: [cocoa_deps])
+  dependencies: [cocoa_deps, directx_native_hdr])
 
 # A placed create on an imported (synthetic) heap must never write to the
 # heap's memory: pre-filled window + spin-checker for transient zeros while
@@ -497,12 +541,14 @@ sparse_pool_probe = executable('sparse-pool-probe',
 d3d12_placed_notzeroed = executable('d3d12-placed-notzeroed-test',
   ['d3d12_placed_notzeroed_test.cpp'],
   include_directories: [test_native_inc, include_directories('../src')],
-  link_with: dmn_lib)
+  link_with: dmn_lib,
+  dependencies: [directx_native_hdr])
 test('d3d12-placed-notzeroed', d3d12_placed_notzeroed, env: ['DMN_LOG=warn'],
   timeout: 300)
 
 import_zerofill = executable('import-zerofill-test',
   ['import_zerofill_test.cpp'],
   include_directories: [test_native_inc, include_directories('../src')],
-  link_with: dmn_lib)
+  link_with: dmn_lib,
+  dependencies: [directx_native_hdr])
 test('import-zerofill', import_zerofill, env: ['DMN_LOG=warn'], timeout: 300)

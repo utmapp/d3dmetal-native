@@ -109,7 +109,7 @@ void mk_device_d3d11(Barrier* b) {
     HANDLE h = nullptr;
     if (FAILED(tex->QueryInterface(__uuidof(IDXGIResource), (void**)&res)) ||
         FAILED(res->GetSharedHandle(&h)) || !h ||
-        ((dmn_shared_texture_handle*)h)->magic != DMN_SHARED_TEXTURE_MAGIC)
+        ((dxn_shared_texture*)h)->magic != DXN_SHARED_TEXTURE_MAGIC)
         TFAIL("device-phase texture export FAILED");
 }
 
@@ -125,7 +125,7 @@ void mk_device_d3d12(Barrier* b) {
         TFAIL("device-phase D3D12 CreateFence(SHARED) FAILED");
     HANDLE h = nullptr;
     if (FAILED(dev->CreateSharedHandle(fence.ptr(), nullptr, 0, nullptr, &h)) ||
-        !h || ((dmn_shared_fence_handle*)h)->magic != DMN_SHARED_FENCE_MAGIC)
+        !h || ((dxn_shared_fence*)h)->magic != DXN_SHARED_FENCE_MAGIC)
         TFAIL("device-phase D3D12 fence export FAILED");
     if (dmn_shared_handle_close(h) != DMN_SUCCESS)
         TFAIL("device-phase D3D12 fence handle close FAILED");
@@ -167,12 +167,12 @@ void churn_d3d11(ID3D11Device* dev, Barrier* b, int tid) {
         if (FAILED(tex->QueryInterface(__uuidof(IDXGIResource), (void**)&res)) ||
             FAILED(res->GetSharedHandle(&h)) || !h)
             TFAIL("t%d i%d texture export FAILED", tid, i);
-        auto* pod = (dmn_shared_texture_handle*)h;
-        if (pod->magic != DMN_SHARED_TEXTURE_MAGIC)
+        auto* pod = (dxn_shared_texture*)h;
+        if (pod->magic != DXN_SHARED_TEXTURE_MAGIC)
             TFAIL("t%d i%d bad texture POD magic", tid, i);
-        if (pod->width != W || pod->height != H)
+        if (pod->meta.width != W || pod->meta.height != H)
             TFAIL("t%d i%d POD is %ux%u, created %ux%u — arm cross-capture!",
-                  tid, i, pod->width, pod->height, W, H);
+                  tid, i, pod->meta.width, pod->meta.height, W, H);
 
         /* Open it back on this thread (concurrent consumer arms). */
         Com<ID3D11Texture2D> imp;
@@ -200,8 +200,8 @@ void churn_d3d11(ID3D11Device* dev, Barrier* b, int tid) {
         if (FAILED(buf->QueryInterface(__uuidof(IDXGIResource), (void**)&bres)) ||
             FAILED(bres->GetSharedHandle(&bh)) || !bh)
             TFAIL("t%d i%d buffer export FAILED", tid, i);
-        auto* bpod = (dmn_shared_buffer_handle*)bh;
-        if (bpod->magic != DMN_SHARED_BUFFER_MAGIC || bpod->size != BW)
+        auto* bpod = (dxn_shared_buffer*)bh;
+        if (bpod->magic != DXN_SHARED_BUFFER_MAGIC || bpod->size != BW)
             TFAIL("t%d i%d buffer POD size %llu, created %u — arm cross-capture!",
                   tid, i, (unsigned long long)bpod->size, BW);
     }
@@ -255,12 +255,12 @@ void churn_d3d12(ID3D12Device* dev, Barrier* b, int tid) {
         if (FAILED(dev->CreateSharedHandle(tex.ptr(), nullptr, 0, nullptr, &h)) ||
             !h)
             TFAIL("t%d i%d D3D12 CreateSharedHandle FAILED", tid, i);
-        auto* pod = (dmn_shared_texture_handle*)h;
-        if (pod->magic != DMN_SHARED_TEXTURE_MAGIC)
+        auto* pod = (dxn_shared_texture*)h;
+        if (pod->magic != DXN_SHARED_TEXTURE_MAGIC)
             TFAIL("t%d i%d bad D3D12 texture POD magic", tid, i);
-        if (pod->width != W || pod->height != H)
+        if (pod->meta.width != W || pod->meta.height != H)
             TFAIL("t%d i%d D3D12 POD is %ux%u, created %ux%u — arm cross-capture!",
-                  tid, i, pod->width, pod->height, W, H);
+                  tid, i, pod->meta.width, pod->meta.height, W, H);
 
         Com<ID3D12Resource> imp;
         if (FAILED(dev->OpenSharedHandle(h, __uuidof(ID3D12Resource),
@@ -302,7 +302,7 @@ void churn_fences(ID3D11Device5* d11, ID3D12Device* d12, Barrier* b, int tid) {
             TFAIL("t%d i%d D3D11 CreateFence(SHARED) FAILED", tid, i);
         HANDLE h11 = nullptr;
         if (FAILED(f11->CreateSharedHandle(nullptr, 0, nullptr, &h11)) || !h11 ||
-            ((dmn_shared_fence_handle*)h11)->magic != DMN_SHARED_FENCE_MAGIC)
+            ((dxn_shared_fence*)h11)->magic != DXN_SHARED_FENCE_MAGIC)
             TFAIL("t%d i%d D3D11 fence export FAILED", tid, i);
         if (dmn_shared_handle_close(h11) != DMN_SUCCESS)
             TFAIL("t%d i%d D3D11 fence handle close FAILED", tid, i);
@@ -314,7 +314,7 @@ void churn_fences(ID3D11Device5* d11, ID3D12Device* d12, Barrier* b, int tid) {
         HANDLE h12 = nullptr;
         if (FAILED(d12->CreateSharedHandle(f12.ptr(), nullptr, 0, nullptr,
                                            &h12)) || !h12 ||
-            ((dmn_shared_fence_handle*)h12)->magic != DMN_SHARED_FENCE_MAGIC)
+            ((dxn_shared_fence*)h12)->magic != DXN_SHARED_FENCE_MAGIC)
             TFAIL("t%d i%d D3D12 fence export FAILED", tid, i);
         if (dmn_shared_handle_close(h12) != DMN_SUCCESS)
             TFAIL("t%d i%d D3D12 fence handle close FAILED", tid, i);

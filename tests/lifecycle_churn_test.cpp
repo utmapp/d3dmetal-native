@@ -138,7 +138,7 @@ int churn_d3d11(unsigned kinds = K_ALL_11) {
             return -1;
         }
         if (g_shared &&
-            ((dmn_shared_texture_handle*)h1)->magic != DMN_SHARED_TEXTURE_MAGIC) {
+            ((dxn_shared_texture*)h1)->magic != DXN_SHARED_TEXTURE_MAGIC) {
             fprintf(stderr, "CHURN: iter %d bad texture POD magic\n", i);
             return -1;
         }
@@ -187,7 +187,7 @@ int churn_d3d11(unsigned kinds = K_ALL_11) {
         HANDLE fh = nullptr;
         if (g_shared &&
             (FAILED(fence->CreateSharedHandle(nullptr, 0, nullptr, &fh)) || !fh ||
-             ((dmn_shared_fence_handle*)fh)->magic != DMN_SHARED_FENCE_MAGIC)) {
+             ((dxn_shared_fence*)fh)->magic != DXN_SHARED_FENCE_MAGIC)) {
             fprintf(stderr, "CHURN: iter %d fence export FAILED\n", i);
             return -1;
         }
@@ -252,7 +252,7 @@ int churn_d3d12(unsigned kinds = K_ALL_12) {
         HANDLE th = nullptr;
         if (g_shared &&
             (FAILED(dev->CreateSharedHandle(tex.ptr(), nullptr, 0, nullptr, &th)) ||
-             !th || ((dmn_shared_texture_handle*)th)->magic != DMN_SHARED_TEXTURE_MAGIC)) {
+             !th || ((dxn_shared_texture*)th)->magic != DXN_SHARED_TEXTURE_MAGIC)) {
             fprintf(stderr, "CHURN: iter %d D3D12 texture export FAILED\n", i);
             return -1;
         }

@@ -44,7 +44,7 @@ void dmn_fd3d_fence_destroy(void* identity);
 
 /* Fill `out` with the fence's shareable POD. False if the fence is neither a
  * producer nor an import (re-export from an opened fence is allowed). */
-bool dmn_fd3d_export(IUnknown* fence, dmn_shared_fence_handle* out);
+bool dmn_fd3d_export(IUnknown* fence, dxn_shared_fence* out);
 
 /* Signal interception, called after a SUCCESSFUL orig Signal. A D3D12
  * producer's slot store rides its helper queue; a D3D11 producer's, and every
@@ -98,10 +98,10 @@ bool dmn_fd3d_watch_slot(IUnknown* fence, UINT64 value, HANDLE event);
  * fence in *out; the caller patches its class methods and attaches the
  * eviction sentinel. */
 HRESULT dmn_fd3d_import_d3d12(ID3D12Device* dev,
-                              const dmn_shared_fence_handle* pod,
+                              const dxn_shared_fence* pod,
                               ID3D12Fence** out);
 HRESULT dmn_fd3d_import_d3d11(ID3D11Device5* dev,
-                              const dmn_shared_fence_handle* pod,
+                              const dxn_shared_fence* pod,
                               ID3D11Fence** out);
 
 /* Before a GPU wait on `fence` is enqueued (queue Wait, context Wait, or one
@@ -116,7 +116,7 @@ void dmn_fd3d_before_ctx_wait(ID3D11DeviceContext4* c, ID3D11Fence* fence,
 /* Companion-buffer POD lookup for a resource that just went through the hooked
  * shared-buffer create path (the fence module creates its companion buffers
  * through the standard public APIs, so the hooks record them). */
-bool dmn_res_lookup_buffer_pod(IUnknown* res, dmn_shared_buffer_handle* out);
+bool dmn_res_lookup_buffer_pod(IUnknown* res, dxn_shared_buffer* out);
 
 /* Signal through the ORIGINAL (pre-patch) method. Watcher raises of an
  * imported fence must not re-enter the Signal hooks: they are not app

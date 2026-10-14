@@ -422,7 +422,7 @@ public:
 
   bool beginFrame() {
     if (m_latencyEvent)
-      dmn_event_wait(m_latencyEvent, DMN_WAIT_INFINITE);
+      dmn_event_wait(m_latencyEvent, DXN_WAIT_INFINITE);
 
     // Make sure we can actually render to the window
     uint32_t newWindowSizeW = m_windowSizeW;

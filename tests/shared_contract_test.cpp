@@ -71,24 +71,27 @@ D3D11_TEXTURE2D_DESC shared_desc(UINT w, UINT h, DXGI_FORMAT fmt, UINT bind) {
 
 /* Export a shared texture's POD. The HANDLE our IDXGIResource::GetSharedHandle
  * vends is the POD bytes themselves. */
-bool export_pod(ID3D11Texture2D* tex, dmn_shared_texture_handle* out) {
+bool export_pod(ID3D11Texture2D* tex, dxn_shared_texture* out) {
     Com<IDXGIResource> res;
     HANDLE h = nullptr;
     if (FAILED(tex->QueryInterface(__uuidof(IDXGIResource), (void**)&res)) ||
         FAILED(res->GetSharedHandle(&h)) || !h)
         return false;
     memcpy(out, h, sizeof(*out));
-    return out->magic == DMN_SHARED_TEXTURE_MAGIC;
+    /* The whole directx-native contract, as every peer (the Neptune render
+     * server, DXMT) validates it: a shm texture is one linear plane. */
+    return dxn_shared_check(out, DXN_SHARED_TEXTURE_MAGIC, sizeof(*out)) &&
+           out->plane_count == 1 && out->planes[0].pitch != 0;
 }
 
-bool export_buffer_pod(ID3D11Buffer* buf, dmn_shared_buffer_handle* out) {
+bool export_buffer_pod(ID3D11Buffer* buf, dxn_shared_buffer* out) {
     Com<IDXGIResource> res;
     HANDLE h = nullptr;
     if (FAILED(buf->QueryInterface(__uuidof(IDXGIResource), (void**)&res)) ||
         FAILED(res->GetSharedHandle(&h)) || !h)
         return false;
     memcpy(out, h, sizeof(*out));
-    return out->magic == DMN_SHARED_BUFFER_MAGIC;
+    return dxn_shared_check(out, DXN_SHARED_BUFFER_MAGIC, sizeof(*out));
 }
 
 /* == 1. Unshareable formats fail the create ============================== */
@@ -132,10 +135,10 @@ int test_import_validation(ID3D11Device* dev) {
     Com<ID3D11Texture2D> src;
     CK(dev->CreateTexture2D(&td, nullptr, &src), "control shared create");
 
-    dmn_shared_texture_handle pod{};
+    dxn_shared_texture pod{};
     EXPECT(export_pod(src.ptr(), &pod), "control export");
-    EXPECT(pod.stride >= 256u * 4u, "exported stride covers a row");
-    EXPECT(pod.size >= pod.stride * 256u, "exported size covers the surface");
+    EXPECT(pod.planes[0].pitch >= 256u * 4u, "exported stride covers a row");
+    EXPECT(pod.size >= pod.planes[0].pitch * 256u, "exported size covers the surface");
 
     /* Control: the untouched handle must open, or the negatives below prove
      * nothing. */
@@ -154,13 +157,13 @@ int test_import_validation(ID3D11Device* dev) {
     } bad[] = {
         { "stride 0",              0,             pod.size },
         { "stride under one row",  16,            pod.size },
-        { "size 0",                pod.stride,    0 },
-        { "size under the surface",pod.stride,    pod.stride * 4 },
-        { "size past any surface", pod.stride,    (uint64_t)1 << 40 },
+        { "size 0",                pod.planes[0].pitch,    0 },
+        { "size under the surface",pod.planes[0].pitch,    pod.planes[0].pitch * 4 },
+        { "size past any surface", pod.planes[0].pitch,    (uint64_t)1 << 40 },
     };
     for (const auto& b : bad) {
-        dmn_shared_texture_handle corrupt = pod;
-        corrupt.stride = b.stride;
+        dxn_shared_texture corrupt = pod;
+        corrupt.planes[0].pitch = b.stride;
         corrupt.size = b.size;
         Com<ID3D11Texture2D> opened;
         HRESULT hr = dev->OpenSharedResource(
@@ -214,27 +217,27 @@ int test_export_geometry(ID3D11Device* dev) {
                         D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET);
         Com<ID3D11Texture2D> tex;
         CK(dev->CreateTexture2D(&td, nullptr, &tex), "shared texture create");
-        dmn_shared_texture_handle pod{};
+        dxn_shared_texture pod{};
         EXPECT(export_pod(tex.ptr(), &pod), "texture export");
 
-        EXPECT(pod.stride >= row, "exported stride covers a row");
-        if (pod.stride > row + page) {
+        EXPECT(pod.planes[0].pitch >= row, "exported stride covers a row");
+        if (pod.planes[0].pitch > row + page) {
             fprintf(stderr, T_TAG ": exported stride %llu for a %llu-byte row — "
                     "this is not a %ux%u surface's own backing\n",
-                    (unsigned long long)pod.stride, (unsigned long long)row,
+                    (unsigned long long)pod.planes[0].pitch, (unsigned long long)row,
                     kW, kH);
             return 1;
         }
         /* The POD's documented meaning: stride*height, not page-padded. */
-        if (pod.size != pod.stride * kH) {
+        if (pod.size != pod.planes[0].pitch * kH) {
             fprintf(stderr, T_TAG ": exported size %llu != stride %llu * height "
                     "%u\n", (unsigned long long)pod.size,
-                    (unsigned long long)pod.stride, kH);
+                    (unsigned long long)pod.planes[0].pitch, kH);
             return 1;
         }
         printf(T_TAG ": exported texture geometry describes the texture "
                "(stride=%llu size=%llu): OK\n",
-               (unsigned long long)pod.stride, (unsigned long long)pod.size);
+               (unsigned long long)pod.planes[0].pitch, (unsigned long long)pod.size);
     }
 
     {
@@ -248,7 +251,7 @@ int test_export_geometry(ID3D11Device* dev) {
         bd.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
         Com<ID3D11Buffer> buf;
         CK(dev->CreateBuffer(&bd, nullptr, &buf), "shared buffer create");
-        dmn_shared_buffer_handle pod{};
+        dxn_shared_buffer pod{};
         EXPECT(export_buffer_pod(buf.ptr(), &pod), "buffer export");
 
         EXPECT(pod.size >= kBytes, "exported size covers the buffer");

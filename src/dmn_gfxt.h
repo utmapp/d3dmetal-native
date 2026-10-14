@@ -14,7 +14,7 @@
 #include <memory>
 
 #include "d3dmetal_gfxt.h"
-#include "d3dmetal_native.h" /* dmn_wait_status */
+#include "d3dmetal_native.h" /* dxn_wait_status */
 
 class DmnGFXTMonitor final : public GFXTMonitorInterface {
 public:

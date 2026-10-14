@@ -12,6 +12,8 @@
 #include <cstring>
 #include <mutex>
 
+#include <directx-native/dxn_log.h>
+
 namespace {
 
 std::atomic<int> g_level{-1};
@@ -46,6 +48,15 @@ const char* level_tag(dmn_log_level level) {
     }
     return "?";
 }
+
+/* directx-native's diagnostics (events, shm) go through the same threshold
+ * and sink; its levels are a prefix of ours. Installed at load, before any
+ * dxn call can run. */
+void dxn_log_forward(dxn_log_level level, const char* message, void*) {
+    dmn_log_impl((dmn_log_level)level, "%s", message);
+}
+
+[[maybe_unused]] const bool g_dxn_log_installed = (dxn_set_log_callback(dxn_log_forward, nullptr), true);
 
 } // namespace
 

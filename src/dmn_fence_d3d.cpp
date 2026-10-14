@@ -69,7 +69,7 @@ struct GpuFence {
     IUnknown* realFence = nullptr;         /* borrowed — an AddRef here would
                                               keep the fence alive forever and
                                               destruction could never evict us */
-    dmn_shared_buffer_handle bufPod{};     /* companion buffer (fd/size); the
+    dxn_shared_buffer bufPod{};     /* companion buffer (fd/size); the
                                               value slot is at offset 0 */
     uint64_t  initial = 0;
     uint32_t  flags = 0;
@@ -117,9 +117,10 @@ GpuFence* lookup_producer(IUnknown* fence) {
 
 /* Open the producer's own view of its slot (for completed-merge/watch). */
 void open_producer_view(GpuFence* gf) {
-    dmn_shared_fence_handle pod{};
-    pod.magic = DMN_SHARED_FENCE_MAGIC;
-    pod.version = DMN_SHARED_HANDLE_VERSION;
+    dxn_shared_fence pod{};
+    pod.magic = DXN_SHARED_FENCE_MAGIC;
+    pod.version = DXN_SHARED_VERSION;
+    pod.struct_size = sizeof(pod);
     pod.fd = gf->bufPod.fd;
     pod.flags = gf->flags;
     pod.initial_value = gf->initial;
@@ -183,8 +184,9 @@ bool gpufence_setup_d3d11(GpuFence* gf) {
         DMN_ERROR("fence: D3D11 slot allocation failed");
         return false;
     }
-    gf->bufPod.magic = DMN_SHARED_BUFFER_MAGIC;
-    gf->bufPod.version = DMN_SHARED_HANDLE_VERSION;
+    gf->bufPod.magic = DXN_SHARED_BUFFER_MAGIC;
+    gf->bufPod.version = DXN_SHARED_VERSION;
+    gf->bufPod.struct_size = sizeof(gf->bufPod);
     gf->bufPod.fd = gf->d11slot_fd;
     gf->bufPod.size = dmn_share_page_align(1);
     return true;
@@ -340,7 +342,7 @@ struct ImportedFence {
     IUnknown* realFence = nullptr;      /* borrowed — an AddRef here would make
                                            destruction unobservable */
     dmn_shared_fence_t view = nullptr;  /* our own mapping of the slot */
-    dmn_shared_fence_handle pod{};      /* fd = registry-owned dup (re-export +
+    dxn_shared_fence pod{};      /* fd = registry-owned dup (re-export +
                                            watcher views) */
     std::mutex mtx;                     /* guards raised + d11mt */
     uint64_t raised = 0;                /* highest value watcher-signaled into
@@ -364,7 +366,7 @@ ImportedFence* lookup_import(IUnknown* fence) {
 }
 
 /* Common import setup: slot view + owned fd dup. */
-ImportedFence* import_open(const dmn_shared_fence_handle* pod, bool is_d3d12) {
+ImportedFence* import_open(const dxn_shared_fence* pod, bool is_d3d12) {
     auto* imp = new (std::nothrow) ImportedFence();
     if (!imp)
         return nullptr;
@@ -426,7 +428,7 @@ void import_raise_d3d11(ImportedFence* imp, ID3D11DeviceContext4* c,
 void wait_local_completion(ID3D11Fence* f, UINT64 value) {
     void* ev = dmn_event_create(1, 0);
     if (ev && SUCCEEDED(dmn_hooks_f11_seoc_orig(f, value, ev))) {
-        dmn_event_wait(ev, DMN_WAIT_INFINITE);
+        dmn_event_wait(ev, DXN_WAIT_INFINITE);
     } else {
         while (dmn_hooks_f11_completed_orig(f) < value) {
             struct timespec ns = {0, 200 * 1000};
@@ -440,7 +442,7 @@ void wait_local_completion(ID3D11Fence* f, UINT64 value) {
 void wait_local_completion(ID3D12Fence* f, UINT64 value) {
     void* ev = dmn_event_create(1, 0);
     if (ev && SUCCEEDED(dmn_hooks_f12_seoc_orig(f, value, ev))) {
-        dmn_event_wait(ev, DMN_WAIT_INFINITE);
+        dmn_event_wait(ev, DXN_WAIT_INFINITE);
     } else {
         while (dmn_hooks_f12_completed_orig(f) < value) {
             struct timespec ns = {0, 200 * 1000};
@@ -589,7 +591,7 @@ void dmn_fd3d_fence_destroy(void* identity) {
 /* The slot pod + live view of a fence that is a producer or an import; false
  * for foreign fences. One identity resolution and one lock — this sits on the
  * hooked GetCompletedValue path, which apps spin-poll. */
-static bool fence_slot(IUnknown* fence, dmn_shared_fence_handle* pod,
+static bool fence_slot(IUnknown* fence, dxn_shared_fence* pod,
                        dmn_shared_fence_t* view) {
     if (!fence)
         return false;
@@ -608,8 +610,9 @@ static bool fence_slot(IUnknown* fence, dmn_shared_fence_handle* pod,
         }
     }
     if (gf) {
-        pod->magic = DMN_SHARED_FENCE_MAGIC;
-        pod->version = DMN_SHARED_HANDLE_VERSION;
+        pod->magic = DXN_SHARED_FENCE_MAGIC;
+        pod->version = DXN_SHARED_VERSION;
+        pod->struct_size = sizeof(*pod);
         pod->fd = gf->bufPod.fd;
         pod->flags = gf->flags;
         pod->initial_value = gf->initial;
@@ -624,7 +627,7 @@ static bool fence_slot(IUnknown* fence, dmn_shared_fence_handle* pod,
     return false;
 }
 
-bool dmn_fd3d_export(IUnknown* fence, dmn_shared_fence_handle* out) {
+bool dmn_fd3d_export(IUnknown* fence, dxn_shared_fence* out) {
     dmn_shared_fence_t view = nullptr;
     return out && fence_slot(fence, out, &view);
 }
@@ -775,7 +778,7 @@ void dmn_fd3d_on_queue_signal(ID3D12Fence* fence, UINT64 value) {
 }
 
 void dmn_fd3d_on_cpu_signal(IUnknown* fence, UINT64 value) {
-    dmn_shared_fence_handle pod{};
+    dxn_shared_fence pod{};
     dmn_shared_fence_t view = nullptr;
     if (!fence_slot(fence, &pod, &view) || !view)
         return;
@@ -789,7 +792,7 @@ void dmn_fd3d_on_cpu_signal(IUnknown* fence, UINT64 value) {
 }
 
 UINT64 dmn_fd3d_completed_merge(IUnknown* fence, UINT64 from_fence) {
-    dmn_shared_fence_handle pod{};
+    dxn_shared_fence pod{};
     dmn_shared_fence_t view = nullptr;
     if (!fence_slot(fence, &pod, &view) || !view)
         return from_fence;
@@ -798,7 +801,7 @@ UINT64 dmn_fd3d_completed_merge(IUnknown* fence, UINT64 from_fence) {
 }
 
 bool dmn_fd3d_watch_slot(IUnknown* fence, UINT64 value, HANDLE event) {
-    dmn_shared_fence_handle pod{};
+    dxn_shared_fence pod{};
     dmn_shared_fence_t view = nullptr;
     if (!event)
         return false;
@@ -820,7 +823,7 @@ bool dmn_fd3d_watch_slot(IUnknown* fence, UINT64 value, HANDLE event) {
         return false;
     }
     std::thread([watch, value, event]() {
-        dmn_shared_fence_wait(watch, value, DMN_WAIT_INFINITE);
+        dmn_shared_fence_wait(watch, value, DXN_WAIT_INFINITE);
         dmn_event_signal(event);
         dmn_event_close(event);
         dmn_shared_fence_close(watch);
@@ -842,7 +845,7 @@ void import_abandon(ImportedFence* imp) {
 } // namespace
 
 HRESULT dmn_fd3d_import_d3d12(ID3D12Device* dev,
-                              const dmn_shared_fence_handle* pod,
+                              const dxn_shared_fence* pod,
                               ID3D12Fence** out) {
     if (!dev || !pod || !out)
         return E_INVALIDARG;
@@ -868,7 +871,7 @@ HRESULT dmn_fd3d_import_d3d12(ID3D12Device* dev,
 }
 
 HRESULT dmn_fd3d_import_d3d11(ID3D11Device5* dev,
-                              const dmn_shared_fence_handle* pod,
+                              const dxn_shared_fence* pod,
                               ID3D11Fence** out) {
     if (!dev || !pod || !out)
         return E_INVALIDARG;
@@ -906,7 +909,7 @@ void dmn_fd3d_before_queue_wait(ID3D12Fence* fence, UINT64 value) {
     }
     fence->AddRef();
     std::thread([imp, fence, value, watch]() {
-        dmn_shared_fence_wait(watch, value, DMN_WAIT_INFINITE);
+        dmn_shared_fence_wait(watch, value, DXN_WAIT_INFINITE);
         dmn_shared_fence_close(watch);
         import_raise_d3d12(imp, fence, value);
         fence->Release();
@@ -947,7 +950,7 @@ void dmn_fd3d_before_ctx_wait(ID3D11DeviceContext4* c, ID3D11Fence* fence,
     c->AddRef();
     fence->AddRef();
     std::thread([imp, c, fence, value, watch]() {
-        dmn_shared_fence_wait(watch, value, DMN_WAIT_INFINITE);
+        dmn_shared_fence_wait(watch, value, DXN_WAIT_INFINITE);
         dmn_shared_fence_close(watch);
         import_raise_d3d11(imp, c, fence, value);
         c->Release();

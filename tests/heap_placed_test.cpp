@@ -152,9 +152,9 @@ int main() {
     HANDLE h = nullptr;
     CK(dev->CreateSharedHandle(placed.ptr(), nullptr, 0, nullptr, &h),
        "CreateSharedHandle(placed)");
-    auto* pod = (dmn_shared_texture_handle*)h;
-    EXPECT(pod->magic == DMN_SHARED_TEXTURE_MAGIC, "bad POD magic");
-    EXPECT(pod->width == kW && pod->height == kH, "POD dims mismatch");
+    auto* pod = (dxn_shared_texture*)h;
+    EXPECT(pod->magic == DXN_SHARED_TEXTURE_MAGIC, "bad POD magic");
+    EXPECT(pod->meta.width == kW && pod->meta.height == kH, "POD dims mismatch");
 
     /* 3) Open + prove shared backing via a marker through the fds. */
     Com<ID3D12Resource> opened;
@@ -172,7 +172,7 @@ int main() {
     HANDLE h2 = nullptr;
     CK(dev->CreateSharedHandle(opened.ptr(), nullptr, 0, nullptr, &h2),
        "CreateSharedHandle(opened)");
-    auto* pod2 = (dmn_shared_texture_handle*)h2;
+    auto* pod2 = (dxn_shared_texture*)h2;
     void* map2 = mmap(nullptr, (size_t)pod2->size, PROT_READ, MAP_SHARED,
                       pod2->fd, 0);
     EXPECT(map2 != MAP_FAILED, "mmap(re-exported fd) failed");
@@ -183,7 +183,7 @@ int main() {
     munmap(map1, (size_t)pod->size);
     munmap(map2, (size_t)pod2->size);
     printf("HEAP: placed round trip ok (%ux%u, stride %llu)\n", kW, kH,
-           (unsigned long long)pod2->stride);
+           (unsigned long long)pod2->planes[0].pitch);
     CK(dmn_shared_handle_close(h2) == DMN_SUCCESS ? S_OK : E_FAIL, "close h2");
     CK(dmn_shared_handle_close(h) == DMN_SUCCESS ? S_OK : E_FAIL, "close h");
 
@@ -217,10 +217,10 @@ int main() {
            "CreateSharedHandle(placed buffer A)");
         CK(dev->CreateSharedHandle(bb.ptr(), nullptr, 0, nullptr, &hb),
            "CreateSharedHandle(placed buffer B)");
-        auto* pa = (dmn_shared_buffer_handle*)ha;
-        auto* pb = (dmn_shared_buffer_handle*)hb;
-        EXPECT(pa->magic == DMN_SHARED_BUFFER_MAGIC, "bad buffer POD magic");
-        EXPECT(pa->version == DMN_SHARED_HANDLE_VERSION, "bad buffer POD version");
+        auto* pa = (dxn_shared_buffer*)ha;
+        auto* pb = (dxn_shared_buffer*)hb;
+        EXPECT(pa->magic == DXN_SHARED_BUFFER_MAGIC, "bad buffer POD magic");
+        EXPECT(pa->version == DXN_SHARED_VERSION, "bad buffer POD version");
         EXPECT(pa->offset == kOff && pb->offset == kOff,
                "exported POD does not carry the placement offset");
         EXPECT(pa->size == kSz, "exported POD size mismatch");
@@ -246,7 +246,7 @@ int main() {
         HANDLE hr2 = nullptr;
         CK(dev->CreateSharedHandle(oa.ptr(), nullptr, 0, nullptr, &hr2),
            "CreateSharedHandle(opened placed buffer)");
-        auto* p2 = (dmn_shared_buffer_handle*)hr2;
+        auto* p2 = (dxn_shared_buffer*)hr2;
         EXPECT(p2->offset == kOff, "re-export lost the window offset");
         void* w2 = mmap(nullptr, (size_t)kSz, PROT_READ, MAP_SHARED, p2->fd,
                         (off_t)p2->offset);
@@ -298,7 +298,7 @@ int main() {
         HANDLE hbo = nullptr;
         CK(dev->CreateSharedHandle(bo.ptr(), nullptr, 0, nullptr, &hbo),
            "CreateSharedHandle(buffer on opened heap)");
-        auto* po = (dmn_shared_buffer_handle*)hbo;
+        auto* po = (dxn_shared_buffer*)hbo;
         EXPECT(po->offset == kOff, "opened-heap placement lost its offset");
         void* wo = mmap(nullptr, (size_t)kSz, PROT_READ, MAP_SHARED, po->fd,
                         (off_t)po->offset);
@@ -374,8 +374,8 @@ int main() {
         HANDLE hpl = nullptr;
         CK(dev->CreateSharedHandle(pl.ptr(), nullptr, 0, nullptr, &hpl),
            "CreateSharedHandle(GPU-write target)");
-        auto* pd = (dmn_shared_buffer_handle*)hdecoy;
-        auto* pp = (dmn_shared_buffer_handle*)hpl;
+        auto* pd = (dxn_shared_buffer*)hdecoy;
+        auto* pp = (dxn_shared_buffer*)hpl;
 
         EXPECT(gpu.copy(pl.ptr(), src.ptr(), kSz), "GPU copy into placement");
         void* mp = mmap(nullptr, (size_t)kSz, PROT_READ, MAP_SHARED, pp->fd,
@@ -418,11 +418,11 @@ int main() {
         HANDLE ht = nullptr;
         CK(dev->CreateSharedHandle(ptex.ptr(), nullptr, 0, nullptr, &ht),
            "CreateSharedHandle(placed texture @1M)");
-        auto* pt = (dmn_shared_texture_handle*)ht;
-        EXPECT(pt->version == DMN_SHARED_HANDLE_VERSION, "bad texture POD version");
-        EXPECT(pt->offset == kOff, "texture POD does not carry the placement offset");
+        auto* pt = (dxn_shared_texture*)ht;
+        EXPECT(pt->version == DXN_SHARED_VERSION, "bad texture POD version");
+        EXPECT(pt->planes[0].offset == kOff, "texture POD does not carry the placement offset");
         void* wt = mmap(nullptr, (size_t)pt->size, PROT_READ | PROT_WRITE,
-                        MAP_SHARED, pt->fd, (off_t)pt->offset);
+                        MAP_SHARED, pt->fd, (off_t)pt->planes[0].offset);
         EXPECT(wt != MAP_FAILED, "mmap(placed texture window) failed");
         const uint32_t kMark = 0x7E57A11Cu;
         memcpy(wt, &kMark, sizeof(kMark));
@@ -432,10 +432,10 @@ int main() {
         HANDLE ht2 = nullptr;
         CK(dev->CreateSharedHandle(otex.ptr(), nullptr, 0, nullptr, &ht2),
            "CreateSharedHandle(opened placed texture)");
-        auto* pt2 = (dmn_shared_texture_handle*)ht2;
-        EXPECT(pt2->offset == kOff, "re-export lost the texture's window offset");
+        auto* pt2 = (dxn_shared_texture*)ht2;
+        EXPECT(pt2->planes[0].offset == kOff, "re-export lost the texture's window offset");
         void* wt2 = mmap(nullptr, (size_t)pt2->size, PROT_READ, MAP_SHARED,
-                         pt2->fd, (off_t)pt2->offset);
+                         pt2->fd, (off_t)pt2->planes[0].offset);
         EXPECT(wt2 != MAP_FAILED, "mmap(re-exported texture window) failed");
         uint32_t seen = 0;
         memcpy(&seen, wt2, sizeof(seen));
@@ -573,8 +573,8 @@ int main() {
             HANDLE h1 = nullptr;
             CK(dev->CreateSharedHandle(tex.ptr(), nullptr, 0, nullptr, &h1),
                "CreateSharedHandle(CCR1)");
-            auto* p1 = (dmn_shared_texture_handle*)h1;
-            EXPECT(p1->magic == DMN_SHARED_TEXTURE_MAGIC && p1->width == 64,
+            auto* p1 = (dxn_shared_texture*)h1;
+            EXPECT(p1->magic == DXN_SHARED_TEXTURE_MAGIC && p1->meta.width == 64,
                    "CCR1 POD mismatch");
             CK(dmn_shared_handle_close(h1) == DMN_SUCCESS ? S_OK : E_FAIL,
                "close h1");

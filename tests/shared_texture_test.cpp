@@ -70,8 +70,8 @@ void expected_bgr(const Rgba& c, uint8_t out[3]) {
 /* == SCM_RIGHTS fd passing =============================================== */
 
 struct WireHandles {
-    dmn_shared_texture_handle tex;
-    dmn_shared_fence_handle fence;
+    dxn_shared_texture tex;
+    dxn_shared_fence fence;
 };
 
 void dump_ppm(const char* dir, int tick, const uint8_t* base, uint64_t stride) {
@@ -237,8 +237,8 @@ int consumer(int sock) {
     wire.tex.fd = fds[0];     /* the received fd is the resource's token */
     wire.fence.fd = fds[1];
 
-    if (wire.tex.magic != DMN_SHARED_TEXTURE_MAGIC ||
-        wire.fence.magic != DMN_SHARED_FENCE_MAGIC) {
+    if (wire.tex.magic != DXN_SHARED_TEXTURE_MAGIC ||
+        wire.fence.magic != DXN_SHARED_FENCE_MAGIC) {
         fprintf(stderr, "SHARED: consumer bad magic (tex=0x%08x fence=0x%08x)\n",
                 wire.tex.magic, wire.fence.magic);
         return 1;
@@ -330,7 +330,7 @@ int consumer(int sock) {
         /* The fence says the tick is done: the shared bytes must already be
          * the tick's color. This is the ordering guarantee the fence exists to
          * provide, checked without a GPU read in the way. */
-        const uint8_t* at_flip = cpu + (uint64_t)cy * wire.tex.stride + cx * 4;
+        const uint8_t* at_flip = cpu + (uint64_t)cy * wire.tex.planes[0].pitch + cx * 4;
         if (memcmp(at_flip, want, 3) != 0) {
             fprintf(stderr, "SHARED: tick %d: fence reached %llu but the shared "
                     "bytes still read BGR=%02x%02x%02x (want %02x%02x%02x) — "

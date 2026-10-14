@@ -13,7 +13,7 @@
 
 #include <cstdint>
 
-#include "d3dmetal_native.h" /* dmn_shared_fence_handle, dmn_wait_status, DMN_WAIT_* */
+#include "d3dmetal_native.h" /* dxn_shared_fence, dxn_wait_status, DMN_WAIT_* */
 
 #ifdef __cplusplus
 extern "C" {
@@ -22,14 +22,14 @@ extern "C" {
 typedef struct dmn_shared_fence* dmn_shared_fence_t;
 
 /* Open a consumer view over a received fence handle (fd already patched in). */
-dmn_shared_fence_t dmn_shared_fence_open(const dmn_shared_fence_handle* handle);
+dmn_shared_fence_t dmn_shared_fence_open(const dxn_shared_fence* handle);
 void               dmn_shared_fence_close(dmn_shared_fence_t fence);
 
 /* Highest GPU-written value seen so far (monotonic). */
 uint64_t dmn_shared_fence_get_completed(dmn_shared_fence_t fence);
 
 /* Block until the value reaches >= value, or timeout_ns elapses. */
-dmn_wait_status dmn_shared_fence_wait(dmn_shared_fence_t fence, uint64_t value,
+dxn_wait_status dmn_shared_fence_wait(dmn_shared_fence_t fence, uint64_t value,
                                       uint64_t timeout_ns);
 
 /* CPU-side signal: raise the slot to >= value (monotonic; no-op for lower

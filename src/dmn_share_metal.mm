@@ -24,7 +24,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
-#include <sys/posix_shm.h>
 #include <sys/proc_info.h>
 #include <sys/stat.h>
 #include <libproc.h>
@@ -36,6 +35,8 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+#include <directx-native/dxn_shm.h>
 
 #include "d3dmetal_native.h"
 #include "dmn_formats.h"
@@ -145,79 +146,10 @@ static void attach_shadow_heap(id<MTLTexture> tex, id<MTLBuffer> backing,
 
 namespace {
 
-/* An app group prefix must leave room for "/", a slot digit and one nonce
- * digit within PSHMNAMLEN. */
-constexpr size_t kAppSandboxGroupIdMax = PSHMNAMLEN - 3;
-
-/* == Anonymous shared file: shm_open a random name, unlink immediately ==== */
-int dmn_anon_file(off_t size) {
-    /* Under App Sandbox a shm name must live in the app group container, i.e.
-     * be prefixed with the group identifier instead of '/'; anything else is
-     * denied. The PSHMNAMLEN budget then leaves no room for our tag or the
-     * pid, so the name is just a slot digit plus as much of the nonce as
-     * fits. */
-    const char* group = getenv("APP_SANDBOX_GROUP_ID");
-    if (group && !group[0])
-        group = nullptr;
-    if (group && strlen(group) > kAppSandboxGroupIdMax) {
-        DMN_ERROR("share: APP_SANDBOX_GROUP_ID is %zu chars, at most %zu fit",
-                  strlen(group), kAppSandboxGroupIdMax);
-        errno = EINVAL;
-        return -1;
-    }
-
-    const size_t nonce_room = group ? PSHMNAMLEN - strlen(group) - 2 : 8;
-    const unsigned nonce_digits = (unsigned)(nonce_room < 8 ? nonce_room : 8);
-    const unsigned nonce = arc4random() >> (32 - 4 * nonce_digits);
-    int fd = -1;
-    for (unsigned i = 0; i < 32; i++) {
-        char name[64];
-        if (group) {
-            /* the slot must stay a single hex digit to fit the name budget */
-            if (i > 0xf)
-                break;
-            snprintf(name, sizeof(name), "%s/%x%x", group, i, nonce);
-        } else {
-            snprintf(name, sizeof(name), "/dmn-shm-%d-%x-%x", getpid(), nonce,
-                     i);
-        }
-        fd = shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0600);
-        if (fd >= 0) {
-            if (fcntl(fd, F_SETFD, FD_CLOEXEC) < 0) {
-                const int saved_errno = errno;
-                close(fd);
-                shm_unlink(name);
-                errno = saved_errno;
-                fd = -1;
-                break;
-            }
-            shm_unlink(name); /* anonymous from here on */
-            break;
-        }
-        if (errno != EEXIST)
-            break;
-    }
-    if (fd < 0)
-        return -1;
-    if (ftruncate(fd, size) < 0) {
-        close(fd);
-        return -1;
-    }
-    return fd;
-}
-
-/* Apple Silicon kernel/GPU pages are 16 KiB, but this is the x86_64 slice and
- * runs under Rosetta, where getpagesize() reports the emulated 4096. A mapping
- * whose length is only 4 KiB-aligned leaves its final real page partly
- * described, and the GPU has no mapping for the tail. */
-constexpr size_t kMinPageAlign = 16384;
-
-size_t page_align(size_t n) {
-    size_t pg = (size_t)getpagesize();
-    if (pg < kMinPageAlign)
-        pg = kMinPageAlign;
-    return (n + pg - 1) & ~(pg - 1);
-}
+/* Page granularity of every shm size and mapping: directx-native's, which
+ * is at least 16 KiB because this x86_64 slice runs under Rosetta, where
+ * getpagesize() reports the emulated 4096 (see dxn_shm.h). */
+size_t page_align(size_t n) { return (size_t)dxn_shm_page_align(n); }
 
 /* == Geometry validation ==================================================
  * Width, height, stride and size all originate outside this process: the
@@ -809,7 +741,7 @@ id<MTLTexture> substitute_producer(id<MTLDevice> device,
     }
     layout.mapped = pages;
 
-    const int fd = dmn_anon_file((off_t)layout.mapped);
+    const int fd = dxn_shm_create(layout.mapped);
     if (fd < 0) {
         DMN_ERROR("share: anon file (%zu) failed", layout.mapped);
         return nil;
@@ -1125,7 +1057,7 @@ id<MTLBuffer> substitute_buffer(id<MTLDevice> device, NSUInteger length) {
             return nil;
         }
         const size_t mapped = page_align(logical);
-        const int fd = dmn_anon_file((off_t)mapped);
+        const int fd = dxn_shm_create(mapped);
         if (fd < 0) {
             DMN_ERROR("share: buffer anon file (%zu) failed", mapped);
             return nil;
@@ -2453,7 +2385,7 @@ void dmn_share_install_swizzles(void) {
 
 size_t dmn_share_page_align(size_t n) { return page_align(n); }
 
-int dmn_share_anon_file(size_t size) { return dmn_anon_file((off_t)size); }
+int dmn_share_anon_file(size_t size) { return dxn_shm_create(size); }
 
 void* dmn_share_map_fd(int fd, size_t size) {
     size_t aligned = page_align(size);

@@ -55,8 +55,8 @@ const Rgba kColors[3] = {
 };
 
 struct WireHandles {
-    dmn_shared_texture_handle tex;
-    dmn_shared_fence_handle fence;
+    dxn_shared_texture tex;
+    dxn_shared_fence fence;
 };
 
 uint64_t now_ms() {

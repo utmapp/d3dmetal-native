@@ -66,8 +66,8 @@ struct Vertex {
 };
 
 struct WireHandles {
-    dmn_shared_texture_handle tex;
-    dmn_shared_fence_handle fence;
+    dxn_shared_texture tex;
+    dxn_shared_fence fence;
 };
 
 uint64_t now_ms() {
@@ -486,7 +486,7 @@ private:
            "CreateDescriptorHeap(SRV)");
 
         D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
-        srv.Format = (DXGI_FORMAT)m_sharedTex.dxgi_format;
+        srv.Format = (DXGI_FORMAT)m_sharedTex.meta.dxgi_format;
         srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
         srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         srv.Texture2D.MipLevels = 1;
@@ -737,8 +737,8 @@ private:
 
     /* shared-texture mode (consumed entirely through standard D3D) */
     bool m_shared = false, m_textured = false, m_shareDone = false;
-    dmn_shared_texture_handle m_sharedTex = {};   /* opaque handle bytes + fd */
-    dmn_shared_fence_handle m_fenceHandle = {};
+    dxn_shared_texture m_sharedTex = {};   /* opaque handle bytes + fd */
+    dxn_shared_fence m_fenceHandle = {};
     Com<ID3D12Fence> m_sharedFence12;             /* vended by OpenSharedHandle */
     Com<ID3D12Resource> m_importedTex;
     Com<ID3D12DescriptorHeap> m_srvHeap;

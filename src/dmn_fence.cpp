@@ -55,9 +55,9 @@ struct dmn_shared_fence {
 };
 
 extern "C" dmn_shared_fence_t dmn_shared_fence_open(
-        const dmn_shared_fence_handle* handle) {
-    if (!handle || handle->magic != DMN_SHARED_FENCE_MAGIC ||
-        handle->version != DMN_SHARED_HANDLE_VERSION || handle->fd < 0) {
+        const dxn_shared_fence* handle) {
+    if (!dxn_shared_check(handle, DXN_SHARED_FENCE_MAGIC, sizeof(*handle)) ||
+        handle->fd < 0) {
         DMN_WARN("shared_fence_open: invalid handle");
         return nullptr;
     }
@@ -104,22 +104,22 @@ extern "C" void dmn_shared_fence_signal(dmn_shared_fence_t f, uint64_t value) {
     }
 }
 
-extern "C" dmn_wait_status dmn_shared_fence_wait(dmn_shared_fence_t f,
+extern "C" dxn_wait_status dmn_shared_fence_wait(dmn_shared_fence_t f,
                                                  uint64_t value,
                                                  uint64_t timeout_ns) {
     if (!f)
-        return DMN_WAIT_FAILED;
+        return DXN_WAIT_FAILED;
     if (dmn_shared_fence_get_completed(f) >= value)
-        return DMN_WAIT_SIGNALED;
+        return DXN_WAIT_SIGNALED;
 
-    const bool infinite = (timeout_ns == DMN_WAIT_INFINITE);
+    const bool infinite = (timeout_ns == DXN_WAIT_INFINITE);
     const uint64_t deadline = infinite ? 0 : now_ns() + timeout_ns;
     uint32_t spins = 0;
     for (;;) {
         if (dmn_shared_fence_get_completed(f) >= value)
-            return DMN_WAIT_SIGNALED;
+            return DXN_WAIT_SIGNALED;
         if (!infinite && now_ns() >= deadline)
-            return DMN_WAIT_TIMEOUT;
+            return DXN_WAIT_TIMEOUT;
         /* Backoff: spin-yield briefly, then sleep. */
         if (spins < 128) {
             sched_yield();

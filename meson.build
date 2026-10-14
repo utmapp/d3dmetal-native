@@ -36,6 +36,14 @@ add_project_arguments('-DDMN_DEV_FRAMEWORK_PATH="' + dev_fw + '"',
 add_project_arguments('-DWIDL_EXPLICIT_AGGREGATE_RETURNS=1',
                       language: ['cpp', 'objcpp'])
 
+# The contract shared with the other native D3D backends and the Neptune
+# render server: shared-resource descriptors, embedder API, events, shm.
+# Statically linked; its headers are installed because d3dmetal_native.h
+# includes them.
+directx_native_dep = dependency('directx-native',
+  fallback: ['directx-native', 'directx_native_dep'],
+  default_options: ['install_headers=true', 'tests=false'])
+
 apple_deps = dependency('appleframeworks',
   modules: ['Foundation', 'AppKit', 'Metal', 'QuartzCore', 'CoreGraphics'])
 
@@ -75,7 +83,7 @@ exports_list = meson.current_source_dir() / 'src/exports.symbols'
 
 dmn_lib = library('d3dmetal-native', dmn_sources,
   include_directories: [dmn_public_inc, dmn_private_inc, dmn_native_inc],
-  dependencies: [apple_deps],
+  dependencies: [apple_deps, directx_native_dep],
   link_args: ['-Wl,-exported_symbols_list,' + exports_list],
   link_depends: files('src/exports.symbols'),
   install: true)
@@ -88,7 +96,7 @@ pkg = import('pkgconfig')
 pkg.generate(dmn_lib,
   name: 'd3dmetal-native',
   description: 'D3D11/D3D12 for native macOS apps via D3DMetal.framework',
-  subdirs: ['d3dmetal-native'])
+  subdirs: ['d3dmetal-native', '.'])
 
 if get_option('tests').allowed()
   subdir('tests')

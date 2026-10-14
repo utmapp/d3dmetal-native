@@ -166,8 +166,8 @@ int check_identity_through_views(ID3D11Device* dev) {
     CK(v2->GetSharedHandle(&h2), "GetSharedHandle via a second view");
     EXPECT(h1 && h1 == h2,
            "two views of one resource vended different legacy handles");
-    EXPECT(((const dmn_shared_texture_handle*)h1)->magic ==
-               DMN_SHARED_TEXTURE_MAGIC,
+    EXPECT(((const dxn_shared_texture*)h1)->magic ==
+               DXN_SHARED_TEXTURE_MAGIC,
            "GetSharedHandle through a view did not return our POD");
     printf(T_TAG ": legacy export agrees through either view: OK\n");
     return 0;

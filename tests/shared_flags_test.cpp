@@ -40,7 +40,7 @@ namespace {
 
 const UINT kW = 64, kH = 64;
 
-int check_d3d12_open(ID3D12Device* d12, dmn_shared_texture_handle* pod,
+int check_d3d12_open(ID3D12Device* d12, dxn_shared_texture* pod,
                      const char* what) {
     Com<ID3D12Resource> opened;
     CK(d12->OpenSharedHandle((HANDLE)pod, __uuidof(ID3D12Resource),
@@ -74,11 +74,11 @@ int test_d3d12_producer(ID3D12Device* d12, ID3D11Device* d11) {
     HANDLE h = nullptr;
     CK(d12->CreateSharedHandle(tex.ptr(), nullptr, 0, nullptr, &h),
        "D3D12 CreateSharedHandle");
-    dmn_shared_texture_handle pod;
+    dxn_shared_texture pod;
     memcpy(&pod, h, sizeof(pod));
     printf(T_TAG ": D3D12 export: bind_flags 0x%x misc_flags 0x%x\n",
-           pod.bind_flags, pod.misc_flags);
-    EXPECT(pod.bind_flags ==
+           pod.meta.bind_flags, pod.meta.misc_flags);
+    EXPECT(pod.meta.bind_flags ==
                (D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS),
            "D3D12 export does not record SRV|UAV bind flags");
 
@@ -122,7 +122,7 @@ int test_d3d11_producer(ID3D12Device* d12, ID3D11Device* d11) {
     CK(tex->QueryInterface(__uuidof(IDXGIResource), (void**)&res),
        "IDXGIResource");
     CK(res->GetSharedHandle(&h), "GetSharedHandle");
-    dmn_shared_texture_handle pod;
+    dxn_shared_texture pod;
     memcpy(&pod, h, sizeof(pod));
     return check_d3d12_open(d12, &pod, "D3D12 OpenSharedHandle(D3D11 export)");
 }

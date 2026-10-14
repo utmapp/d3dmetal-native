@@ -37,6 +37,13 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* The shared-resource descriptors and wait statuses are directx-native's
+ * (the contract every native D3D backend and the Neptune render server
+ * share). */
+#include <directx-native/dxn_embedder.h>
+#include <directx-native/dxn_event.h>
+#include <directx-native/dxn_shared.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -158,15 +165,7 @@ void dmn_window_destroy(dmn_window_t window);
  * IDXGISwapChain2::GetFrameLatencyWaitableObject) are created by this
  * library's GFXT event implementation and can be waited on here. */
 
-#define DMN_WAIT_INFINITE UINT64_MAX
-
-typedef enum dmn_wait_status {
-    DMN_WAIT_SIGNALED = 0,
-    DMN_WAIT_TIMEOUT  = 1,
-    DMN_WAIT_FAILED   = -1, /* not a dmn event/semaphore handle */
-} dmn_wait_status;
-
-dmn_wait_status dmn_event_wait(void* handle, uint64_t timeout_ns);
+dxn_wait_status dmn_event_wait(void* handle, uint64_t timeout_ns);
 
 /* Events are kqueue-backed: each event owns a kqueue whose single
  * EVFILT_USER registration IS the signaled state, so one event is
@@ -307,55 +306,14 @@ dmn_result dmn_registry_set_string(dmn_registry_root root, const char* subkey,
  * is touched in that case. */
 dmn_result dmn_shared_handle_close(void* handle);
 
-#define DMN_SHARED_TEXTURE_MAGIC 0x58544D44u /* 'DMTX' */
-#define DMN_SHARED_FENCE_MAGIC   0x4E464D44u /* 'DMFN' */
-#define DMN_SHARED_HANDLE_VERSION 2u
+/* The HANDLEs above point to directx-native descriptors (dxn_shared.h):
+ * dxn_shared_texture, dxn_shared_fence (fd = companion value buffer, the
+ * uint64 value slot at offset 0) and dxn_shared_buffer.  Opens dispatch on
+ * the descriptor magic and reject any version or size mismatch. */
 
-typedef struct dmn_shared_texture_handle {
-    uint32_t magic;         /* DMN_SHARED_TEXTURE_MAGIC */
-    uint32_t version;       /* DMN_SHARED_HANDLE_VERSION */
-    int32_t  fd;            /* process-local; send via SCM_RIGHTS, then patch */
-    uint32_t width, height;
-    uint32_t dxgi_format;   /* DXGI_FORMAT */
-    uint32_t mip_levels, array_size, sample_count;
-    uint32_t bind_flags, misc_flags, cpu_access;
-    uint64_t stride;        /* bytesPerRow, byte-exact for the consumer */
-    uint64_t size;          /* logical stride*height (NOT page-padded) */
-    uint64_t offset;        /* byte offset of the surface within `fd`; 0 for
-                               a committed surface, which owns its whole
-                               object; nonzero for a texture placed in a
-                               shared heap, a window into the heap's one
-                               object. Not necessarily page-aligned. */
-} dmn_shared_texture_handle;
-
-typedef struct dmn_shared_fence_handle {
-    uint32_t magic;         /* DMN_SHARED_FENCE_MAGIC */
-    uint32_t version;       /* DMN_SHARED_HANDLE_VERSION */
-    int32_t  fd;            /* companion value buffer; SCM_RIGHTS + patch.
-                               The fence's uint64 value slot is at offset 0. */
-    uint32_t flags;         /* D3D11_FENCE_FLAG / D3D12_FENCE_FLAGS */
-    uint64_t initial_value;
-} dmn_shared_fence_handle;
-
-/* == Cross-process shared buffers ======================================== */
-/* Like shared textures, but for D3D buffers created with the shared flag
- * (D3D11 D3D11_RESOURCE_MISC_SHARED, D3D12 D3D12_HEAP_FLAG_SHARED). */
-
-#define DMN_SHARED_BUFFER_MAGIC 0x42544D44u /* 'DMTB' */
-
-typedef struct dmn_shared_buffer_handle {
-    uint32_t magic;         /* DMN_SHARED_BUFFER_MAGIC */
-    uint32_t version;       /* DMN_SHARED_HANDLE_VERSION */
-    int32_t  fd;            /* process-local; send via SCM_RIGHTS, then patch */
-    uint32_t bind_flags, misc_flags, cpu_access;
-    uint64_t size;          /* logical byte length */
-    uint64_t offset;        /* byte offset of the buffer within `fd`, page-
-                               aligned. 0 for a committed buffer, which owns
-                               its whole object; nonzero for a resource placed
-                               in a shared heap, where one object backs the
-                               whole heap and each placement is a window into
-                               it. A consumer must map at this offset. */
-} dmn_shared_buffer_handle;
+/* Embedder ABI check: returns the DXN_ABI_VERSION this library was built
+ * with (dxn_embedder.h). */
+uint32_t dmn_native_abi_version(void);
 
 /* == Imported placed-buffer heaps ======================================== */
 /* Import [offset, offset+size) of a shared-memory fd as an ID3D12Heap on

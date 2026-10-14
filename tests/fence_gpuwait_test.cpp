@@ -52,7 +52,7 @@ int producer(int sock) {
     if (FAILED(dev->CreateSharedHandle(fence.ptr(), nullptr, 0, nullptr, &h)) || !h) {
         fprintf(stderr, "GPUWAIT: prod CreateSharedHandle FAILED\n"); return 1;
     }
-    dmn_shared_fence_handle pod;
+    dxn_shared_fence pod;
     memcpy(&pod, h, sizeof(pod));
     if (!send_with_fd(sock, &pod, sizeof(pod), pod.fd)) {
         fprintf(stderr, "GPUWAIT: prod send FAILED\n"); return 1;
@@ -86,13 +86,13 @@ int consumer(int sock) {
     Com<ID3D12Device> dev;
     if (FAILED(make_d3d12_device(dev))) { fprintf(stderr, "GPUWAIT: cons device FAILED\n"); return 1; }
 
-    dmn_shared_fence_handle pod;
+    dxn_shared_fence pod;
     int fd = -1;
     if (!recv_with_fd(sock, &pod, sizeof(pod), &fd)) {
         fprintf(stderr, "GPUWAIT: cons recv FAILED\n"); return 1;
     }
     pod.fd = fd;
-    if (pod.magic != DMN_SHARED_FENCE_MAGIC) {
+    if (pod.magic != DXN_SHARED_FENCE_MAGIC) {
         fprintf(stderr, "GPUWAIT: cons bad magic\n"); return 1;
     }
     Com<ID3D12Fence> imported;
