@@ -128,7 +128,7 @@ HRESULT STDMETHODCALLTYPE km_ReleaseSync(VendedKmtx* self, UINT64 key) {
     kmtx_lock(s);
     if (!s->acquired) {
         kmtx_unlock(s);
-        return DXGI_ERROR_INVALID_CALL;
+        return E_FAIL;
     }
     s->acquired = 0;
     s->key = key;

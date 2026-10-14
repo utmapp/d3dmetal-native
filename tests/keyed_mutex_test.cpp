@@ -102,6 +102,15 @@ int producer(int sock) {
     if (!counter) { fprintf(stderr, "KMUTEX: prod map FAILED\n"); return 1; }
     counter[0] = 0;
 
+    /* IDXGIKeyedMutex::ReleaseSync: releasing a mutex the device does not
+     * own returns E_FAIL. */
+    HRESULT unowned = km->ReleaseSync(kKeyC);
+    if (unowned != E_FAIL) {
+        fprintf(stderr, "KMUTEX: unowned ReleaseSync returned 0x%08x, "
+                "expected E_FAIL\n", (unsigned)unowned);
+        return 1;
+    }
+
     for (int r = 0; r < kRounds; r++) {
         uint64_t key = (r == 0) ? kKeyStart : kKeyP;
         if (FAILED(km->AcquireSync(key, 5000))) {
