@@ -940,7 +940,11 @@ constexpr DisallowedBits kDisallowed[] = {
     {0x3d8dae0c, 0x13f}, /* R8_SINT */
     {0x3d190c0f, 0x13f}, /* A8_UNORM */
     {0x00000000, 0x000}, /* R1_UNORM */
-    {0x3f7dec0f, 0x5ff}, /* R9G9B9E5_SHAREDEXP */
+    /* R9G9B9E5_SHAREDEXP: the tables' disallowed render target, blend, resolve
+     * and multisample bits are optional in practice -- WARP reports them and
+     * passes the HLK's own CheckFormatSupport check -- so they are left to
+     * Metal, where RGB9E5Float is a blendable, multisampled colour target. */
+    {0x3f192c0f, 0x5ff}, /* R9G9B9E5_SHAREDEXP */
     {0x3f7dec0f, 0x7ff}, /* R8G8_B8G8_UNORM */
     {0x3f7dec0f, 0x7ff}, /* G8R8_G8B8_UNORM */
     {0x3fedef1f, 0x1ff}, /* BC1_TYPELESS */
