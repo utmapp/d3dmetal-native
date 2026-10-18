@@ -144,14 +144,17 @@ void build_table(id<MTLDevice> dev, CapTable& t) {
     cap(MTLPixelFormatRG8Uint, kCapInt | kCapBufRdWr);
     cap(MTLPixelFormatRG8Sint, kCapInt | kCapBufRdWr);
 
-    /* Packed 16-bit: resolvable, but not shader-writable. */
-    cap(MTLPixelFormatB5G6R5Unorm, kCapPacked16);
+    /* Packed 16-bit.  Metal cannot write these from a shader, but D3DMetal
+     * serves typed UAV loads and stores on them in the DXGI channel order
+     * (packed-uav-test), so they carry Write. */
+    cap(MTLPixelFormatB5G6R5Unorm, kCapPacked16 | kCapWrite | kCapBufRdWr);
     cap(MTLPixelFormatA1BGR5Unorm, kCapPacked16);
-    /* Sample-only: DXGI B4G4R4A4 is ABGR4Unorm with a different nibble
-     * order.  D3DMetal swizzles reads, but render writes cannot be swizzled,
-     * so a target of it comes back channel-rotated (packed-rt-test). */
-    cap(MTLPixelFormatABGR4Unorm, kCapFilter | kCapSparse);
-    cap(MTLPixelFormatBGR5A1Unorm, kCapPacked16);
+    /* DXGI B4G4R4A4 is ABGR4Unorm with a different nibble order.  D3DMetal
+     * swizzles reads and typed UAV access, but render writes cannot be
+     * swizzled, so a target of it comes back channel-rotated
+     * (packed-rt-test): no Color. */
+    cap(MTLPixelFormatABGR4Unorm, kCapFilter | kCapSparse | kCapWrite | kCapBufRdWr);
+    cap(MTLPixelFormatBGR5A1Unorm, kCapPacked16 | kCapWrite | kCapBufRdWr);
 
     cap(MTLPixelFormatR32Uint, kCapInt32 | kCapBufAll);
     cap(MTLPixelFormatR32Sint, kCapInt32 | kCapBufAll);

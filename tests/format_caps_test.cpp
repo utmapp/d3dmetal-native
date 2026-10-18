@@ -169,11 +169,11 @@ int main(){
         D3D11_FORMAT_SUPPORT_SHADER_SAMPLE|D3D11_FORMAT_SUPPORT_RENDER_TARGET|
         D3D11_FORMAT_SUPPORT_BLENDABLE,0);
 
-    // Packed 16-bit formats are resolvable but not shader-writable.
+    // Packed 16-bit formats are resolvable and take typed UAVs, as on WARP.
     expect_bits(dev.ptr(),DXGI_FORMAT_B5G6R5_UNORM,"B5G6R5_UNORM",
         D3D11_FORMAT_SUPPORT_RENDER_TARGET|D3D11_FORMAT_SUPPORT_BLENDABLE|
-        D3D11_FORMAT_SUPPORT_MULTISAMPLE_RESOLVE,
-        D3D11_FORMAT_SUPPORT_TYPED_UNORDERED_ACCESS_VIEW);
+        D3D11_FORMAT_SUPPORT_MULTISAMPLE_RESOLVE|
+        D3D11_FORMAT_SUPPORT_TYPED_UNORDERED_ACCESS_VIEW,0);
 
     // Integer formats: writable and MSAA-able, never blendable or resolvable.
     expect_bits(dev.ptr(),DXGI_FORMAT_R32G32B32A32_UINT,"RGBA32_UINT",
