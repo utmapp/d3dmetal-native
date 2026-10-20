@@ -77,6 +77,7 @@ dmn_sources = files(
   'src/dmn_kmtx.cpp',
   'src/dmn_com_hooks.cpp',
   'src/dmn_dxil_reflect.cpp',
+  'src/dmn_import_shims.mm',
 )
 
 exports_list = meson.current_source_dir() / 'src/exports.symbols'

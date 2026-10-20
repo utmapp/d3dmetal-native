@@ -560,3 +560,15 @@ import_zerofill = executable('import-zerofill-test',
   link_with: dmn_lib,
   dependencies: [directx_native_hdr])
 test('import-zerofill', import_zerofill, env: ['DMN_LOG=warn'], timeout: 300)
+
+# The public-API replacements a patched D3DMetal binds to
+# (scripts/patch_d3dmetal_imports.py), compared against the private symbols they
+# replace. Run it with D3DMETAL_FRAMEWORK_PATH at a patched framework too: it
+# then also proves the patched binary loads and binds to this library.
+import_shims = executable('import-shims-test',
+  ['import_shims_test.mm', 'import_shims_d3d12.cpp'],
+  include_directories: test_native_inc,
+  link_with: dmn_lib,
+  dependencies: [directx_native_hdr,
+                 dependency('appleframeworks', modules: ['Foundation', 'Metal'])])
+test('import-shims', import_shims, env: ['DMN_LOG=warn'], timeout: 120)
