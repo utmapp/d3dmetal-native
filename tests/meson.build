@@ -436,6 +436,13 @@ packed_uav_test = executable('packed-uav-test',
   dependencies: [directx_native_hdr])
 test('packed-uav', packed_uav_test, env: ['DMN_LOG=info'], timeout: 120)
 
+rgb9e5_uav_test = executable('rgb9e5-uav-test',
+  'rgb9e5_uav_test.cpp',
+  include_directories: test_native_inc,
+  link_with: dmn_lib,
+  dependencies: [directx_native_hdr])
+test('rgb9e5-uav', rgb9e5_uav_test, env: ['DMN_LOG=info'], timeout: 120)
+
 # Windowless: dmn_open_existing_heap_from_fd — a shm window imported as an
 # ID3D12Heap whose placed buffers alias the caller's pages in both directions
 # (import offset + heap offset compose), the backing survives releasing the

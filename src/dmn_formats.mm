@@ -179,7 +179,8 @@ void build_table(id<MTLDevice> dev, CapTable& t) {
     cap(MTLPixelFormatBGR10A2Unorm, kCapAll);
     cap(MTLPixelFormatRGB10A2Uint, kCapInt | kCapBufRdWr);
     cap(MTLPixelFormatRG11B10Float, kCapAll | kCapBufRdWr);
-    cap(MTLPixelFormatRGB9E5Float, kCapAll);
+    /* D3DMetal serves typed buffer UAVs of it (rgb9e5-uav-test). */
+    cap(MTLPixelFormatRGB9E5Float, kCapAll | kCapBufRdWr);
 
     /* 64-bit */
     cap(MTLPixelFormatRG32Uint, kCapInt | kCapBufRdWr);
@@ -943,11 +944,13 @@ constexpr DisallowedBits kDisallowed[] = {
     {0x3d8dae0c, 0x13f}, /* R8_SINT */
     {0x3d190c0f, 0x13f}, /* A8_UNORM */
     {0x00000000, 0x000}, /* R1_UNORM */
-    /* R9G9B9E5_SHAREDEXP: the tables' disallowed render target, blend, resolve
-     * and multisample bits are optional in practice -- WARP reports them and
-     * passes the HLK's own CheckFormatSupport check -- so they are left to
-     * Metal, where RGB9E5Float is a blendable, multisampled colour target. */
-    {0x3f192c0f, 0x5ff}, /* R9G9B9E5_SHAREDEXP */
+    /* R9G9B9E5_SHAREDEXP: the tables predate D3D11.3's revised 999E5
+     * grouping, which pairs render target, blend, resolve and multisample
+     * with typed UAV load and store (WARP reports the set and passes the
+     * HLK's RevisedFormat999E5 and CheckFormatSupport tests).  They are left
+     * to Metal, where RGB9E5Float is a blendable, multisampled colour target;
+     * D3DMetal serves the typed UAV access (rgb9e5-uav-test). */
+    {0x3d192c0f, 0x53f}, /* R9G9B9E5_SHAREDEXP */
     {0x3f7dec0f, 0x7ff}, /* R8G8_B8G8_UNORM */
     {0x3f7dec0f, 0x7ff}, /* G8R8_G8B8_UNORM */
     {0x3fedef1f, 0x1ff}, /* BC1_TYPELESS */
