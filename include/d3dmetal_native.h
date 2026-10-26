@@ -214,10 +214,12 @@ void* dmn_event_duplicate(void* handle);
 int dmn_event_dup_fd(void* handle);
 
 /* Override what D3DMetal sees as the running executable's path (its per-app
- * profile matcher keys on the basename). Must be set before the first D3D
- * device/factory creation to be effective. NULL restores the real process
- * path. The string is copied. Useful for embedders hosting another
- * program's D3D workload (VM display servers, remoting hosts). */
+ * profile matcher keys on the basename). `path` is the hosted program's
+ * Windows path or bare file name, UTF-8 (e.g. "C:\\Games\\x.exe" or
+ * "x.exe"). Must be set before the first D3D device/factory creation to be
+ * effective. NULL or "" restores the real process path. The string is
+ * copied. Useful for embedders hosting another program's D3D workload (VM
+ * display servers, remoting hosts). */
 dmn_result dmn_set_executable_path(const char* path);
 
 /* == Configuration ======================================================= */

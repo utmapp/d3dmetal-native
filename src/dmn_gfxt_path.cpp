@@ -9,6 +9,7 @@
 
 #include <dlfcn.h>
 #include <mach-o/dyld.h>
+#include <strings.h>
 
 #include <cstring>
 #include <mutex>
@@ -26,16 +27,32 @@ namespace {
 std::mutex g_exe_path_mutex;
 std::string g_exe_path_override;
 
-bool exe_path_override(char* out, uint32_t bytes) {
+/* The override as the Windows path the matcher parses: it takes the name
+ * after the last '\\' (a path without one is ignored) and appends ".exe"
+ * unless the name already ends in exactly that, so "GAME.EXE" would miss. */
+std::string windows_exe_path(const char* path) {
+    std::string s = path;
+    if (s.find('\\') == std::string::npos) {
+        size_t slash = s.rfind('/');
+        if (slash != std::string::npos)
+            s.erase(0, slash + 1);
+        s.insert(0, "C:\\");
+    }
+    if (s.size() >= 4 && strcasecmp(s.c_str() + s.size() - 4, ".exe") == 0)
+        s.replace(s.size() - 4, 4, ".exe");
+    return s;
+}
+
+uint32_t exe_path_override(char* out, uint32_t bytes) {
     std::lock_guard<std::mutex> lock(g_exe_path_mutex);
     if (g_exe_path_override.empty())
-        return false;
+        return 0;
     size_t n = g_exe_path_override.size();
     if (n >= bytes)
         n = bytes - 1;
     memcpy(out, g_exe_path_override.c_str(), n);
     out[n] = '\0';
-    return true;
+    return (uint32_t)n;
 }
 
 /* Minimal UTF-16 <-> UTF-8 conversion (with surrogate pairs). */
@@ -183,43 +200,42 @@ bool DmnGFXTPath::windowsSystemDirectoryPath(char16_t* out,
     return true;
 }
 
-void DmnGFXTPath::getExecutablePath(char* out, uint32_t bytes) {
+uint32_t DmnGFXTPath::getExecutablePath(char* out, uint32_t bytes) {
     if (!out || bytes == 0)
-        return;
-    if (exe_path_override(out, bytes)) {
+        return 0;
+    if (uint32_t n = exe_path_override(out, bytes)) {
         DMN_TRACE("path: getExecutablePath (override) -> %s", out);
-        return;
+        return n;
     }
     uint32_t want = bytes;
     if (_NSGetExecutablePath(out, &want) != 0)
         out[0] = '\0';
     DMN_TRACE("path: getExecutablePath -> %s", out);
+    return (uint32_t)strlen(out);
 }
 
 extern "C" dmn_result dmn_set_executable_path(const char* path) {
     std::lock_guard<std::mutex> lock(g_exe_path_mutex);
-    g_exe_path_override = path ? path : "";
+    g_exe_path_override = path && *path ? windows_exe_path(path) : "";
     DMN_INFO("path: executable path override %s%s",
              path ? "= " : "cleared", path ? path : "");
     return DMN_SUCCESS;
 }
 
-void DmnGFXTPath::getModulePath(void* module, char* out, uint32_t bytes) {
+uint32_t DmnGFXTPath::getModulePath(void* module, char* out, uint32_t bytes) {
     if (!out || bytes == 0)
-        return;
-    if (!module) {
-        getExecutablePath(out, bytes);
-        return;
-    }
+        return 0;
+    if (!module)
+        return getExecutablePath(out, bytes);
     Dl_info info{};
+    size_t n = 0;
     if (dladdr(module, &info) && info.dli_fname) {
-        size_t n = strlen(info.dli_fname);
+        n = strlen(info.dli_fname);
         if (n >= bytes)
             n = bytes - 1;
         memcpy(out, info.dli_fname, n);
-        out[n] = '\0';
-    } else {
-        out[0] = '\0';
     }
+    out[n] = '\0';
     DMN_TRACE("path: getModulePath(%p) -> %s", module, out);
+    return (uint32_t)n;
 }

@@ -82,8 +82,8 @@ public:
     bool windowsToUnixPath(const char16_t* in, char* out, size_t* inOutBytes) override;
     bool unixToWindowsPath(const char* in, char16_t* out, size_t* inOutChars) override;
     bool windowsSystemDirectoryPath(char16_t* out, size_t* inOutChars) override;
-    void getExecutablePath(char* out, uint32_t bytes) override;
-    void getModulePath(void* module, char* out, uint32_t bytes) override;
+    uint32_t getExecutablePath(char* out, uint32_t bytes) override;
+    uint32_t getModulePath(void* module, char* out, uint32_t bytes) override;
 };
 
 class DmnGFXTAllocation final : public GFXTAllocationInterface {

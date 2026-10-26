@@ -47,6 +47,16 @@ dmn_smoke = executable('dmn-smoke', 'dmn_smoke.c',
   dependencies: [directx_native_hdr])
 test('smoke', dmn_smoke, env: ['DMN_LOG=info'], timeout: 120)
 
+# D3DMetal keys its per-app profile on the executable path the library
+# reports; an embedder hosting another program's workload overrides it.
+exe_identity = executable('exe-identity-test', 'exe_identity_test.cpp',
+  include_directories: test_native_inc,
+  link_with: dmn_lib,
+  dependencies: [directx_native_hdr])
+test('exe-identity', exe_identity, args: ['bf1.exe'], env: ['DMN_LOG=info'],
+     timeout: 60)
+test('exe-identity-default', exe_identity, env: ['DMN_LOG=info'], timeout: 60)
+
 dmn_device_test = executable('dmn-device-test',
   ['dmn_device_test.cpp', 'cocoa_window.mm'],
   include_directories: test_native_inc,
