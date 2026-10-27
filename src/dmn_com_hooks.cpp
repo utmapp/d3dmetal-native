@@ -3056,6 +3056,13 @@ HRESULT STDMETHODCALLTYPE hook_d3d12_CheckFeatureSupport(
  * sparse heap refuses: buffers, 3D, MSAA) the committed create stands, fully
  * backed -- and fully resident, see dmn_sparse.h.
  *
+ * A texture with UNORDERED_ACCESS takes the committed create too: Metal does
+ * not support MTLTextureUsageShaderWrite on a texture in a MTLHeapTypeSparse
+ * heap (the API validation layer says so on AGX G16), and every shader store
+ * or atomic into one is silently dropped (reads back zero; sparse-uav-test).
+ * Subnautica 2 writes reserved textures through UAVs, and rendered garbage
+ * and hung or faulted the GPU on the data its later passes consumed.
+ *
  * The framework object is created PLACED at offset 0 of a dummy heap rather
  * than committed.  Measured (DMN_ALLOC_TRACE): a committed create -- with or
  * without HEAP_FLAG_SHARED -- makes D3DMetal reserve the texture's full size
@@ -3079,7 +3086,8 @@ HRESULT d12_create_reserved(ID3D12Device* This, const D3D12_RESOURCE_DESC* desc,
                             Committed&& create_committed) {
     const bool sparse = dmn_sparse_enabled() &&
                         desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
-                        desc->SampleDesc.Count <= 1;
+                        desc->SampleDesc.Count <= 1 &&
+                        !(desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
     static ID3D12Device* dummy_dev = nullptr;
     static ID3D12Heap* dummy_heap = nullptr;
     static UINT64 dummy_bytes = 0;

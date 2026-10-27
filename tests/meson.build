@@ -538,6 +538,15 @@ sparse_tiled = executable('sparse-tiled-test',
   dependencies: [cocoa_deps, directx_native_hdr])
 test('sparse-tiled', sparse_tiled, env: ['DMN_LOG=warn'], is_parallel: false, timeout: 120)
 
+# Shader (UAV) writes into a reserved texture, stores and atomics, against a
+# committed control: such a texture must not take the sparse backing.
+sparse_uav = executable('sparse-uav-test',
+  ['sparse_uav_test.cpp'],
+  include_directories: [test_native_inc, include_directories('../src')],
+  link_with: dmn_lib,
+  dependencies: [cocoa_deps, directx_native_hdr])
+test('sparse-uav', sparse_uav, env: ['DMN_LOG=warn'], is_parallel: false, timeout: 60)
+
 # How the sparse module sizes itself: when chunks open, where a texture lands,
 # what the chunks may total.  Each case re-execs this binary in a fresh process
 # (the knobs are read once and the chunks are process-global), so it must not
