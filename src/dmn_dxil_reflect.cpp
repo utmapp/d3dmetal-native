@@ -20,13 +20,16 @@
  * leaf dlopen here resolves to the loaded image.
  */
 
+#include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
+#include <string>
+#include <utility>
 #include <vector>
-
 #include <unknwn.h>
 #include <d3d12shader.h> /* D3D12_SHADER_DESC / D3D12_SIGNATURE_PARAMETER_DESC */
 
@@ -151,6 +154,8 @@ public:
     BitCursor(const uint8_t *p, size_t bytes)
         : p_(p), end_((uint64_t)bytes * 8), steps_(end_ * 2) {}
     bool bad() const { return bad_; }
+    uint64_t position() const { return pos_; }
+    const uint8_t *data() const { return p_; }
     /* Charged per decoded value: literal and zero-width fields take no
      * bits, so the stream length alone does not bound the work. */
     void step() {
@@ -202,7 +207,48 @@ struct AbbrevOp {
     enum Kind : uint8_t { Literal, Fixed, Vbr, Array, Char6, Blob } kind;
     uint64_t value; /* the literal, or the field width */
 };
-typedef std::vector<AbbrevOp> Abbrev;
+
+/* Most DXIL abbreviations fit inline; unusually large records spill. */
+struct Abbrev {
+    std::array<AbbrevOp, 8> inlineOps{};
+    std::vector<AbbrevOp> overflow;
+    size_t count = 0;
+
+    void push_back(AbbrevOp op) {
+        if (count < inlineOps.size())
+            inlineOps[count] = op;
+        else
+            overflow.push_back(op);
+        count++;
+    }
+    size_t size() const { return count; }
+    const AbbrevOp &operator[](size_t i) const {
+        return i < inlineOps.size() ? inlineOps[i] : overflow[i - inlineOps.size()];
+    }
+};
+
+/* Keep the common module and VST abbreviations inline, spilling only when
+ * an input contains an unusually large abbreviation table. */
+class AbbrevSet {
+    static const size_t kInlineCount = 16;
+    std::array<Abbrev, kInlineCount> inlineAbbrevs_;
+    std::vector<Abbrev> overflow_;
+    size_t count_ = 0;
+
+public:
+    void push_back(Abbrev &&a) {
+        if (count_ < kInlineCount)
+            inlineAbbrevs_[count_] = std::move(a);
+        else
+            overflow_.push_back(std::move(a));
+        count_++;
+    }
+    size_t size() const { return count_; }
+    const Abbrev &operator[](size_t i) const {
+        return i < kInlineCount ? inlineAbbrevs_[i]
+                                : overflow_[i - kInlineCount];
+    }
+};
 
 bool
 readAbbrev(BitCursor &c, Abbrev &a)
@@ -225,18 +271,44 @@ readAbbrev(BitCursor &c, Abbrev &a)
     return !c.bad();
 }
 
+char
+decodeChar6(uint64_t value)
+{
+    if (value < 26)
+        return (char)('a' + value);
+    if (value < 52)
+        return (char)('A' + value - 26);
+    if (value < 62)
+        return (char)('0' + value - 52);
+    return value == 62 ? '.' : '_';
+}
+
 /* Reads one record: its code, and its first `cap` operands into ops. */
 bool
 readRecord(BitCursor &c, const Abbrev *abbrev, uint64_t *code, uint64_t *ops,
-           unsigned cap, uint64_t *nops)
+           unsigned cap, uint64_t *nops, uint8_t *symbolFlags = nullptr)
 {
+    static const char kQuadVote[] = "dx.op.quadVote.i1";
     uint64_t n = 0;
-    auto put = [&](uint64_t v) {
+    bool valueSymtabEntry = false;
+    bool voteNameMatches = true;
+    size_t nameChars = 0;
+    auto put = [&](uint64_t v, bool char6 = false) {
         c.step();
-        if (n == 0)
+        if (n == 0) {
             *code = v;
-        else if (n - 1 < cap)
-            ops[n - 1] = v;
+            valueSymtabEntry = v == 1;
+        } else {
+            if (n - 1 < cap)
+                ops[n - 1] = v;
+            if (symbolFlags && valueSymtabEntry && n >= 2) {
+                const char ch = char6 ? decodeChar6(v) :
+                                v <= 0x7f ? (char)v : '\0';
+                const size_t at = nameChars++;
+                voteNameMatches &= at < sizeof(kQuadVote) - 1 &&
+                                   ch == kQuadVote[at];
+            }
+        }
         n++;
     };
     auto scalar = [&](const AbbrevOp &op) {
@@ -259,11 +331,12 @@ readRecord(BitCursor &c, const Abbrev *abbrev, uint64_t *code, uint64_t *ops,
             const AbbrevOp &op = (*abbrev)[i];
             if (op.kind == AbbrevOp::Array) {
                 const uint64_t count = c.vbr(6);
-                if (++i >= abbrev->size() || (*abbrev)[i].kind >= AbbrevOp::Array ||
-                    count > c.left())
+                if (++i >= abbrev->size() ||
+                    (*abbrev)[i].kind == AbbrevOp::Array ||
+                    (*abbrev)[i].kind == AbbrevOp::Blob || count > c.left())
                     return false;
                 for (uint64_t k = 0; k < count && !c.bad(); k++)
-                    put(scalar((*abbrev)[i]));
+                    put(scalar((*abbrev)[i]), (*abbrev)[i].kind == AbbrevOp::Char6);
             } else if (op.kind == AbbrevOp::Blob) {
                 const uint64_t bytes = c.vbr(6);
                 c.align32();
@@ -271,16 +344,20 @@ readRecord(BitCursor &c, const Abbrev *abbrev, uint64_t *code, uint64_t *ops,
                 c.align32();
                 c.step();
             } else {
-                put(scalar(op));
+                put(scalar(op), op.kind == AbbrevOp::Char6);
             }
         }
+    }
+    if (symbolFlags && valueSymtabEntry) {
+        if (voteNameMatches && nameChars == sizeof(kQuadVote) - 1)
+            *symbolFlags |= 1;
     }
     *nops = n ? n - 1 : 0;
     return n && !c.bad();
 }
 
 enum { kEndBlock = 0, kEnterSubblock = 1, kDefineAbbrev = 2, kUnabbrevRecord = 3 };
-enum { kBlockInfo = 0, kModuleBlock = 8 };
+enum { kBlockInfo = 0, kModuleBlock = 8, kValueSymtabBlock = 14 };
 
 /* Walks a BLOCKINFO block.  False if it is malformed or registers
  * abbreviations for the module block, which would renumber that block's
@@ -380,6 +457,198 @@ scanLocalFunctions(const uint8_t *bc, size_t size)
     return LocalFunctions::Unknown;
 }
 
+enum class QuadVoteSymbols { No, Yes, Unknown };
+
+bool
+readSymbolBlockInfo(BitCursor &c, unsigned width, AbbrevSet &moduleAbbrevs,
+                    AbbrevSet &vstAbbrevs)
+{
+    uint64_t target = ~0ull;
+    while (!c.bad()) {
+        switch (c.fixed(width)) {
+        case kEndBlock:
+            c.align32();
+            return !c.bad();
+        case kDefineAbbrev: {
+            Abbrev a;
+            if (!readAbbrev(c, a))
+                return false;
+            if (target == kModuleBlock)
+                moduleAbbrevs.push_back(std::move(a));
+            else if (target == kValueSymtabBlock)
+                vstAbbrevs.push_back(std::move(a));
+            break;
+        }
+        case kUnabbrevRecord: {
+            uint64_t code, op, n;
+            if (!readRecord(c, nullptr, &code, &op, 1, &n))
+                return false;
+            if (code == 1 /* SETBID */ && n)
+                target = op;
+            break;
+        }
+        default:
+            return false;
+        }
+    }
+    return false;
+}
+
+QuadVoteSymbols
+scanValueSymtab(BitCursor &c, unsigned width, const AbbrevSet &inherited,
+                uint8_t *symbols)
+{
+    AbbrevSet local;
+    while (!c.bad()) {
+        const uint64_t id = c.fixed(width);
+        if (c.bad())
+            return QuadVoteSymbols::Unknown;
+        if (id == kEndBlock) {
+            c.align32();
+            return c.bad() ? QuadVoteSymbols::Unknown :
+                   (*symbols & 1) ? QuadVoteSymbols::Yes : QuadVoteSymbols::No;
+        }
+        if (id == kDefineAbbrev) {
+            Abbrev a;
+            if (!readAbbrev(c, a))
+                return QuadVoteSymbols::Unknown;
+            local.push_back(std::move(a));
+            continue;
+        }
+        const Abbrev *abbrev = nullptr;
+        if (id != kUnabbrevRecord) {
+            const uint64_t index = id - 4;
+            if (index < inherited.size())
+                abbrev = &inherited[(size_t)index];
+            else if (index - inherited.size() < local.size())
+                abbrev = &local[(size_t)(index - inherited.size())];
+            else
+                return QuadVoteSymbols::Unknown;
+        }
+        uint64_t code, n;
+        uint8_t found = 0;
+        if (!readRecord(c, abbrev, &code, nullptr, 0, &n, &found))
+            return QuadVoteSymbols::Unknown;
+        (void)code;
+        (void)n;
+        *symbols |= found;
+    }
+    return QuadVoteSymbols::Unknown;
+}
+
+QuadVoteSymbols
+scanModuleSymbols(BitCursor &c, unsigned width, AbbrevSet &moduleInherited,
+                  AbbrevSet &vstInherited, uint8_t *symbols)
+{
+    AbbrevSet moduleLocal;
+    while (!c.bad()) {
+        const uint64_t id = c.fixed(width);
+        if (c.bad())
+            return QuadVoteSymbols::Unknown;
+        if (id == kEndBlock) {
+            c.align32();
+            return c.bad() ? QuadVoteSymbols::Unknown : QuadVoteSymbols::No;
+        }
+        if (id == kEnterSubblock) {
+            const uint64_t block = c.vbr(8);
+            const uint64_t inner = c.vbr(4);
+            c.align32();
+            const uint64_t words = c.fixed(32);
+            if (c.bad() || inner < 2 || inner > 32 || words > c.left() / 32 ||
+                words > SIZE_MAX / 4)
+                return QuadVoteSymbols::Unknown;
+            const uint64_t offset = c.position() / 8;
+            const size_t bytes = (size_t)(words * 4);
+            if (offset > SIZE_MAX || (size_t)offset > SIZE_MAX - bytes)
+                return QuadVoteSymbols::Unknown;
+            if (block == kBlockInfo) {
+                BitCursor info(c.data() + (size_t)offset, bytes);
+                if (!readSymbolBlockInfo(info, (unsigned)inner,
+                                         moduleInherited, vstInherited))
+                    return QuadVoteSymbols::Unknown;
+            }
+            if (block == kValueSymtabBlock) {
+                BitCursor vst(c.data() + (size_t)offset, bytes);
+                QuadVoteSymbols result = scanValueSymtab(
+                    vst, (unsigned)inner, vstInherited, symbols);
+                if (result != QuadVoteSymbols::No)
+                    return result;
+            }
+            c.skip(words * 32);
+            if (c.bad())
+                return QuadVoteSymbols::Unknown;
+            continue;
+        }
+        if (id == kDefineAbbrev) {
+            Abbrev a;
+            if (!readAbbrev(c, a))
+                return QuadVoteSymbols::Unknown;
+            moduleLocal.push_back(std::move(a));
+            continue;
+        }
+        const Abbrev *abbrev = nullptr;
+        if (id != kUnabbrevRecord) {
+            const uint64_t index = id - 4;
+            if (index < moduleInherited.size())
+                abbrev = &moduleInherited[(size_t)index];
+            else if (index - moduleInherited.size() < moduleLocal.size())
+                abbrev = &moduleLocal[(size_t)(index - moduleInherited.size())];
+            else
+                return QuadVoteSymbols::Unknown;
+        }
+        uint64_t code, n;
+        if (!readRecord(c, abbrev, &code, nullptr, 0, &n))
+            return QuadVoteSymbols::Unknown;
+        (void)code;
+        (void)n;
+    }
+    return QuadVoteSymbols::Unknown;
+}
+
+QuadVoteSymbols
+scanQuadVoteSymbols(const uint8_t *bc, size_t size)
+{
+    static const uint8_t kMagic[4] = {'B', 'C', 0xC0, 0xDE};
+    
+    if (!bc || size < 4 || memcmp(bc, kMagic, 4) != 0)
+        return QuadVoteSymbols::Unknown;
+
+    BitCursor c(bc, size);
+    c.skip(32);
+    AbbrevSet moduleAbbrevs, vstAbbrevs;
+    while (!c.bad() && c.left()) {
+        if (c.fixed(2) != kEnterSubblock)
+            return QuadVoteSymbols::Unknown;
+        const uint64_t block = c.vbr(8);
+        const uint64_t inner = c.vbr(4);
+        c.align32();
+        const uint64_t words = c.fixed(32);
+        if (c.bad() || inner < 2 || inner > 32 || words > c.left() / 32 ||
+            words > SIZE_MAX / 4)
+            return QuadVoteSymbols::Unknown;
+        const uint64_t offset = c.position() / 8;
+        const size_t bytes = (size_t)(words * 4);
+        if (offset > SIZE_MAX || (size_t)offset > SIZE_MAX - bytes)
+            return QuadVoteSymbols::Unknown;
+        BitCursor blockCursor(bc + (size_t)offset, bytes);
+        if (block == kBlockInfo) {
+            if (!readSymbolBlockInfo(blockCursor, (unsigned)inner,
+                                     moduleAbbrevs, vstAbbrevs))
+                return QuadVoteSymbols::Unknown;
+        } else if (block == kModuleBlock) {
+            uint8_t symbols = 0;
+            QuadVoteSymbols result = scanModuleSymbols(
+                blockCursor, (unsigned)inner, moduleAbbrevs, vstAbbrevs,
+                &symbols);
+            return result;
+        }
+        c.skip(words * 32);
+        if (c.bad())
+            return QuadVoteSymbols::Unknown;
+    }
+    return QuadVoteSymbols::Unknown;
+}
+
 } // namespace
 
 extern "C" int
@@ -447,12 +716,15 @@ out:
  * point on any module defining more than main (SIGSEGV in
  * DXILMDHelper::parseEntryPoint, taking the worker with it).  Inlining
  * restores the single-function form that DXIL from a full compile has. */
-extern "C" int
-dmn_dxil_inline_subroutines(const void *container, size_t size, void **out,
-                            size_t *out_size)
+/* Existing subroutine normalization, intentionally restricted to the guest's
+ * original one-part, zero-digest container shape. */
+static int
+inlineSubroutines(const void *container, size_t size, void **out,
+                  size_t *out_size)
 {
     const uint8_t *c = static_cast<const uint8_t *>(container);
-    if (!c || size < 68 || memcmp(c, "DXBC", 4) != 0)
+    if (!c || !out || !out_size || size < 68 ||
+        memcmp(c, "DXBC", 4) != 0)
         return 0;
     for (int i = 4; i < 20; i++)
         if (c[i])
@@ -466,7 +738,8 @@ dmn_dxil_inline_subroutines(const void *container, size_t size, void **out,
         return 0;
     memcpy(&fourcc, c + partOff, 4);
     memcpy(&partSize, c + partOff + 4, 4);
-    if (fourcc != 0x4C495844u /* 'DXIL' */ || partSize > size - partOff - 8)
+    if (fourcc != 0x4C495844u /* 'DXIL' */ || partSize < 24 ||
+        partSize > size - partOff - 8)
         return 0;
     /* DxilProgramHeader: version, size in dwords, then the bitcode header
      * {'DXIL', DXIL version, bitcode offset, bitcode size}. */
@@ -539,9 +812,21 @@ dmn_dxil_inline_subroutines(const void *container, size_t size, void **out,
         return 0;
     }
 
-    const uint32_t bc = (uint32_t)mod->GetBufferSize();
-    const uint32_t newPart = 24 + ((bc + 3) & ~3u);
-    const uint32_t newTotal = 36 + 8 + newPart;
+    const size_t bcSize = mod->GetBufferSize();
+    const void *optimized = mod->GetBufferPointer();
+    if (!optimized || !bcSize || bcSize > UINT32_MAX - 3) {
+        mod->Release();
+        return 0;
+    }
+    const uint32_t bc = (uint32_t)bcSize;
+    const uint64_t newPart64 = 24 + ((bcSize + 3) & ~(size_t)3);
+    const uint64_t newTotal64 = 36 + 8 + newPart64;
+    if (newPart64 > UINT32_MAX || newTotal64 > UINT32_MAX) {
+        mod->Release();
+        return 0;
+    }
+    const uint32_t newPart = (uint32_t)newPart64;
+    const uint32_t newTotal = (uint32_t)newTotal64;
     uint8_t *o = static_cast<uint8_t *>(calloc(1, newTotal));
     if (!o) {
         mod->Release();
@@ -556,9 +841,540 @@ dmn_dxil_inline_subroutines(const void *container, size_t size, void **out,
     memcpy(o + 40, &newPart, 4);
     const uint32_t nh[6] = {hdr[0], newPart / 4, dxil, hdr[3], 16, bc};
     memcpy(o + 44, nh, sizeof(nh));
-    memcpy(o + 68, mod->GetBufferPointer(), bc);
+    memcpy(o + 68, optimized, bc);
     mod->Release();
     *out = o;
     *out_size = newTotal;
     return 1;
+}
+namespace {
+
+const uint32_t kDxilFourcc = 0x4C495844u;
+
+struct DxilProgramView {
+    uint32_t header[6];
+    const uint8_t *bitcode;
+    size_t bitcodeSize;
+};
+
+bool
+parseDxilProgram(const uint8_t *chunk, uint32_t partSize,
+                 DxilProgramView *program)
+{
+    if (!chunk || !program || partSize < 24)
+        return false;
+    uint32_t fourcc;
+    memcpy(&fourcc, chunk, 4);
+    if (fourcc != kDxilFourcc)
+        return false;
+    memcpy(program->header, chunk + 8, sizeof(program->header));
+    const uint32_t *h = program->header;
+    if (h[2] != kDxilFourcc || h[4] < 16 || h[4] > partSize - 8 ||
+        h[5] > partSize - 8 - h[4])
+        return false;
+    program->bitcode = chunk + 16 + h[4];
+    program->bitcodeSize = h[5];
+    return true;
+}
+
+bool
+quadVoteStageAndVersion(const uint32_t header[6])
+{
+    const uint32_t kind = header[0] >> 16;
+    switch (kind) {
+    case 0:  /* pixel */
+    case 5:  /* compute */
+    case 6:  /* library */
+    case 13: /* mesh */
+    case 14: /* amplification */
+    case 15: /* node */
+        break;
+    default:
+        return false;
+    }
+    const uint32_t major = (header[0] >> 4) & 0xf;
+    const uint32_t minor = header[0] & 0xf;
+    return (major > 6 || (major == 6 && minor >= 7)) &&
+           header[3] >= 0x107;
+}
+
+bool
+containsBytes(const char *text, size_t size, const char *needle,
+              size_t needleSize)
+{
+    if (!text || needleSize > size)
+        return false;
+    for (size_t i = 0; i <= size - needleSize; i++)
+        if (memcmp(text + i, needle, needleSize) == 0)
+            return true;
+    return false;
+}
+
+bool
+printModuleText(SysDxcOptimizer *opt, const uint8_t *bitcode, size_t size,
+                std::string *ir)
+{
+    PinnedBlob input(bitcode, size);
+    SysDxcBlob *mod = nullptr, *text = nullptr;
+    const wchar_t *options[] = {L"-print-module"};
+    const int32_t hr = opt->RunOptimizer(&input, options, 1, &mod, &text);
+    if (mod)
+        mod->Release();
+    if (hr < 0 || !text) {
+        if (text)
+            text->Release();
+        return false;
+    }
+    const char *bytes = static_cast<const char *>(text->GetBufferPointer());
+    size_t n = text->GetBufferSize();
+    while (n && bytes && bytes[n - 1] == '\0')
+        n--;
+    const bool valid = bytes && n && !memchr(bytes, '\0', n);
+    if (valid)
+        ir->assign(bytes, n);
+    text->Release();
+    return valid;
+}
+
+bool
+printModuleHasQuadVote(const uint8_t *bitcode, size_t size)
+{
+    PFN_SysDxcCreateInstance create = dxcCreateInstance();
+    if (!create)
+        return false;
+    SysDxcOptimizer *opt = nullptr;
+    if (create(&kClsidDxcOptimizer, &kIidDxcOptimizer, (void **)&opt) < 0 ||
+        !opt) {
+        if (opt)
+            opt->Release();
+        return false;
+    }
+    std::string ir;
+    const bool printed = printModuleText(opt, bitcode, size, &ir);
+    opt->Release();
+    static const char kSymbol[] = "@dx.op.quadVote.i1";
+    return printed && ir.find(kSymbol) != std::string::npos;
+}
+
+} // namespace
+namespace {
+
+enum class DeclState { Absent, Present, Invalid };
+
+bool
+validDeclarationSuffix(const char *suffix, size_t size)
+{
+    size_t i = 0;
+    while (i < size && (suffix[i] == ' ' || suffix[i] == '\t'))
+        i++;
+    if (i == size)
+        return true;
+    if (suffix[i++] != '#')
+        return false;
+    const size_t digits = i;
+    while (i < size && suffix[i] >= '0' && suffix[i] <= '9')
+        i++;
+    if (i == digits)
+        return false;
+    while (i < size && (suffix[i] == ' ' || suffix[i] == '\t'))
+        i++;
+    if (i == size)
+        return true;
+    static const char kDbg[] = "!dbg !";
+    if (size - i < sizeof(kDbg) - 1 ||
+        memcmp(suffix + i, kDbg, sizeof(kDbg) - 1) != 0)
+        return false;
+    i += sizeof(kDbg) - 1;
+    const size_t dbgDigits = i;
+    while (i < size && suffix[i] >= '0' && suffix[i] <= '9')
+        i++;
+    return i > dbgDigits && i == size;
+}
+
+DeclState
+inspectFunctionDecl(const std::string &ir, const char *signature,
+                    const char *symbol, size_t *lineStart, size_t *lineSize)
+{
+    const size_t signatureSize = strlen(signature);
+    const size_t symbolSize = strlen(symbol);
+    size_t start = 0;
+    size_t declarations = 0;
+    bool symbolSeen = false;
+    size_t foundStart = 0, foundSize = 0;
+    while (start < ir.size()) {
+        size_t end = ir.find('\n', start);
+        if (end == std::string::npos)
+            end = ir.size();
+        const size_t length = end - start;
+        if (containsBytes(ir.data() + start, length, symbol, symbolSize))
+            symbolSeen = true;
+        if (length >= signatureSize &&
+            memcmp(ir.data() + start, signature, signatureSize) == 0 &&
+            validDeclarationSuffix(ir.data() + start + signatureSize,
+                                   length - signatureSize)) {
+            declarations++;
+            foundStart = start;
+            foundSize = length;
+        }
+        if (end == ir.size())
+            break;
+        start = end + 1;
+    }
+    if (declarations > 1)
+        return DeclState::Invalid;
+    if (declarations == 1) {
+        if (lineStart)
+            *lineStart = foundStart;
+        if (lineSize)
+            *lineSize = foundSize;
+        return DeclState::Present;
+    }
+    return symbolSeen ? DeclState::Invalid : DeclState::Absent;
+}
+
+const char kQuadVoteDefinition[] =
+    "define internal i1 @dx.op.quadVote.i1(i32 %op, i1 %cond, i8 %kind) "
+    "alwaysinline nounwind {\n"
+    "entry:\n"
+    "  %cond32 = sext i1 %cond to i32\n"
+    "  %x = call i32 @dx.op.quadOp.i32(i32 123, i32 %cond32, i8 0)\n"
+    "  %y = call i32 @dx.op.quadOp.i32(i32 123, i32 %cond32, i8 1)\n"
+    "  %z = call i32 @dx.op.quadOp.i32(i32 123, i32 %cond32, i8 2)\n"
+    "  %xy.all = and i32 %x, %y\n"
+    "  %xyz.all = and i32 %xy.all, %z\n"
+    "  %all = and i32 %xyz.all, %cond32\n"
+    "  %xy.any = or i32 %x, %y\n"
+    "  %xyz.any = or i32 %xy.any, %z\n"
+    "  %any = or i32 %xyz.any, %cond32\n"
+    "  %is.all = icmp eq i8 %kind, 1\n"
+    "  %result32 = select i1 %is.all, i32 %all, i32 %any\n"
+    "  %result = trunc i32 %result32 to i1\n"
+    "  ret i1 %result\n"
+    "}";
+
+bool
+lowerQuadVoteBitcode(const DxilProgramView &program, uint8_t **newChunk,
+                     size_t *newChunkSize)
+{
+    *newChunk = nullptr;
+    *newChunkSize = 0;
+    PFN_SysDxcCreateInstance create = dxcCreateInstance();
+    if (!create)
+        return false;
+    SysDxcOptimizer *opt = nullptr;
+    if (create(&kClsidDxcOptimizer, &kIidDxcOptimizer, (void **)&opt) < 0 ||
+        !opt) {
+        if (opt)
+            opt->Release();
+        return false;
+    }
+
+    std::string ir;
+    if (!printModuleText(opt, program.bitcode, program.bitcodeSize, &ir)) {
+        opt->Release();
+        return false;
+    }
+    static const char kVoteDecl[] =
+        "declare i1 @dx.op.quadVote.i1(i32, i1, i8)";
+    static const char kVoteSymbol[] = "@dx.op.quadVote.i1";
+    static const char kOpDecl[] =
+        "declare i32 @dx.op.quadOp.i32(i32, i32, i8)";
+    static const char kOpSymbol[] = "@dx.op.quadOp.i32";
+    size_t voteStart, voteSize;
+    if (inspectFunctionDecl(ir, kVoteDecl, kVoteSymbol, &voteStart,
+                            &voteSize) != DeclState::Present) {
+        opt->Release();
+        return false;
+    }
+    const DeclState opDecl = inspectFunctionDecl(ir, kOpDecl, kOpSymbol,
+                                                  nullptr, nullptr);
+    if (opDecl == DeclState::Invalid) {
+        opt->Release();
+        return false;
+    }
+    ir.replace(voteStart, voteSize, kQuadVoteDefinition);
+    if (opDecl == DeclState::Absent) {
+        if (!ir.empty() && ir.back() != '\n')
+            ir.push_back('\n');
+        ir += kOpDecl;
+        ir += " nounwind\n";
+    }
+
+    PinnedBlob input(ir.data(), ir.size());
+    SysDxcBlob *mod = nullptr, *text = nullptr;
+    const wchar_t *options[] = {L"-always-inline"};
+    const int32_t hr = opt->RunOptimizer(&input, options, 1, &mod, &text);
+    if (text)
+        text->Release();
+    opt->Release();
+    if (hr < 0 || !mod) {
+        if (mod)
+            mod->Release();
+        return false;
+    }
+    const void *optimized = mod->GetBufferPointer();
+    const size_t bitcodeSize = mod->GetBufferSize();
+    const QuadVoteSymbols remaining =
+        scanQuadVoteSymbols(static_cast<const uint8_t *>(optimized),
+                            bitcodeSize);
+    if (!optimized || remaining != QuadVoteSymbols::No ||
+        bitcodeSize > UINT32_MAX - 3) {
+        mod->Release();
+        return false;
+    }
+
+    const uint64_t paddedBitcode = (bitcodeSize + 3) & ~(uint64_t)3;
+    const uint64_t partSize64 = 24 + paddedBitcode;
+    const uint64_t chunkSize64 = 8 + partSize64;
+    if (partSize64 > UINT32_MAX || chunkSize64 > UINT32_MAX ||
+        chunkSize64 > SIZE_MAX) {
+        mod->Release();
+        return false;
+    }
+    uint8_t *chunk = static_cast<uint8_t *>(
+        calloc(1, (size_t)chunkSize64));
+    if (!chunk) {
+        mod->Release();
+        return false;
+    }
+    const uint32_t partSize = (uint32_t)partSize64;
+    memcpy(chunk, &kDxilFourcc, 4);
+    memcpy(chunk + 4, &partSize, 4);
+    const uint32_t outputHeader[6] = {
+        program.header[0], partSize / 4, kDxilFourcc, program.header[3],
+        16, (uint32_t)bitcodeSize};
+    memcpy(chunk + 8, outputHeader, sizeof(outputHeader));
+    memcpy(chunk + 32, optimized, bitcodeSize);
+    mod->Release();
+    *newChunk = chunk;
+    *newChunkSize = (size_t)chunkSize64;
+    return true;
+}
+
+} // namespace
+namespace {
+
+struct ContainerPart {
+    const uint8_t *chunk;
+    uint32_t offset;
+    uint32_t partSize;
+    uint32_t newOffset;
+    uint32_t fourcc;
+    uint8_t *replacement;
+    size_t replacementSize;
+};
+
+bool
+programHasQuadVote(const DxilProgramView &program)
+{
+    if (!quadVoteStageAndVersion(program.header))
+        return false;
+    const QuadVoteSymbols symbols =
+        scanQuadVoteSymbols(program.bitcode, program.bitcodeSize);
+    if (symbols == QuadVoteSymbols::Yes)
+        return true;
+    if (symbols == QuadVoteSymbols::No)
+        return false;
+    return printModuleHasQuadVote(program.bitcode, program.bitcodeSize);
+}
+
+void
+freeParts(ContainerPart *parts, size_t count, ContainerPart **sorted)
+{
+    if (parts) {
+        for (size_t i = 0; i < count; i++)
+            free(parts[i].replacement);
+    }
+    free(sorted);
+    free(parts);
+}
+
+int
+normalizeQuadVoteContainer(const void *container, size_t size, void **out,
+                           size_t *outSize)
+{
+    const uint8_t *c = static_cast<const uint8_t *>(container);
+    if (!c || !out || !outSize || size < 36 || memcmp(c, "DXBC", 4) != 0)
+        return 0;
+    uint32_t total, count;
+    memcpy(&total, c + 24, 4);
+    memcpy(&count, c + 28, 4);
+    /* The fixed DXBC header is 32 bytes; DWORD part offsets follow it. */
+    if (total != size || count > (total - 32) / 4)
+        return 0;
+    const uint64_t tableEnd = 32 + (uint64_t)count * 4;
+
+    /* Common shaders return here without allocating or printing IR. */
+    bool affected = false;
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t offset;
+        memcpy(&offset, c + 32 + (size_t)i * 4, 4);
+        if ((offset & 3) || offset < tableEnd || offset > total - 8)
+            return 0;
+        uint32_t fourcc, partSize;
+        memcpy(&fourcc, c + offset, 4);
+        memcpy(&partSize, c + offset + 4, 4);
+        if (partSize > total - offset - 8)
+            return 0;
+        if (fourcc != kDxilFourcc)
+            continue;
+        DxilProgramView program;
+        if (!parseDxilProgram(c + offset, partSize, &program))
+            return 0;
+        if (programHasQuadVote(program))
+            affected = true;
+    }
+    if (!affected || count == 0 ||
+        (uint64_t)count > SIZE_MAX / sizeof(ContainerPart) ||
+        (uint64_t)count > SIZE_MAX / sizeof(ContainerPart *))
+        return 0;
+
+    const size_t partCount = count;
+    ContainerPart *parts = static_cast<ContainerPart *>(
+        calloc(partCount, sizeof(ContainerPart)));
+    ContainerPart **sorted = static_cast<ContainerPart **>(
+        malloc(partCount * sizeof(ContainerPart *)));
+    if (!parts || !sorted) {
+        free(parts);
+        free(sorted);
+        return 0;
+    }
+    for (size_t i = 0; i < partCount; i++) {
+        uint32_t offset;
+        memcpy(&offset, c + 32 + i * 4, 4);
+        uint32_t partSize, fourcc;
+        memcpy(&fourcc, c + offset, 4);
+        memcpy(&partSize, c + offset + 4, 4);
+        parts[i].chunk = c + offset;
+        parts[i].offset = offset;
+        parts[i].partSize = partSize;
+        parts[i].fourcc = fourcc;
+        sorted[i] = &parts[i];
+    }
+    std::sort(sorted, sorted + partCount,
+              [](const ContainerPart *a, const ContainerPart *b) {
+                  return a->offset < b->offset;
+              });
+    uint64_t previousEnd = tableEnd;
+    for (size_t i = 0; i < partCount; i++) {
+        const ContainerPart &part = *sorted[i];
+        if (part.offset < previousEnd) {
+            freeParts(parts, partCount, sorted);
+            return 0;
+        }
+        previousEnd = (uint64_t)part.offset + 8 + part.partSize;
+    }
+
+    bool changed = false;
+    for (size_t i = 0; i < partCount; i++) {
+        ContainerPart &part = parts[i];
+        if (part.fourcc != kDxilFourcc)
+            continue;
+        DxilProgramView program;
+        if (!parseDxilProgram(part.chunk, part.partSize, &program)) {
+            freeParts(parts, partCount, sorted);
+            return 0;
+        }
+        if (!programHasQuadVote(program))
+            continue;
+        if (!lowerQuadVoteBitcode(program, &part.replacement,
+                                  &part.replacementSize)) {
+            freeParts(parts, partCount, sorted);
+            return 0;
+        }
+        changed = true;
+    }
+    if (!changed) {
+        freeParts(parts, partCount, sorted);
+        return 0;
+    }
+
+    uint64_t outputSize = tableEnd;
+    for (size_t i = 0; i < partCount; i++) {
+        if (outputSize > UINT32_MAX - 3) {
+            freeParts(parts, partCount, sorted);
+            return 0;
+        }
+        outputSize = (outputSize + 3) & ~3ull;
+        const uint64_t chunkSize = parts[i].replacement
+                                       ? parts[i].replacementSize
+                                       : 8ull + parts[i].partSize;
+        if (outputSize > UINT32_MAX ||
+            chunkSize > UINT32_MAX - outputSize) {
+            freeParts(parts, partCount, sorted);
+            return 0;
+        }
+        parts[i].newOffset = (uint32_t)outputSize;
+        outputSize += chunkSize;
+    }
+    if (outputSize > UINT32_MAX - 3) {
+        freeParts(parts, partCount, sorted);
+        return 0;
+    }
+    outputSize = (outputSize + 3) & ~3ull;
+    if (outputSize > SIZE_MAX || outputSize > UINT32_MAX) {
+        freeParts(parts, partCount, sorted);
+        return 0;
+    }
+    uint8_t *normalized =
+        static_cast<uint8_t *>(calloc(1, (size_t)outputSize));
+    if (!normalized) {
+        freeParts(parts, partCount, sorted);
+        return 0;
+    }
+    memcpy(normalized, c, 24);
+    memset(normalized + 4, 0, 16);
+    const uint32_t newTotal = (uint32_t)outputSize;
+    memcpy(normalized + 24, &newTotal, 4);
+    memcpy(normalized + 28, &count, 4);
+    for (size_t i = 0; i < partCount; i++) {
+        const ContainerPart &part = parts[i];
+        memcpy(normalized + 32 + i * 4, &part.newOffset, 4);
+        const void *chunk = part.replacement
+                                ? part.replacement
+                                : static_cast<const void *>(part.chunk);
+        const size_t chunkSize = part.replacement
+                                     ? part.replacementSize
+                                     : (size_t)part.partSize + 8;
+        memcpy(normalized + part.newOffset, chunk, chunkSize);
+    }
+    freeParts(parts, partCount, sorted);
+    *out = normalized;
+    *outSize = (size_t)outputSize;
+    return 1;
+}
+
+} // namespace
+
+extern "C" int
+dmn_dxil_normalize(const void *container, size_t size, void **out,
+                   size_t *out_size)
+{
+    if (!out || !out_size)
+        return 0;
+    *out = nullptr;
+    *out_size = 0;
+
+    void *inlined = nullptr;
+    size_t inlinedSize = 0;
+    const bool didInline =
+        inlineSubroutines(container, size, &inlined, &inlinedSize) != 0;
+    const void *working = didInline ? inlined : container;
+    const size_t workingSize = didInline ? inlinedSize : size;
+
+    void *quadVote = nullptr;
+    size_t quadVoteSize = 0;
+    if (normalizeQuadVoteContainer(working, workingSize, &quadVote,
+                                  &quadVoteSize)) {
+        free(inlined);
+        *out = quadVote;
+        *out_size = quadVoteSize;
+        return 1;
+    }
+    if (didInline) {
+        *out = inlined;
+        *out_size = inlinedSize;
+        return 1;
+    }
+    return 0;
 }

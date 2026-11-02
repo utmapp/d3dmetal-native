@@ -2,11 +2,11 @@
  * Copyright 2026 Turing Software LLC
  * SPDX-License-Identifier: MIT
  *
- * dmn_dxil_inline_subroutines reads a container the guest built; a part
- * offset or size whose 32-bit sum with the header wraps must be rejected,
- * not followed out of the buffer.  Each container below is one DXIL part
- * in the minimal shape (zero digest) with one field pushed past the end,
- * placed against an inaccessible page so a read past it faults.
+ * dmn_dxil_normalize reads a container the guest built; a part offset or size
+ * whose 32-bit sum with the header wraps must be rejected, not followed out of
+ * the buffer. Each container below is one DXIL part in the minimal shape
+ * (zero digest) with one field pushed past the end, placed against an
+ * inaccessible page so a read past it faults.
  *
  * Prints "DXILBOUNDS: PASS" and exits 0 on success.
  */
@@ -21,8 +21,8 @@
 #define T_TAG "DXILBOUNDS"
 #include "common/check.h"
 
-extern "C" int dmn_dxil_inline_subroutines(const void* container, size_t size,
-                                           void** out, size_t* out_size);
+extern "C" int dmn_dxil_normalize(const void* container, size_t size,
+                                  void** out, size_t* out_size);
 
 namespace {
 
@@ -64,7 +64,7 @@ int main() {
         build(c, k.partOff, k.partSize);
         void* out = nullptr;
         size_t n = 0;
-        const int r = dmn_dxil_inline_subroutines(c, kSize, &out, &n);
+        const int r = dmn_dxil_normalize(c, kSize, &out, &n);
         printf(T_TAG ": %s -> %d\n", k.name, r);
         EXPECT(r == 0 && !out, "malformed container was not rejected");
     }

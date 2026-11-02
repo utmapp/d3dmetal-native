@@ -23,13 +23,14 @@ struct dmn_dxil_semantic {
 int dmn_dxil_input_semantics(const void *container, size_t size,
                              struct dmn_dxil_semantic *out, int cap);
 
-/* For a minimal container (one DXIL part, zero digest -- the shape the guest
- * UMD wraps a bare DXIL program in) whose module defines internal
- * functions, inline them and turn the globals they shared into locals.
- * Returns 1 and a malloc'd container in *out / *out_size (caller frees)
- * when it rewrote the module, 0 to keep the input. */
-int dmn_dxil_inline_subroutines(const void *container, size_t size,
-                                void **out, size_t *out_size);
+/* Normalize supported DXIL containers. Internal-function inlining remains
+ * limited to the guest's original one-DXIL-part, zero-digest container shape;
+ * QuadVote lowering is module-generic for supported stages and is applied
+ * without changing shader-model or DXIL-version fields. Returns 1 with a
+ * malloc-owned container in *out / *out_size only when bytes changed; returns
+ * 0 with *out == NULL when the input is kept unchanged. */
+int dmn_dxil_normalize(const void *container, size_t size, void **out,
+                       size_t *out_size);
 
 #ifdef __cplusplus
 }
