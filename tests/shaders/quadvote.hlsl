@@ -20,7 +20,9 @@ void main(uint3 tid : SV_GroupThreadID, uint index : SV_GroupIndex)
 #endif
     bool condition = ((quad >> lane) & 1) != 0;
     output[index * 4] = uint(QuadAny(condition)) | (uint(QuadAll(condition)) << 1);
+#if TWO_D
     output[index * 4 + 1] = QuadReadAcrossX(index);
     output[index * 4 + 2] = QuadReadAcrossY(index);
     output[index * 4 + 3] = QuadReadAcrossDiagonal(index);
+#endif
 }

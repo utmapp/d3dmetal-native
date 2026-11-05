@@ -11,11 +11,16 @@
  * Prints "DXILBOUNDS: PASS" and exits 0 on success.
  */
 
+#include <cerrno>
+#include <cstdlib>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <vector>
 
 #include <sys/mman.h>
+#include <sys/resource.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #define T_TAG "DXILBOUNDS"
@@ -23,6 +28,8 @@
 
 extern "C" int dmn_dxil_normalize(const void* container, size_t size,
                                   void** out, size_t* out_size);
+typedef unsigned char BYTE;
+#include "shaders/quadvote0.h"
 
 namespace {
 
@@ -44,6 +51,61 @@ void build(unsigned char* c, uint32_t partOff, uint32_t partSize) {
     const uint32_t prog[6] = {0x60, 0, 0x4C495844u, 0x100, 16, 0x01000000u};
     memcpy(c + 44, prog, sizeof(prog));
     memcpy(c + 68, "BC\xC0\xDE", 4);
+}
+/* A duplicate table must not multiply decoding work by the part count.
+ * Bound CPU time in a child rather than using a wall-clock timing assertion. */
+bool duplicatePartWorkBound() {
+    uint32_t originalCount;
+    memcpy(&originalCount, g_quadvote0 + 28, 4);
+    uint32_t originalOffset = 0, chunkSize = 0;
+    for (uint32_t i = 0; i < originalCount; ++i) {
+        uint32_t offset;
+        memcpy(&offset, g_quadvote0 + 32 + i * 4, 4);
+        if (memcmp(g_quadvote0 + offset, "DXIL", 4) == 0) {
+            originalOffset = offset;
+            memcpy(&chunkSize, g_quadvote0 + offset + 4, 4);
+            chunkSize += 8;
+            break;
+        }
+    }
+    if (!chunkSize)
+        return false;
+    const uint32_t count = 1u << 20, offset = 32 + count * 4;
+    const uint32_t total = offset + chunkSize, version = 1;
+    std::vector<unsigned char> container(total);
+    memcpy(container.data(), "DXBC", 4);
+    memcpy(container.data() + 20, &version, 4);
+    memcpy(container.data() + 24, &total, 4);
+    memcpy(container.data() + 28, &count, 4);
+    for (uint32_t i = 0; i < count; ++i)
+        memcpy(container.data() + 32 + i * 4, &offset, 4);
+    memcpy(container.data() + offset, g_quadvote0 + originalOffset, chunkSize);
+    const pid_t child = fork();
+    if (child < 0)
+        return false;
+    if (child == 0) {
+        const rlimit cpu = {1, 1};
+        if (setrlimit(RLIMIT_CPU, &cpu) != 0)
+            _exit(2);
+        void *out = nullptr;
+        size_t size = 0;
+        const int changed = dmn_dxil_normalize(
+            container.data(), container.size(), &out, &size);
+        const bool rejected = changed == 0 && !out;
+        free(out);
+        _exit(rejected ? 0 : 1);
+    }
+    int status = 0;
+    pid_t waited;
+    do {
+        waited = waitpid(child, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+    if (waited != child)
+        return false;
+    printf(T_TAG ": duplicate-part work bound: exit=%d signal=%d\n",
+           WIFEXITED(status) ? WEXITSTATUS(status) : -1,
+           WIFSIGNALED(status) ? WTERMSIG(status) : 0);
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
 
 } // namespace
@@ -68,6 +130,7 @@ int main() {
         printf(T_TAG ": %s -> %d\n", k.name, r);
         EXPECT(r == 0 && !out, "malformed container was not rejected");
     }
+    EXPECT(duplicatePartWorkBound(), "duplicate parts exceeded bounded rejection work");
     T_PASS();
     return 0;
 }

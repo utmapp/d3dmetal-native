@@ -27,6 +27,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -748,6 +749,9 @@ inlineSubroutines(const void *container, size_t size, void **out,
     memcpy(hdr, prog, sizeof(hdr));
     if (hdr[2] != 0x4C495844u || 8 + (uint64_t)hdr[4] + hdr[5] > partSize)
         return 0;
+    /* Preserve the original VS/PS-only subroutine repair. */
+    if ((hdr[0] >> 16) > 1)
+        return 0;
     const uint8_t *bitcode = prog + 8 + hdr[4];
 
     /* Every shader of every pipeline create comes through here, so the
@@ -936,25 +940,6 @@ printModuleText(SysDxcOptimizer *opt, const uint8_t *bitcode, size_t size,
     return valid;
 }
 
-bool
-printModuleHasQuadVote(const uint8_t *bitcode, size_t size)
-{
-    PFN_SysDxcCreateInstance create = dxcCreateInstance();
-    if (!create)
-        return false;
-    SysDxcOptimizer *opt = nullptr;
-    if (create(&kClsidDxcOptimizer, &kIidDxcOptimizer, (void **)&opt) < 0 ||
-        !opt) {
-        if (opt)
-            opt->Release();
-        return false;
-    }
-    std::string ir;
-    const bool printed = printModuleText(opt, bitcode, size, &ir);
-    opt->Release();
-    static const char kSymbol[] = "@dx.op.quadVote.i1";
-    return printed && ir.find(kSymbol) != std::string::npos;
-}
 
 } // namespace
 namespace {
@@ -1154,191 +1139,124 @@ lowerQuadVoteBitcode(const DxilProgramView &program, uint8_t **newChunk,
 } // namespace
 namespace {
 
-struct ContainerPart {
-    const uint8_t *chunk;
+struct PartRange {
     uint32_t offset;
-    uint32_t partSize;
-    uint32_t newOffset;
-    uint32_t fourcc;
-    uint8_t *replacement;
-    size_t replacementSize;
+    uint32_t size;
 };
-
-bool
-programHasQuadVote(const DxilProgramView &program)
-{
-    if (!quadVoteStageAndVersion(program.header))
-        return false;
-    const QuadVoteSymbols symbols =
-        scanQuadVoteSymbols(program.bitcode, program.bitcodeSize);
-    if (symbols == QuadVoteSymbols::Yes)
-        return true;
-    if (symbols == QuadVoteSymbols::No)
-        return false;
-    return printModuleHasQuadVote(program.bitcode, program.bitcodeSize);
-}
-
-void
-freeParts(ContainerPart *parts, size_t count, ContainerPart **sorted)
-{
-    if (parts) {
-        for (size_t i = 0; i < count; i++)
-            free(parts[i].replacement);
-    }
-    free(sorted);
-    free(parts);
-}
 
 int
 normalizeQuadVoteContainer(const void *container, size_t size, void **out,
                            size_t *outSize)
 {
     const uint8_t *c = static_cast<const uint8_t *>(container);
-    if (!c || !out || !outSize || size < 36 || memcmp(c, "DXBC", 4) != 0)
+    if (!c || size < 36 || memcmp(c, "DXBC", 4) != 0)
         return 0;
     uint32_t total, count;
     memcpy(&total, c + 24, 4);
     memcpy(&count, c + 28, 4);
-    /* The fixed DXBC header is 32 bytes; DWORD part offsets follow it. */
     if (total != size || count > (total - 32) / 4)
         return 0;
-    const uint64_t tableEnd = 32 + (uint64_t)count * 4;
-
-    /* Common shaders return here without allocating or printing IR. */
-    bool affected = false;
+    const uint32_t tableEnd = 32 + count * 4;
+    uint32_t dxilIndex = UINT32_MAX;
+    DxilProgramView program{};
+    /* DXBC has one executable DXIL part. Validate all entries before any
+     * bitcode scan; aliases cannot multiply the scanner's work budget. */
     for (uint32_t i = 0; i < count; i++) {
-        uint32_t offset;
+        uint32_t offset, fourcc, partSize;
         memcpy(&offset, c + 32 + (size_t)i * 4, 4);
         if ((offset & 3) || offset < tableEnd || offset > total - 8)
             return 0;
-        uint32_t fourcc, partSize;
         memcpy(&fourcc, c + offset, 4);
         memcpy(&partSize, c + offset + 4, 4);
         if (partSize > total - offset - 8)
             return 0;
-        if (fourcc != kDxilFourcc)
-            continue;
-        DxilProgramView program;
-        if (!parseDxilProgram(c + offset, partSize, &program))
-            return 0;
-        if (programHasQuadVote(program))
-            affected = true;
+        if (fourcc == kDxilFourcc) {
+            if (dxilIndex != UINT32_MAX ||
+                !parseDxilProgram(c + offset, partSize, &program))
+                return 0;
+            dxilIndex = i;
+        }
     }
-    if (!affected || count == 0 ||
-        (uint64_t)count > SIZE_MAX / sizeof(ContainerPart) ||
-        (uint64_t)count > SIZE_MAX / sizeof(ContainerPart *))
+    if (dxilIndex == UINT32_MAX || !quadVoteStageAndVersion(program.header))
         return 0;
 
-    const size_t partCount = count;
-    ContainerPart *parts = static_cast<ContainerPart *>(
-        calloc(partCount, sizeof(ContainerPart)));
-    ContainerPart **sorted = static_cast<ContainerPart **>(
-        malloc(partCount * sizeof(ContainerPart *)));
-    if (!parts || !sorted) {
-        free(parts);
-        free(sorted);
-        return 0;
+    /* Ordinary containers fit on the stack; larger tables need one
+     * allocation, bounded by their actual offset-table length. */
+    PartRange common[8];
+    std::unique_ptr<PartRange, decltype(&std::free)> allocated(nullptr, std::free);
+    PartRange *ranges = common;
+    if (count > 8) {
+        if constexpr (sizeof(size_t) < sizeof(uint64_t)) {
+            if (count > SIZE_MAX / sizeof(PartRange))
+                return 0;
+        }
+        allocated.reset(static_cast<PartRange *>(malloc(count * sizeof(PartRange))));
+        if (!allocated)
+            return 0;
+        ranges = allocated.get();
     }
-    for (size_t i = 0; i < partCount; i++) {
-        uint32_t offset;
-        memcpy(&offset, c + 32 + i * 4, 4);
-        uint32_t partSize, fourcc;
-        memcpy(&fourcc, c + offset, 4);
-        memcpy(&partSize, c + offset + 4, 4);
-        parts[i].chunk = c + offset;
-        parts[i].offset = offset;
-        parts[i].partSize = partSize;
-        parts[i].fourcc = fourcc;
-        sorted[i] = &parts[i];
+    for (uint32_t i = 0; i < count; i++) {
+        memcpy(&ranges[i].offset, c + 32 + (size_t)i * 4, 4);
+        memcpy(&ranges[i].size, c + ranges[i].offset + 4, 4);
     }
-    std::sort(sorted, sorted + partCount,
-              [](const ContainerPart *a, const ContainerPart *b) {
-                  return a->offset < b->offset;
+    std::sort(ranges, ranges + count,
+              [](const PartRange &a, const PartRange &b) {
+                  return a.offset < b.offset;
               });
     uint64_t previousEnd = tableEnd;
-    for (size_t i = 0; i < partCount; i++) {
-        const ContainerPart &part = *sorted[i];
-        if (part.offset < previousEnd) {
-            freeParts(parts, partCount, sorted);
+    for (uint32_t i = 0; i < count; i++) {
+        if (ranges[i].offset < previousEnd)
             return 0;
-        }
-        previousEnd = (uint64_t)part.offset + 8 + part.partSize;
+        previousEnd = (uint64_t)ranges[i].offset + 8 + ranges[i].size;
     }
-
-    bool changed = false;
-    for (size_t i = 0; i < partCount; i++) {
-        ContainerPart &part = parts[i];
-        if (part.fourcc != kDxilFourcc)
-            continue;
-        DxilProgramView program;
-        if (!parseDxilProgram(part.chunk, part.partSize, &program)) {
-            freeParts(parts, partCount, sorted);
-            return 0;
-        }
-        if (!programHasQuadVote(program))
-            continue;
-        if (!lowerQuadVoteBitcode(program, &part.replacement,
-                                  &part.replacementSize)) {
-            freeParts(parts, partCount, sorted);
-            return 0;
-        }
-        changed = true;
-    }
-    if (!changed) {
-        freeParts(parts, partCount, sorted);
+    if (scanQuadVoteSymbols(program.bitcode, program.bitcodeSize) ==
+        QuadVoteSymbols::No)
         return 0;
-    }
+    /* Unknown scans use the same one print as recognized votes: the
+     * canonical declaration check in lowering also detects absence. */
+    uint8_t *replacement = nullptr;
+    size_t replacementSize = 0;
+    if (!lowerQuadVoteBitcode(program, &replacement, &replacementSize))
+        return 0;
+    std::unique_ptr<uint8_t, decltype(&std::free)> owned(replacement, std::free);
 
     uint64_t outputSize = tableEnd;
-    for (size_t i = 0; i < partCount; i++) {
-        if (outputSize > UINT32_MAX - 3) {
-            freeParts(parts, partCount, sorted);
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t offset, partSize;
+        memcpy(&offset, c + 32 + (size_t)i * 4, 4);
+        memcpy(&partSize, c + offset + 4, 4);
+        const uint64_t chunkSize =
+            i == dxilIndex ? replacementSize : 8ull + partSize;
+        if (outputSize > UINT32_MAX - 3)
             return 0;
-        }
         outputSize = (outputSize + 3) & ~3ull;
-        const uint64_t chunkSize = parts[i].replacement
-                                       ? parts[i].replacementSize
-                                       : 8ull + parts[i].partSize;
-        if (outputSize > UINT32_MAX ||
-            chunkSize > UINT32_MAX - outputSize) {
-            freeParts(parts, partCount, sorted);
+        if (chunkSize > UINT32_MAX - outputSize)
             return 0;
-        }
-        parts[i].newOffset = (uint32_t)outputSize;
         outputSize += chunkSize;
     }
-    if (outputSize > UINT32_MAX - 3) {
-        freeParts(parts, partCount, sorted);
+    if (outputSize > UINT32_MAX - 3)
         return 0;
-    }
     outputSize = (outputSize + 3) & ~3ull;
-    if (outputSize > SIZE_MAX || outputSize > UINT32_MAX) {
-        freeParts(parts, partCount, sorted);
+    uint8_t *normalized = static_cast<uint8_t *>(calloc(1, (size_t)outputSize));
+    if (!normalized)
         return 0;
-    }
-    uint8_t *normalized =
-        static_cast<uint8_t *>(calloc(1, (size_t)outputSize));
-    if (!normalized) {
-        freeParts(parts, partCount, sorted);
-        return 0;
-    }
-    memcpy(normalized, c, 24);
+    memcpy(normalized, c, 32);
     memset(normalized + 4, 0, 16);
     const uint32_t newTotal = (uint32_t)outputSize;
     memcpy(normalized + 24, &newTotal, 4);
-    memcpy(normalized + 28, &count, 4);
-    for (size_t i = 0; i < partCount; i++) {
-        const ContainerPart &part = parts[i];
-        memcpy(normalized + 32 + i * 4, &part.newOffset, 4);
-        const void *chunk = part.replacement
-                                ? part.replacement
-                                : static_cast<const void *>(part.chunk);
-        const size_t chunkSize = part.replacement
-                                     ? part.replacementSize
-                                     : (size_t)part.partSize + 8;
-        memcpy(normalized + part.newOffset, chunk, chunkSize);
+    uint32_t cursor = tableEnd;
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t offset, partSize;
+        memcpy(&offset, c + 32 + (size_t)i * 4, 4);
+        memcpy(&partSize, c + offset + 4, 4);
+        const void *chunk = i == dxilIndex ? replacement : c + offset;
+        const size_t chunkSize =
+            i == dxilIndex ? replacementSize : (size_t)partSize + 8;
+        cursor = (cursor + 3u) & ~3u;
+        memcpy(normalized + 32 + (size_t)i * 4, &cursor, 4);
+        memcpy(normalized + cursor, chunk, chunkSize);
+        cursor += (uint32_t)chunkSize;
     }
-    freeParts(parts, partCount, sorted);
     *out = normalized;
     *outSize = (size_t)outputSize;
     return 1;

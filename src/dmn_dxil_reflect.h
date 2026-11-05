@@ -23,7 +23,7 @@ struct dmn_dxil_semantic {
 int dmn_dxil_input_semantics(const void *container, size_t size,
                              struct dmn_dxil_semantic *out, int cap);
 
-/* Normalize supported DXIL containers. Internal-function inlining remains
+/* Normalize supported DXIL containers. VS/PS subroutine inlining remains
  * limited to the guest's original one-DXIL-part, zero-digest container shape;
  * QuadVote lowering is module-generic for supported stages and is applied
  * without changing shader-model or DXIL-version fields. Returns 1 with a

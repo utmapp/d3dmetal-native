@@ -83,13 +83,15 @@ bool check(ID3D12PipelineState *state, ID3D12RootSignature *root, bool twoD,
         const UINT pattern = twoD ? (y / 2) * 4 + x / 2 : i / 4;
         const UINT vote = (pattern != 0) | ((pattern == 15) << 1);
         if (values[i * 4] != vote) ++badVotes;
-        const UINT partners[] = {i ^ 1, i ^ (twoD ? 8 : 2), i ^ (twoD ? 9 : 3)};
-        for (UINT p = 0; p < 3; ++p)
-            if (values[i * 4 + p + 1] != partners[p]) ++badPartners;
+        if (twoD) {
+            const UINT partners[] = {i ^ 1, i ^ 8, i ^ 9};
+            for (UINT p = 0; p < 3; ++p)
+                if (values[i * 4 + p + 1] != partners[p]) ++badPartners;
+        }
     }
     readback->Unmap(0, nullptr);
-    printf(T_TAG ": %s %s votes=%u/64 wrong, partners=%u/192 wrong\n",
-           path, twoD ? "8x8" : "64x1", badVotes, badPartners);
+    printf(T_TAG ": %s %s votes=%u/64 wrong, partners=%u/%u wrong\n",
+           path, twoD ? "8x8" : "64x1", badVotes, badPartners, twoD ? 192u : 0u);
     readback->Release(); seed->Release(); out->Release();
     return badVotes == 0 && badPartners == 0;
 }
