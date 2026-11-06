@@ -80,12 +80,12 @@ int main() {
         v++;
         CK(prod->SetEventOnCompletion(v, evProd), "producer SetEventOnCompletion");
         CK(imp->SetEventOnCompletion(v, evImp), "import SetEventOnCompletion");
-        EXPECT(dmn_event_wait(evImp, 50ull * 1000 * 1000) == DMN_WAIT_TIMEOUT,
+        EXPECT(dmn_event_wait(evImp, 50ull * 1000 * 1000) == DXN_WAIT_TIMEOUT,
                "import event fired before any signal");
         CK(queue->Signal(prod.ptr(), v), "queue Signal");
-        EXPECT(dmn_event_wait(evProd, kLongNs) == DMN_WAIT_SIGNALED,
+        EXPECT(dmn_event_wait(evProd, kLongNs) == DXN_WAIT_SIGNALED,
                "producer event did not fire");
-        EXPECT(dmn_event_wait(evImp, kLongNs) == DMN_WAIT_SIGNALED,
+        EXPECT(dmn_event_wait(evImp, kLongNs) == DXN_WAIT_SIGNALED,
                "import event did not fire");
         dmn_event_close(evProd);
         dmn_event_close(evImp);
@@ -135,10 +135,10 @@ int main() {
             CK(mhr, "SetEventOnMultipleFenceCompletion(ALL)");
             CK(queue->Signal(prod.ptr(), vImp), "queue Signal(shared)");
             v = vImp;
-            EXPECT(dmn_event_wait(evAll, 200ull * 1000 * 1000) == DMN_WAIT_TIMEOUT,
+            EXPECT(dmn_event_wait(evAll, 200ull * 1000 * 1000) == DXN_WAIT_TIMEOUT,
                    "ALL wait fired with one fence pending");
             CK(queue->Signal(plain.ptr(), vPlain), "queue Signal(plain)");
-            EXPECT(dmn_event_wait(evAll, kLongNs) == DMN_WAIT_SIGNALED,
+            EXPECT(dmn_event_wait(evAll, kLongNs) == DXN_WAIT_SIGNALED,
                    "ALL wait did not fire");
             dmn_event_close(evAll);
 
@@ -151,7 +151,7 @@ int main() {
                "SetEventOnMultipleFenceCompletion(ANY)");
             CK(queue->Signal(prod.ptr(), v + 1), "queue Signal(shared)");
             v++;
-            EXPECT(dmn_event_wait(evAny, kLongNs) == DMN_WAIT_SIGNALED,
+            EXPECT(dmn_event_wait(evAny, kLongNs) == DXN_WAIT_SIGNALED,
                    "ANY wait did not fire on the imported fence");
             dmn_event_close(evAny);
             printf("FEVENTS: multi-fence waits ok (value %llu)\n",
@@ -194,7 +194,7 @@ after_multi:
         v++;
         CK(imp11->SetEventOnCompletion(v, ev11), "D3D11 SetEventOnCompletion");
         CK(queue->Signal(prod.ptr(), v), "queue Signal");
-        EXPECT(dmn_event_wait(ev11, kLongNs) == DMN_WAIT_SIGNALED,
+        EXPECT(dmn_event_wait(ev11, kLongNs) == DXN_WAIT_SIGNALED,
                "D3D11 import event did not fire");
         dmn_event_close(ev11);
         printf("FEVENTS: cross-API import event ok (value %llu)\n",
@@ -218,7 +218,7 @@ after_xapi:
         pfd = {fd, POLLIN, 0};
         EXPECT(poll(&pfd, 1, 10000) == 1 && (pfd.revents & POLLIN),
                "event fd never became readable on fence completion");
-        EXPECT(dmn_event_wait(ev, 0) == DMN_WAIT_SIGNALED,
+        EXPECT(dmn_event_wait(ev, 0) == DXN_WAIT_SIGNALED,
                "event not signaled alongside the readable fd");
         close(fd);
         dmn_event_close(ev);
@@ -256,7 +256,7 @@ after_xapi:
             EXPECT(poll(&pfd, 1, 10000) == 1 && (pfd.revents & POLLIN),
                    "event fd never became readable on multi-fence completion "
                    "(DuplicateEvent dropped the exported pipe)");
-            EXPECT(dmn_event_wait(ev, 0) == DMN_WAIT_SIGNALED,
+            EXPECT(dmn_event_wait(ev, 0) == DXN_WAIT_SIGNALED,
                    "event not signaled alongside the readable fd");
             close(fd);
             dmn_event_close(ev);
@@ -280,7 +280,7 @@ after_xapi:
             ID3D12Fence* f = (i & 1) ? imp.ptr() : prod.ptr();
             CK(f->SetEventOnCompletion(v, ev), "SetEventOnCompletion(close-race)");
             CK(queue->Signal(prod.ptr(), v), "queue Signal(close-race)");
-            EXPECT(dmn_event_wait(ev, kLongNs) == DMN_WAIT_SIGNALED,
+            EXPECT(dmn_event_wait(ev, kLongNs) == DXN_WAIT_SIGNALED,
                    "close-race event did not fire");
             dmn_event_close(ev); /* watcher may not have signaled yet */
         }
@@ -290,7 +290,7 @@ after_xapi:
             v++;
             CK(prod->SetEventOnCompletion(v, ev), "SetEventOnCompletion(drain)");
             CK(queue->Signal(prod.ptr(), v), "queue Signal(drain)");
-            EXPECT(dmn_event_wait(ev, kLongNs) == DMN_WAIT_SIGNALED, "drain event");
+            EXPECT(dmn_event_wait(ev, kLongNs) == DXN_WAIT_SIGNALED, "drain event");
             dmn_event_close(ev);
         }
         printf("FEVENTS: event closed right after completion, %d rounds ok\n", 100);

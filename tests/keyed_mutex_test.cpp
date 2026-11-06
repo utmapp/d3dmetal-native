@@ -92,15 +92,24 @@ int producer(int sock) {
                 "not vended\n");
         return 1;
     }
-    dmn_shared_texture_handle pod;
+    dxn_shared_texture pod;
     memcpy(&pod, h, sizeof(pod));
     if (!send_with_fd(sock, &pod, sizeof(pod), pod.fd)) {
         fprintf(stderr, "KMUTEX: prod send FAILED: %s\n", strerror(errno));
         return 1;
     }
-    volatile uint32_t* counter = map_counter(pod.fd, pod.stride * kH);
+    volatile uint32_t* counter = map_counter(pod.fd, pod.planes[0].pitch * kH);
     if (!counter) { fprintf(stderr, "KMUTEX: prod map FAILED\n"); return 1; }
     counter[0] = 0;
+
+    /* IDXGIKeyedMutex::ReleaseSync: releasing a mutex the device does not
+     * own returns E_FAIL. */
+    HRESULT unowned = km->ReleaseSync(kKeyC);
+    if (unowned != E_FAIL) {
+        fprintf(stderr, "KMUTEX: unowned ReleaseSync returned 0x%08x, "
+                "expected E_FAIL\n", (unsigned)unowned);
+        return 1;
+    }
 
     for (int r = 0; r < kRounds; r++) {
         uint64_t key = (r == 0) ? kKeyStart : kKeyP;
@@ -128,13 +137,13 @@ int consumer(int sock) {
     Com<ID3D11Device> dev = make_device();
     if (!dev) { fprintf(stderr, "KMUTEX: cons device FAILED\n"); return 1; }
 
-    dmn_shared_texture_handle pod;
+    dxn_shared_texture pod;
     int fd = -1;
     if (!recv_with_fd(sock, &pod, sizeof(pod), &fd)) {
         fprintf(stderr, "KMUTEX: cons recv FAILED\n"); return 1;
     }
     pod.fd = fd;
-    if (pod.magic != DMN_SHARED_TEXTURE_MAGIC) {
+    if (pod.magic != DXN_SHARED_TEXTURE_MAGIC) {
         fprintf(stderr, "KMUTEX: cons bad magic 0x%08x\n", pod.magic); return 1;
     }
     Com<ID3D11Texture2D> tex;
@@ -146,7 +155,7 @@ int consumer(int sock) {
     if (FAILED(tex->QueryInterface(__uuidof(IDXGIKeyedMutex), (void**)&km)) || !km) {
         fprintf(stderr, "KMUTEX: cons QI(IDXGIKeyedMutex) FAILED\n"); return 1;
     }
-    volatile uint32_t* counter = map_counter(pod.fd, pod.stride * kH);
+    volatile uint32_t* counter = map_counter(pod.fd, pod.planes[0].pitch * kH);
     if (!counter) { fprintf(stderr, "KMUTEX: cons map FAILED\n"); return 1; }
 
     for (int r = 0; r < kRounds; r++) {

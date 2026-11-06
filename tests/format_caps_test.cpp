@@ -169,11 +169,11 @@ int main(){
         D3D11_FORMAT_SUPPORT_SHADER_SAMPLE|D3D11_FORMAT_SUPPORT_RENDER_TARGET|
         D3D11_FORMAT_SUPPORT_BLENDABLE,0);
 
-    // Packed 16-bit formats are resolvable but not shader-writable.
+    // Packed 16-bit formats are resolvable and take typed UAVs, as on WARP.
     expect_bits(dev.ptr(),DXGI_FORMAT_B5G6R5_UNORM,"B5G6R5_UNORM",
         D3D11_FORMAT_SUPPORT_RENDER_TARGET|D3D11_FORMAT_SUPPORT_BLENDABLE|
-        D3D11_FORMAT_SUPPORT_MULTISAMPLE_RESOLVE,
-        D3D11_FORMAT_SUPPORT_TYPED_UNORDERED_ACCESS_VIEW);
+        D3D11_FORMAT_SUPPORT_MULTISAMPLE_RESOLVE|
+        D3D11_FORMAT_SUPPORT_TYPED_UNORDERED_ACCESS_VIEW,0);
 
     // Integer formats: writable and MSAA-able, never blendable or resolvable.
     expect_bits(dev.ptr(),DXGI_FORMAT_R32G32B32A32_UINT,"RGBA32_UINT",
@@ -255,6 +255,17 @@ int main(){
         D3D11_FEATURE_DATA_D3D11_OPTIONS o={};
         HRESULT hr=dev->CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS,&o,sizeof(o));
         expect(hr==S_OK,"D3D11_OPTIONS forwards to D3DMetal");
+    }
+
+    // A texture in a format Metal has no pixel format for is refused, not
+    // handed to D3DMetal, whose descriptor validation aborts the process.
+    for(DXGI_FORMAT f : {DXGI_FORMAT_YUY2,DXGI_FORMAT_NV12,DXGI_FORMAT_P8}){
+        D3D11_TEXTURE2D_DESC td={};
+        td.Width=64; td.Height=64; td.MipLevels=1; td.ArraySize=1; td.Format=f;
+        td.SampleDesc.Count=1; td.Usage=D3D11_USAGE_DEFAULT; td.BindFlags=D3D11_BIND_SHADER_RESOURCE;
+        Com<ID3D11Texture2D> t;
+        HRESULT hr=dev->CreateTexture2D(&td,nullptr,&t);
+        if(hr!=E_INVALIDARG){ printf("FAIL CreateTexture2D format %d: hr=0x%08x\n",(int)f,hr); g_fail++; }
     }
 
     // A null out pointer is an error, not a crash.
@@ -351,6 +362,35 @@ int main(){
                 D3D12_RESOURCE_STATE_COMMON,nullptr,__uuidof(ID3D12Resource),(void**)&res);
             expect(hr==E_INVALIDARG&&!res,"D3D12 YUY2 committed create is E_INVALIDARG");
             if(res) res->Release();
+
+            // Every CreateReservedResource variant refuses it too.
+            {
+                D3D12_RESOURCE_DESC rr=rd;
+                rr.Layout=D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
+                res=nullptr;
+                hr=d12->CreateReservedResource(&rr,D3D12_RESOURCE_STATE_COMMON,nullptr,
+                    __uuidof(ID3D12Resource),(void**)&res);
+                expect(hr==E_INVALIDARG&&!res,"D3D12 YUY2 reserved create is E_INVALIDARG");
+                if(res) res->Release();
+                Com<ID3D12Device4> r4;
+                if(SUCCEEDED(d12->QueryInterface(__uuidof(ID3D12Device4),(void**)&r4))){
+                    res=nullptr;
+                    hr=r4->CreateReservedResource1(&rr,D3D12_RESOURCE_STATE_COMMON,nullptr,
+                        nullptr,__uuidof(ID3D12Resource),(void**)&res);
+                    expect(hr==E_INVALIDARG&&!res,"D3D12 YUY2 reserved create 1 is E_INVALIDARG");
+                    if(res) res->Release();
+                }
+                Com<ID3D12Device10> r10;
+                if(SUCCEEDED(d12->QueryInterface(__uuidof(ID3D12Device10),(void**)&r10))){
+                    res=nullptr;
+                    hr=r10->CreateReservedResource2(&rr,0 /* D3D12_BARRIER_LAYOUT_COMMON */,
+                        nullptr,nullptr,0,nullptr,__uuidof(ID3D12Resource),(void**)&res);
+                    expect(hr==E_INVALIDARG&&!res,"D3D12 YUY2 reserved create 2 is E_INVALIDARG");
+                    if(res) res->Release();
+                } else {
+                    expect(false,"ID3D12Device10 exposed");
+                }
+            }
 
             // The newer allocation-info entry points get the same refusal,
             // and still answer a supported description.

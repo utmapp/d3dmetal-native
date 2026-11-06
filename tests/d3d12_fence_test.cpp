@@ -53,7 +53,7 @@ int main() {
     CK(device->CreateSharedHandle(fence.ptr(), nullptr, 0, nullptr, &fenceH),
        "CreateSharedHandle");
     if (!fenceH ||
-        ((const dmn_shared_fence_handle*)fenceH)->magic != DMN_SHARED_FENCE_MAGIC) {
+        ((const dxn_shared_fence*)fenceH)->magic != DXN_SHARED_FENCE_MAGIC) {
         fprintf(stderr, "FENCE12: CreateSharedHandle did not return a fence POD\n");
         return 1;
     }

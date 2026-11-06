@@ -55,6 +55,10 @@ your app ──> libd3dmetal-native.dylib ──> D3DMetal.framework ──> Met
   compilation, including pipeline streams and library loads. Shader-model
   and DXIL versions remain unchanged; no per-game shader replacements are
   needed.
+- **In-driver DXIL subroutines**: internal functions left by D3D12's
+  in-driver DXBC conversion are inlined for shader kinds 0 through 5 only in
+  one-DXIL-part, zero-digest containers. The normalizer covers direct, stream,
+  and pipeline-library creates and loads.
 - **Registry pre-seeding** (`dmn_registry_set_*`) and per-value environment
   overrides for the settings D3DMetal reads.
 - **Executable-path override** (`dmn_set_executable_path`) so D3DMetal's

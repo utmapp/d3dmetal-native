@@ -206,19 +206,19 @@ int main() {
     HANDLE h = nullptr;
     CK(dev->CreateSharedHandle(comp.ptr(), nullptr, 0, nullptr, &h),
        "CreateSharedHandle(companion)");
-    dmn_shared_texture_handle* pod = (dmn_shared_texture_handle*)h;
-    EXPECT(pod && pod->magic == DMN_SHARED_TEXTURE_MAGIC,
+    dxn_shared_texture* pod = (dxn_shared_texture*)h;
+    EXPECT(pod && pod->magic == DXN_SHARED_TEXTURE_MAGIC,
            "exported handle is not a texture POD");
-    EXPECT(pod->width == kW && pod->height == kH,
+    EXPECT(pod->meta.width == kW && pod->meta.height == kH,
            "POD dims mismatch");
-    EXPECT(pod->stride >= kPitch, "POD stride smaller than a packed row");
-    const size_t mapLen = (size_t)(pod->offset + pod->stride * kH);
+    EXPECT(pod->planes[0].pitch >= kPitch, "POD stride smaller than a packed row");
+    const size_t mapLen = (size_t)(pod->planes[0].offset + pod->planes[0].pitch * kH);
     void* m = mmap(nullptr, mapLen, PROT_READ, MAP_SHARED, pod->fd, 0);
     EXPECT(m != MAP_FAILED, "mmap(companion fd) failed");
-    const uint8_t* base = (const uint8_t*)m + pod->offset;
+    const uint8_t* base = (const uint8_t*)m + pod->planes[0].offset;
     unsigned bad = 0;
     for (unsigned y = 0; y < kH && bad < 8; y += 37) {
-        const uint32_t* row = (const uint32_t*)(base + (size_t)y * pod->stride);
+        const uint32_t* row = (const uint32_t*)(base + (size_t)y * pod->planes[0].pitch);
         for (unsigned x = 0; x < kW && bad < 8; x += 41) {
             const uint32_t want = pattern_at(x, y);
             if (row[x] != want) {
@@ -236,7 +236,7 @@ int main() {
         for (unsigned iy = 0; iy < 2 && bad < 8; iy++)
             for (unsigned ix = 0; ix < 2 && bad < 8; ix++) {
                 const uint32_t* row =
-                    (const uint32_t*)(base + (size_t)ys[iy] * pod->stride);
+                    (const uint32_t*)(base + (size_t)ys[iy] * pod->planes[0].pitch);
                 if (row[xs[ix]] != pattern_at(xs[ix], ys[iy])) {
                     fprintf(stderr,
                             "PRESENTCOPY: corner (%u,%u) = 0x%08x want 0x%08x\n",
@@ -250,7 +250,7 @@ int main() {
     EXPECT(bad == 0, "companion bytes do not match the native source");
 
     printf("PRESENTCOPY: copy native->substituted 1280x720 verified "
-           "(stride=%llu)\n", (unsigned long long)pod->stride);
+           "(stride=%llu)\n", (unsigned long long)pod->planes[0].pitch);
     dmn_shared_handle_close(h);
     T_PASS();
     return 0;

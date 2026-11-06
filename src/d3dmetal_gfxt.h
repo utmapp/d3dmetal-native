@@ -163,8 +163,8 @@ public:
     virtual bool windowsToUnixPath(const char16_t* in, char* out, size_t* inOutBytes) = 0;
     virtual bool unixToWindowsPath(const char* in, char16_t* out, size_t* inOutChars) = 0;
     virtual bool windowsSystemDirectoryPath(char16_t* out, size_t* inOutChars) = 0;
-    virtual void getExecutablePath(char* out, uint32_t bytes) = 0;
-    virtual void getModulePath(void* module, char* out, uint32_t bytes) = 0;
+    virtual uint32_t getExecutablePath(char* out, uint32_t bytes) = 0;
+    virtual uint32_t getModulePath(void* module, char* out, uint32_t bytes) = 0;
 };
 
 class GFXTAllocationInterface {

@@ -18,3 +18,8 @@ _DXGIDeclareAdapterRemovalSupport
 _D3DCompile
 _D3DCompileFromFile
 _D3D10CreateBlob
+# Public-API replacements for D3DMetal's private imports (dmn_import_shims.mm).
+# The dmn_* functions are covered above; the class is bound by name from a
+# D3DMetal patched with scripts/patch_d3dmetal_imports.py.
+_OBJC_CLASS_$_DMNAccelerationStructureAllocationDescriptor
+_OBJC_METACLASS_$_DMNAccelerationStructureAllocationDescriptor

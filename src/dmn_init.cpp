@@ -241,6 +241,9 @@ dmn_result init_locked(const dmn_options* options) {
 const std::string& dmn_framework_binary_path() { return g_framework_binary; }
 const std::string& dmn_framework_resources_dir() { return g_resources_dir; }
 
+/* The embedder's check that this library and it agree on directx-native. */
+extern "C" DXN_DEFINE_NATIVE_ABI_VERSION(dmn_)
+
 extern "C" dmn_result dmn_init(const dmn_options* options) {
     std::lock_guard<std::mutex> lock(g_init_mutex);
     if (g_initialized)

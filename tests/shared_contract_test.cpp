@@ -25,10 +25,8 @@
  *      — then exported — the whole pool. A peer reading offset 0 of that gets
  *      the wrong bytes. Lower bounds alone cannot see it (a pool covers any
  *      surface), so the geometry is bounded from above as well.
- *   5. A view that names a slice the substituted Metal texture lacks (a
- *      MISC_SHARED array texture is backed single-slice) is clamped, not
- *      fatal: Metal would otherwise abort the whole process inside the view
- *      create.
+ *   5. A shape the single linear surface cannot carry (mips, slices, MSAA)
+ *      fails the create, and ExtendedResourceSharing says so up front.
  *
  * Same-process throughout: opening a handle this process exported exercises
  * exactly the consumer path, and none of these assertions are about data
@@ -73,24 +71,27 @@ D3D11_TEXTURE2D_DESC shared_desc(UINT w, UINT h, DXGI_FORMAT fmt, UINT bind) {
 
 /* Export a shared texture's POD. The HANDLE our IDXGIResource::GetSharedHandle
  * vends is the POD bytes themselves. */
-bool export_pod(ID3D11Texture2D* tex, dmn_shared_texture_handle* out) {
+bool export_pod(ID3D11Texture2D* tex, dxn_shared_texture* out) {
     Com<IDXGIResource> res;
     HANDLE h = nullptr;
     if (FAILED(tex->QueryInterface(__uuidof(IDXGIResource), (void**)&res)) ||
         FAILED(res->GetSharedHandle(&h)) || !h)
         return false;
     memcpy(out, h, sizeof(*out));
-    return out->magic == DMN_SHARED_TEXTURE_MAGIC;
+    /* The whole directx-native contract, as every peer (the Neptune render
+     * server, DXMT) validates it: a shm texture is one linear plane. */
+    return dxn_shared_check(out, DXN_SHARED_TEXTURE_MAGIC, sizeof(*out)) &&
+           out->plane_count == 1 && out->planes[0].pitch != 0;
 }
 
-bool export_buffer_pod(ID3D11Buffer* buf, dmn_shared_buffer_handle* out) {
+bool export_buffer_pod(ID3D11Buffer* buf, dxn_shared_buffer* out) {
     Com<IDXGIResource> res;
     HANDLE h = nullptr;
     if (FAILED(buf->QueryInterface(__uuidof(IDXGIResource), (void**)&res)) ||
         FAILED(res->GetSharedHandle(&h)) || !h)
         return false;
     memcpy(out, h, sizeof(*out));
-    return out->magic == DMN_SHARED_BUFFER_MAGIC;
+    return dxn_shared_check(out, DXN_SHARED_BUFFER_MAGIC, sizeof(*out));
 }
 
 /* == 1. Unshareable formats fail the create ============================== */
@@ -134,10 +135,10 @@ int test_import_validation(ID3D11Device* dev) {
     Com<ID3D11Texture2D> src;
     CK(dev->CreateTexture2D(&td, nullptr, &src), "control shared create");
 
-    dmn_shared_texture_handle pod{};
+    dxn_shared_texture pod{};
     EXPECT(export_pod(src.ptr(), &pod), "control export");
-    EXPECT(pod.stride >= 256u * 4u, "exported stride covers a row");
-    EXPECT(pod.size >= pod.stride * 256u, "exported size covers the surface");
+    EXPECT(pod.planes[0].pitch >= 256u * 4u, "exported stride covers a row");
+    EXPECT(pod.size >= pod.planes[0].pitch * 256u, "exported size covers the surface");
 
     /* Control: the untouched handle must open, or the negatives below prove
      * nothing. */
@@ -156,13 +157,13 @@ int test_import_validation(ID3D11Device* dev) {
     } bad[] = {
         { "stride 0",              0,             pod.size },
         { "stride under one row",  16,            pod.size },
-        { "size 0",                pod.stride,    0 },
-        { "size under the surface",pod.stride,    pod.stride * 4 },
-        { "size past any surface", pod.stride,    (uint64_t)1 << 40 },
+        { "size 0",                pod.planes[0].pitch,    0 },
+        { "size under the surface",pod.planes[0].pitch,    pod.planes[0].pitch * 4 },
+        { "size past any surface", pod.planes[0].pitch,    (uint64_t)1 << 40 },
     };
     for (const auto& b : bad) {
-        dmn_shared_texture_handle corrupt = pod;
-        corrupt.stride = b.stride;
+        dxn_shared_texture corrupt = pod;
+        corrupt.planes[0].pitch = b.stride;
         corrupt.size = b.size;
         Com<ID3D11Texture2D> opened;
         HRESULT hr = dev->OpenSharedResource(
@@ -216,27 +217,27 @@ int test_export_geometry(ID3D11Device* dev) {
                         D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET);
         Com<ID3D11Texture2D> tex;
         CK(dev->CreateTexture2D(&td, nullptr, &tex), "shared texture create");
-        dmn_shared_texture_handle pod{};
+        dxn_shared_texture pod{};
         EXPECT(export_pod(tex.ptr(), &pod), "texture export");
 
-        EXPECT(pod.stride >= row, "exported stride covers a row");
-        if (pod.stride > row + page) {
+        EXPECT(pod.planes[0].pitch >= row, "exported stride covers a row");
+        if (pod.planes[0].pitch > row + page) {
             fprintf(stderr, T_TAG ": exported stride %llu for a %llu-byte row — "
                     "this is not a %ux%u surface's own backing\n",
-                    (unsigned long long)pod.stride, (unsigned long long)row,
+                    (unsigned long long)pod.planes[0].pitch, (unsigned long long)row,
                     kW, kH);
             return 1;
         }
         /* The POD's documented meaning: stride*height, not page-padded. */
-        if (pod.size != pod.stride * kH) {
+        if (pod.size != pod.planes[0].pitch * kH) {
             fprintf(stderr, T_TAG ": exported size %llu != stride %llu * height "
                     "%u\n", (unsigned long long)pod.size,
-                    (unsigned long long)pod.stride, kH);
+                    (unsigned long long)pod.planes[0].pitch, kH);
             return 1;
         }
         printf(T_TAG ": exported texture geometry describes the texture "
                "(stride=%llu size=%llu): OK\n",
-               (unsigned long long)pod.stride, (unsigned long long)pod.size);
+               (unsigned long long)pod.planes[0].pitch, (unsigned long long)pod.size);
     }
 
     {
@@ -250,7 +251,7 @@ int test_export_geometry(ID3D11Device* dev) {
         bd.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
         Com<ID3D11Buffer> buf;
         CK(dev->CreateBuffer(&bd, nullptr, &buf), "shared buffer create");
-        dmn_shared_buffer_handle pod{};
+        dxn_shared_buffer pod{};
         EXPECT(export_buffer_pod(buf.ptr(), &pod), "buffer export");
 
         EXPECT(pod.size >= kBytes, "exported size covers the buffer");
@@ -269,55 +270,58 @@ int test_export_geometry(ID3D11Device* dev) {
     return 0;
 }
 
-/* 5. A view outside the substituted texture must not abort the process. The
- * substitution backs a MISC_SHARED array texture with a single-slice linear
- * texture, so a view of slice 1 — valid for the resource the app created —
- * names a slice the Metal object lacks. Metal aborts on that; the guard clamps
- * the view instead, so both view creates return and the process survives. */
-int test_array_view_clamped(ID3D11Device* dev, ID3D11DeviceContext* ctx) {
-    D3D11_TEXTURE2D_DESC td = shared_desc(64, 64, DXGI_FORMAT_B8G8R8A8_UNORM,
-                                          D3D11_BIND_RENDER_TARGET |
-                                              D3D11_BIND_SHADER_RESOURCE);
-    td.ArraySize = 2;
-    Com<ID3D11Texture2D> tex;
-    HRESULT hr = dev->CreateTexture2D(&td, nullptr, &tex);
-    if (FAILED(hr)) {
-        printf(T_TAG ": MISC_SHARED array texture rejected (0x%08x); view "
-               "clamp not exercised\n", (unsigned)hr);
-        return 0;
+/* 5. A shape the linear surface cannot carry fails the create. The surface
+ * is one level, one slice and one sample; a mipped, array or MSAA shared
+ * texture used to "succeed" over a single-subresource substitute that
+ * D3DMetal then addressed past. ExtendedResourceSharing, which promises
+ * those shapes, must read FALSE accordingly. */
+int test_reject_unshareable_shapes(ID3D11Device* dev) {
+    const struct {
+        UINT mips, array, samples;
+        const char* name;
+    } cases[] = {
+        { 0, 1, 1, "full mip chain" },
+        { 2, 1, 1, "2 mips" },
+        { 1, 2, 1, "2 slices" },
+        { 1, 1, 4, "4x MSAA" },
+    };
+    for (const auto& c : cases) {
+        D3D11_TEXTURE2D_DESC td = shared_desc(64, 64, DXGI_FORMAT_B8G8R8A8_UNORM,
+                                              D3D11_BIND_RENDER_TARGET |
+                                                  D3D11_BIND_SHADER_RESOURCE);
+        td.MipLevels = c.mips;
+        td.ArraySize = c.array;
+        td.SampleDesc.Count = c.samples;
+        Com<ID3D11Texture2D> tex;
+        HRESULT hr = dev->CreateTexture2D(&td, nullptr, &tex);
+        if (SUCCEEDED(hr)) {
+            fprintf(stderr, T_TAG ": MISC_SHARED %s create SUCCEEDED; the "
+                    "shared surface cannot carry that shape\n", c.name);
+            return 1;
+        }
+        printf(T_TAG ": MISC_SHARED %s rejected (0x%08x): OK\n", c.name,
+               (unsigned)hr);
     }
-    D3D11_RENDER_TARGET_VIEW_DESC rv{};
-    rv.Format = td.Format;
-    rv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DARRAY;
-    rv.Texture2DArray.FirstArraySlice = 1;
-    rv.Texture2DArray.ArraySize = 1;
-    Com<ID3D11RenderTargetView> rtv;
-    if (FAILED(dev->CreateRenderTargetView(tex.ptr(), &rv, &rtv)) || !rtv) {
-        fprintf(stderr, T_TAG ": RTV of slice 1 on a shared array texture "
-                "FAILED\n");
+    D3D11_TEXTURE3D_DESC vd{};
+    vd.Width = vd.Height = vd.Depth = 16;
+    vd.MipLevels = 1;
+    vd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    vd.Usage = D3D11_USAGE_DEFAULT;
+    vd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    vd.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
+    Com<ID3D11Texture3D> vol;
+    if (SUCCEEDED(dev->CreateTexture3D(&vd, nullptr, &vol))) {
+        fprintf(stderr, T_TAG ": MISC_SHARED Texture3D create SUCCEEDED; D3D11 "
+                "shares only 2D textures\n");
         return 1;
     }
-    const float c[4] = {1.0f, 0.0f, 0.0f, 1.0f};
-    ctx->ClearRenderTargetView(rtv.ptr(), c);
-    D3D11_SHADER_RESOURCE_VIEW_DESC sv{};
-    sv.Format = td.Format;
-    sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
-    sv.Texture2DArray.FirstArraySlice = 1;
-    sv.Texture2DArray.ArraySize = 1;
-    sv.Texture2DArray.MipLevels = 1;
-    Com<ID3D11ShaderResourceView> srv;
-    if (FAILED(dev->CreateShaderResourceView(tex.ptr(), &sv, &srv)) || !srv) {
-        fprintf(stderr, T_TAG ": SRV of slice 1 on a shared array texture "
-                "FAILED\n");
+    D3D11_FEATURE_DATA_D3D11_OPTIONS opt{};
+    if (SUCCEEDED(dev->CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS, &opt,
+                                           sizeof(opt))) &&
+        opt.ExtendedResourceSharing) {
+        fprintf(stderr, T_TAG ": ExtendedResourceSharing reported TRUE\n");
         return 1;
     }
-    /* Retire the clear rather than merely flushing it: some framework
-     * versions stall process exit for tens of seconds when a flushed command
-     * buffer is never waited on. */
-    if (!t_gpu_queue_alive_d3d11(dev, ctx, 10000))
-        return 1;
-    printf(T_TAG ": out-of-range views on a shared array texture are "
-           "clamped, not fatal: OK\n");
     return 0;
 }
 
@@ -343,7 +347,7 @@ int main() {
         return 1;
     if (test_export_geometry(dev.ptr()) != 0)
         return 1;
-    if (test_array_view_clamped(dev.ptr(), ctx.ptr()) != 0)
+    if (test_reject_unshareable_shapes(dev.ptr()) != 0)
         return 1;
 
     T_PASS();

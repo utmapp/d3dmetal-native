@@ -108,7 +108,7 @@ int test_d3d11() {
         fprintf(stderr, "REEXPORT: D3D11 export FAILED\n");
         return 1;
     }
-    dmn_shared_texture_handle podA;
+    dxn_shared_texture podA;
     memcpy(&podA, h, sizeof(podA));
 
     /* Legacy handle: dmn_shared_handle_close must reject it untouched. */
@@ -146,9 +146,9 @@ int test_d3d11() {
         fprintf(stderr, "REEXPORT: D3D11 re-export after creator release FAILED\n");
         return 1;
     }
-    dmn_shared_texture_handle podB;
+    dxn_shared_texture podB;
     memcpy(&podB, h2, sizeof(podB));
-    bool ok = podB.magic == DMN_SHARED_TEXTURE_MAGIC &&
+    bool ok = podB.magic == DXN_SHARED_TEXTURE_MAGIC &&
               check_reexport_fd("D3D11", podB.fd, podB.size,
                                 reinterpret_cast<volatile uint32_t*>(viewA));
     munmap(viewA, (size_t)podA.size);
@@ -202,7 +202,7 @@ int test_d3d12() {
         fprintf(stderr, "REEXPORT: D3D12 export FAILED\n");
         return 1;
     }
-    dmn_shared_texture_handle podA;
+    dxn_shared_texture podA;
     memcpy(&podA, h, sizeof(podA));
 
     Com<ID3D12Resource> opened;
@@ -234,9 +234,9 @@ int test_d3d12() {
         fprintf(stderr, "REEXPORT: D3D12 re-export after creator release FAILED\n");
         return 1;
     }
-    dmn_shared_texture_handle podB;
+    dxn_shared_texture podB;
     memcpy(&podB, h2, sizeof(podB));
-    bool ok = podB.magic == DMN_SHARED_TEXTURE_MAGIC &&
+    bool ok = podB.magic == DXN_SHARED_TEXTURE_MAGIC &&
               check_reexport_fd("D3D12", podB.fd, podB.size,
                                 reinterpret_cast<volatile uint32_t*>(viewA));
     munmap(viewA, (size_t)podA.size);

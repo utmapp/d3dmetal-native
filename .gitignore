@@ -7,3 +7,7 @@ build*/
 
 # Apple-licensed, obtained from the Game Porting Toolkit; never committed
 D3DMetal.framework/
+
+# directx-native checkout (meson wrap-git)
+/subprojects/directx-native
+/subprojects/.wraplock

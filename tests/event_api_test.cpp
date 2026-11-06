@@ -42,12 +42,12 @@ int main() {
     {
         void* ev = dmn_event_create(0, 0);
         EXPECT(ev, "auto-reset create failed");
-        EXPECT(dmn_event_wait(ev, kShortNs) == DMN_WAIT_TIMEOUT,
+        EXPECT(dmn_event_wait(ev, kShortNs) == DXN_WAIT_TIMEOUT,
                "unsignaled auto event did not time out");
         dmn_event_signal(ev);
-        EXPECT(dmn_event_wait(ev, kLongNs) == DMN_WAIT_SIGNALED,
+        EXPECT(dmn_event_wait(ev, kLongNs) == DXN_WAIT_SIGNALED,
                "signaled auto event did not release the wait");
-        EXPECT(dmn_event_wait(ev, kShortNs) == DMN_WAIT_TIMEOUT,
+        EXPECT(dmn_event_wait(ev, kShortNs) == DXN_WAIT_TIMEOUT,
                "auto event was not consumed by the wait");
         dmn_event_close(ev);
         printf("EVENTS: auto-reset ok\n");
@@ -58,11 +58,11 @@ int main() {
         void* evAuto = dmn_event_create(0, 1);
         void* evMan = dmn_event_create(1, 1);
         EXPECT(evAuto && evMan, "initial-state create failed");
-        EXPECT(dmn_event_wait(evAuto, kShortNs) == DMN_WAIT_SIGNALED,
+        EXPECT(dmn_event_wait(evAuto, kShortNs) == DXN_WAIT_SIGNALED,
                "initially-signaled auto event not signaled");
-        EXPECT(dmn_event_wait(evAuto, kShortNs) == DMN_WAIT_TIMEOUT,
+        EXPECT(dmn_event_wait(evAuto, kShortNs) == DXN_WAIT_TIMEOUT,
                "initially-signaled auto event not consumed");
-        EXPECT(dmn_event_wait(evMan, kShortNs) == DMN_WAIT_SIGNALED,
+        EXPECT(dmn_event_wait(evMan, kShortNs) == DXN_WAIT_SIGNALED,
                "initially-signaled manual event not signaled");
         dmn_event_close(evAuto);
         dmn_event_close(evMan);
@@ -75,15 +75,15 @@ int main() {
         void* ev = dmn_event_create(1, 0);
         EXPECT(ev, "manual-reset create failed");
         dmn_event_signal(ev);
-        EXPECT(dmn_event_wait(ev, kLongNs) == DMN_WAIT_SIGNALED,
+        EXPECT(dmn_event_wait(ev, kLongNs) == DXN_WAIT_SIGNALED,
                "manual event did not release the first wait");
-        EXPECT(dmn_event_wait(ev, kShortNs) == DMN_WAIT_SIGNALED,
+        EXPECT(dmn_event_wait(ev, kShortNs) == DXN_WAIT_SIGNALED,
                "manual event did not stay signaled");
         dmn_event_clear(ev);
-        EXPECT(dmn_event_wait(ev, kShortNs) == DMN_WAIT_TIMEOUT,
+        EXPECT(dmn_event_wait(ev, kShortNs) == DXN_WAIT_TIMEOUT,
                "cleared manual event still signaled");
         dmn_event_signal(ev);
-        EXPECT(dmn_event_wait(ev, kLongNs) == DMN_WAIT_SIGNALED,
+        EXPECT(dmn_event_wait(ev, kLongNs) == DXN_WAIT_SIGNALED,
                "signal after clear did not release the wait");
         dmn_event_close(ev);
         printf("EVENTS: manual-reset ok\n");
@@ -96,10 +96,10 @@ int main() {
         EXPECT(ev, "create failed");
         std::atomic<int> signaled{0}, timed_out{0};
         auto waiter = [&] {
-            dmn_wait_status s = dmn_event_wait(ev, 1500ull * 1000 * 1000);
-            if (s == DMN_WAIT_SIGNALED)
+            dxn_wait_status s = dmn_event_wait(ev, 1500ull * 1000 * 1000);
+            if (s == DXN_WAIT_SIGNALED)
                 signaled.fetch_add(1);
-            else if (s == DMN_WAIT_TIMEOUT)
+            else if (s == DXN_WAIT_TIMEOUT)
                 timed_out.fetch_add(1);
         };
         std::thread t1(waiter), t2(waiter);
@@ -148,7 +148,7 @@ int main() {
         EXPECT(fd >= 0, "dup_fd failed");
         dmn_event_signal(ev);
         EXPECT(fd_readable(fd, 1000), "fd not readable after signal");
-        EXPECT(dmn_event_wait(ev, kLongNs) == DMN_WAIT_SIGNALED,
+        EXPECT(dmn_event_wait(ev, kLongNs) == DXN_WAIT_SIGNALED,
                "wait did not consume the signal");
         EXPECT(!fd_readable(fd, 0),
                "fd readable after an auto-reset wait consumed the signal");
@@ -181,13 +181,13 @@ int main() {
         int fd = dmn_event_dup_fd(ev);
         EXPECT(fd >= 0, "dup_fd failed");
         EXPECT(fd_readable(fd, 1000), "fd not primed for a pre-signaled auto-reset event");
-        EXPECT(dmn_event_wait(ev, kShortNs) == DMN_WAIT_SIGNALED,
+        EXPECT(dmn_event_wait(ev, kShortNs) == DXN_WAIT_SIGNALED,
                "priming the fd consumed the auto-reset trigger");
         EXPECT(!fd_readable(fd, 0), "fd readable after the wait consumed the trigger");
         dmn_event_signal(ev);
         dmn_event_signal(ev); /* second signal while still signaled */
-        EXPECT(dmn_event_wait(ev, kShortNs) == DMN_WAIT_SIGNALED, "wait after double signal");
-        EXPECT(dmn_event_wait(ev, kShortNs) == DMN_WAIT_TIMEOUT,
+        EXPECT(dmn_event_wait(ev, kShortNs) == DXN_WAIT_SIGNALED, "wait after double signal");
+        EXPECT(dmn_event_wait(ev, kShortNs) == DXN_WAIT_TIMEOUT,
                "auto-reset released a second waiter for one signaled state");
         EXPECT(!fd_readable(fd, 0), "fd readable after the state was consumed");
         close(fd);
@@ -205,15 +205,15 @@ int main() {
         void* dup = dmn_event_duplicate(ev);
         EXPECT(dup && dup != ev, "duplicate failed");
         dmn_event_signal(dup);
-        EXPECT(dmn_event_wait(ev, kShortNs) == DMN_WAIT_SIGNALED,
+        EXPECT(dmn_event_wait(ev, kShortNs) == DXN_WAIT_SIGNALED,
                "signal through the duplicate not seen by the original");
         dmn_event_clear(ev);
-        EXPECT(dmn_event_wait(dup, kShortNs) == DMN_WAIT_TIMEOUT,
+        EXPECT(dmn_event_wait(dup, kShortNs) == DXN_WAIT_TIMEOUT,
                "clear through the original not seen by the duplicate");
         int fd = dmn_event_dup_fd(ev);
         dmn_event_close(ev); /* the owner is done with it */
         dmn_event_signal(dup);
-        EXPECT(dmn_event_wait(dup, kShortNs) == DMN_WAIT_SIGNALED,
+        EXPECT(dmn_event_wait(dup, kShortNs) == DXN_WAIT_SIGNALED,
                "duplicate dead after the original was closed");
         EXPECT(fd_readable(fd, 1000), "fd taken from the original missed a signal via the duplicate");
         close(fd);
@@ -229,9 +229,9 @@ int main() {
         EXPECT(dmn_event_dup_fd(&bogus) == -1, "dup_fd accepted a non-event");
         dmn_event_signal(&bogus); /* no-op */
         dmn_event_clear(&bogus);  /* no-op */
-        EXPECT(dmn_event_wait(&bogus, 0) == DMN_WAIT_FAILED,
+        EXPECT(dmn_event_wait(&bogus, 0) == DXN_WAIT_FAILED,
                "wait accepted a non-event");
-        EXPECT(dmn_event_wait(nullptr, 0) == DMN_WAIT_FAILED,
+        EXPECT(dmn_event_wait(nullptr, 0) == DXN_WAIT_FAILED,
                "wait accepted NULL");
         printf("EVENTS: non-event handle rejection ok\n");
     }

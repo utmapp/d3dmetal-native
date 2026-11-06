@@ -14,7 +14,7 @@
 #include <memory>
 
 #include "d3dmetal_gfxt.h"
-#include "d3dmetal_native.h" /* dmn_wait_status */
+#include "d3dmetal_native.h" /* dxn_wait_status */
 
 class DmnGFXTMonitor final : public GFXTMonitorInterface {
 public:
@@ -82,8 +82,8 @@ public:
     bool windowsToUnixPath(const char16_t* in, char* out, size_t* inOutBytes) override;
     bool unixToWindowsPath(const char* in, char16_t* out, size_t* inOutChars) override;
     bool windowsSystemDirectoryPath(char16_t* out, size_t* inOutChars) override;
-    void getExecutablePath(char* out, uint32_t bytes) override;
-    void getModulePath(void* module, char* out, uint32_t bytes) override;
+    uint32_t getExecutablePath(char* out, uint32_t bytes) override;
+    uint32_t getModulePath(void* module, char* out, uint32_t bytes) override;
 };
 
 class DmnGFXTAllocation final : public GFXTAllocationInterface {

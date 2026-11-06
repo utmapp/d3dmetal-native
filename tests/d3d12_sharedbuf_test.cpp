@@ -96,7 +96,7 @@ uint32_t pattern(uint32_t seed, uint64_t i) {
 
 /* Count mismatches against pattern(seed) over a committed buffer's object (a
  * committed buffer owns its whole object, so it starts at offset 0). */
-int count_bad(const dmn_shared_buffer_handle* pod, uint32_t seed, size_t bytes) {
+int count_bad(const dxn_shared_buffer* pod, uint32_t seed, size_t bytes) {
     void* m = mmap(nullptr, bytes, PROT_READ, MAP_SHARED, pod->fd, 0);
     if (m == MAP_FAILED)
         return -1;
@@ -197,8 +197,8 @@ int main() {
         HANDLE ha = nullptr, hb = nullptr;
         CK(device->CreateSharedHandle(a.ptr(), nullptr, 0, nullptr, &ha), "export A");
         CK(device->CreateSharedHandle(b.ptr(), nullptr, 0, nullptr, &hb), "export B");
-        auto* pa = (const dmn_shared_buffer_handle*)ha;
-        auto* pb = (const dmn_shared_buffer_handle*)hb;
+        auto* pa = (const dxn_shared_buffer*)ha;
+        auto* pb = (const dxn_shared_buffer*)hb;
 
         /* 2) Fill A through the producer, open it, and check the bytes
          * survived the open. */

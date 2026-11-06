@@ -99,7 +99,7 @@ int check_no_debris(const char* what, const Debris& before) {
  * it every time the other fence wins. That currently leaks one thread and one fd
  * per armed wait on 3.0 and 4.0b1 (measured: +100 of each over 100 calls),
  * because dmn_fd3d_before_queue_wait opens its own view of the slot and spawns a
- * detached thread that waits DMN_WAIT_INFINITE. It is off by default so the suite
+ * detached thread that waits DXN_WAIT_INFINITE. It is off by default so the suite
  * is not red on a known-open issue, and present so the fix has a reproducer. */
 int test_rejected_multi_fence_wait(ID3D12Device* dev) {
     Com<ID3D12Device1> dev1;
@@ -256,23 +256,23 @@ int test_rejected_imports(ID3D11Device* dev) {
     HANDLE h = nullptr;
     CK(res->GetSharedHandle(&h), "GetSharedHandle");
 
-    dmn_shared_texture_handle good;
+    dxn_shared_texture good;
     memcpy(&good, h, sizeof(good));
-    EXPECT(good.magic == DMN_SHARED_TEXTURE_MAGIC, "export did not give a POD");
+    EXPECT(good.magic == DXN_SHARED_TEXTURE_MAGIC, "export did not give a POD");
 
     /* Warm up the import path once with something valid so its one-time costs
      * are not counted as debris. */
     {
         Com<ID3D11Texture2D> ok;
-        dmn_shared_texture_handle p = good;
+        dxn_shared_texture p = good;
         (void)dev->OpenSharedResource((HANDLE)&p, __uuidof(ID3D11Texture2D),
                                       (void**)&ok);
     }
 
     const Debris before = snapshot();
     for (int i = 0; i < kReps; i++) {
-        dmn_shared_texture_handle bad = good;
-        bad.stride = 0; /* shorter than a row */
+        dxn_shared_texture bad = good;
+        bad.planes[0].pitch = 0; /* shorter than a row */
         Com<ID3D11Texture2D> out;
         EXPECT(FAILED(dev->OpenSharedResource((HANDLE)&bad,
                                               __uuidof(ID3D11Texture2D),

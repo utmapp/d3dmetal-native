@@ -17,17 +17,14 @@
  *   G  graphics draw + readback on the best-passing graphics variant
  *   H  graphics draw with WRONG layout names: proves matching is NAME-based
  *      against the module metadata and that a mismatch is a SILENT no-op PSO
- *   R  dmn_dxil_input_semantics() directly on both container shapes
- *   P  the production contract: NPTA<reg> placeholder layout names resolved
- *      to real semantics by the CreateGraphicsPipelineState hook -- must draw
  *
  * The compute path executes (WaveActiveSum: 32 lanes must read 496) so a
  * lazily-failing PSO cannot masquerade as a pass.  Prints one PASS/FAIL line
- * per case; exit 0 iff the controls (A, D), the minimal-container shapes the
- * guest depends on (B, E, G) and the placeholder contract (P) pass.  C is
- * opt-in (-bare) because a bare program part crashes D3DMetal; F and H are
- * informational (F only runs if E fails; H is expected to fail silently, which
- * is what makes P necessary).
+ * per case; exit 0 iff the controls (A, D) and the minimal-container shapes
+ * the guest depends on (B, E, G) pass.  C is opt-in (-bare) because a bare
+ * program part crashes D3DMetal; F and H are informational (F only runs if E
+ * fails; H is expected to fail silently, which is why the guest names the
+ * layout from the module metadata).
  */
 
 #include <cstdint>
@@ -555,39 +552,12 @@ int main(int argc, char **argv)
            H ? "matching is register/order-based (fake names OK)"
              : "matching is NAME-based (guest needs real names)");
 
-    /* R: exercise the reflection helper directly on both container shapes
-     * (full dxc output vs our minimal re-wrap) to attribute failures:
-     * both fail => ABI/slot problem; only minimal fails => shape problem. */
-    {
-        dmn_dxil_semantic sem[8];
-        int nFull = dmn_dxil_input_semantics(g_vs_60, sizeof(g_vs_60), sem, 8);
-        printf("R reflect full: %d entries", nFull);
-        for (int i = 0; i < nFull; i++)
-            printf("  [reg %u]=%s idx=%u", sem[i].reg, sem[i].name,
-                   sem[i].index);
-        printf("\n");
-        int nMin = dmn_dxil_input_semantics(vsMin, cbVsMin, sem, 8);
-        printf("R reflect minimal: %d entries", nMin);
-        for (int i = 0; i < nMin; i++)
-            printf("  [reg %u]=%s idx=%u", sem[i].reg, sem[i].name,
-                   sem[i].index);
-        printf("\n");
-    }
-
-    /* P: the production contract -- the guest sends register-tagged
-     * placeholders (NPTA<reg>) and the CreateGraphicsPipelineState hook
-     * resolves them to real names via DXC reflection.  Must render. */
-    bool P = tryGraphics(vsMin, cbVsMin, psMin, cbPsMin, "NPTA0", "NPTA1",
-                         true, "P draw placeholders");
-    printf("P verdict: NPTA placeholder resolution %s\n",
-           P ? "WORKS" : "FAILED");
-
-    printf("DXILPROBE: A=%d B=%d C=%d D=%d E=%d F=%d G=%d P=%d\n", A, B, C, D,
-           E, F, G, P);
+    printf("DXILPROBE: A=%d B=%d C=%d D=%d E=%d F=%d G=%d\n", A, B, C, D, E,
+           F, G);
     free(csMin);
     free(vsMin);
     free(psMin);
-    const bool ok = A && B && D && E && G && P;
+    const bool ok = A && B && D && E && G;
     printf("DXILPROBE: %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 2;
 }

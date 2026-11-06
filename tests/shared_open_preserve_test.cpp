@@ -190,14 +190,14 @@ int run() {
     HANDLE texH = nullptr;
     CK(dxgiRes->GetSharedHandle(&texH), "GetSharedHandle");
     EXPECT(texH != nullptr, "GetSharedHandle returned null");
-    dmn_shared_texture_handle wire = {};
+    dxn_shared_texture wire = {};
     memcpy(&wire, texH, sizeof(wire));
 
     uint8_t* view = (uint8_t*)mmap(nullptr, (size_t)wire.size, PROT_READ,
                                    MAP_SHARED, wire.fd, 0);
     EXPECT(view != MAP_FAILED, "mmap of the shared backing failed");
 
-    size_t bad = check_untouched(view, wire.stride);
+    size_t bad = check_untouched(view, wire.planes[0].pitch);
     if (bad) {
         fprintf(stderr, T_TAG ": producer fill did not reach the shared "
                         "backing (%zu texels wrong) — repro is invalid\n", bad);
@@ -240,7 +240,7 @@ int run() {
     /* Everything outside the drawn corner must still hold the producer's
      * gradient. A whole-surface wipe here is the attach clearing a texture
      * D3DMetal considers undefined because it was created with no data. */
-    bad = check_untouched(view, wire.stride);
+    bad = check_untouched(view, wire.planes[0].pitch);
     munmap(view, (size_t)wire.size);
     if (bad) {
         fprintf(stderr,

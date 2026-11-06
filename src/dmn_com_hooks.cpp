@@ -119,17 +119,17 @@ namespace {
 
 /* == Live-handle registries =============================================== */
 std::mutex g_reg_mtx;
-std::unordered_map<void*, dmn_shared_texture_handle> g_tex_reg; /* identity -> POD */
-std::unordered_map<void*, dmn_shared_buffer_handle>  g_buf_reg;
+std::unordered_map<void*, dxn_shared_texture> g_tex_reg; /* identity -> POD */
+std::unordered_map<void*, dxn_shared_buffer>  g_buf_reg;
 std::unordered_map<void*, int> g_owned_fds; /* identity -> registry-owned dup */
 
-/* Resources placed in a SHARED heap with a dimension the window machinery
- * cannot back (1D/3D). They are real committed resources — correct memory,
- * correct lifetime — but they do NOT alias the heap and must not export: a
- * handle for them would hand a peer memory that is not theirs. Registered so
- * CreateSharedHandle fails them loudly instead of falling through to
- * D3DMetal's fake-passthrough handle. */
-std::unordered_set<void*> g_unshared_placed; /* under g_reg_mtx */
+/* D3D12 resources created SHARED (committed, or placed in a SHARED heap) with
+ * a dimension the shared-memory machinery cannot back (1D/3D). D3D12 lets any
+ * resource be shared, so the create stands as a real private resource, but it
+ * must not export: a handle for it would hand a peer memory that is not the
+ * resource's. Registered so CreateSharedHandle fails them loudly instead of
+ * falling through to D3DMetal's fake-passthrough handle. */
+std::unordered_set<void*> g_unshared; /* under g_reg_mtx */
 
 /* Every registration stores its OWN duplicate of the backing fd in its POD
  * (closed at eviction). This is what makes re-export from an OPENED resource
@@ -211,12 +211,10 @@ void free_pod(void* id) {
 std::mutex g_nt_mtx;
 std::unordered_set<void*> g_nt_handles;
 
-/* dmn_shared_handle_close() reads the fd through this common prefix. */
-constexpr size_t kPodFdOffset = 8;
-static_assert(offsetof(dmn_shared_texture_handle, fd) == kPodFdOffset &&
-              offsetof(dmn_shared_buffer_handle, fd) == kPodFdOffset &&
-              offsetof(dmn_shared_fence_handle, fd) == kPodFdOffset,
-              "shared-handle PODs must start {u32 magic, u32 version, i32 fd}");
+/* dmn_shared_handle_close() reads the fd through the common descriptor
+ * prefix (dxn_shared_header); directx-native asserts every descriptor's
+ * layout, which is the cross-process, cross-library ABI. */
+constexpr size_t kPodFdOffset = offsetof(dxn_shared_header, fd);
 
 template <class Pod>
 HRESULT vend_pod_owned(Pod pod, HANDLE* out) {
@@ -254,7 +252,7 @@ HRESULT vend_pod_owned(Pod pod, HANDLE* out) {
  * is validated by the evict-contract meson test against the vendored
  * framework, not re-probed at runtime. */
 
-enum EvictKind { EV_TEX, EV_BUF, EV_FENCE, EV_UNSHARED_PLACED, EV_SPARSE };
+enum EvictKind { EV_TEX, EV_BUF, EV_FENCE, EV_UNSHARED, EV_SPARSE };
 
 /* {7D3A1F7B-9C44-4A6E-8F21-5D0E6B3CA942} — private-data slot for the sentinel. */
 const GUID kDmnEvictGuid = {0x7d3a1f7b, 0x9c44, 0x4a6e,
@@ -265,7 +263,7 @@ const char* evict_kind_name(int kind) {
     case EV_TEX:   return "texture";
     case EV_BUF:   return "buffer";
     case EV_FENCE: return "fence";
-    case EV_UNSHARED_PLACED: return "unshared-placement";
+    case EV_UNSHARED: return "unshareable";
     case EV_SPARSE: return "sparse-reserved";
     default:       return "?";
     }
@@ -289,10 +287,10 @@ void evict_identity(void* id, int kind) {
     case EV_FENCE:
         dmn_fd3d_fence_destroy(id);
         break;
-    case EV_UNSHARED_PLACED:
+    case EV_UNSHARED:
         {
             std::lock_guard<std::mutex> lk(g_reg_mtx);
-            g_unshared_placed.erase(id);
+            g_unshared.erase(id);
         }
         break;
     case EV_SPARSE:
@@ -523,7 +521,7 @@ HRESULT STDMETHODCALLTYPE sheap_GetPrivateData(DmnSynthHeap* self, REFGUID guid,
         return S_OK;
     }
     *size = 0;
-    return E_FAIL; /* DXGI_ERROR_NOT_FOUND shape; nothing here inspects it */
+    return DXGI_ERROR_NOT_FOUND;
 }
 
 HRESULT STDMETHODCALLTYPE sheap_SetPrivateData(DmnSynthHeap* self, REFGUID guid,
@@ -895,6 +893,51 @@ uint64_t kmtx_extra(UINT misc) {
     return wants_kmtx(misc) ? (uint64_t)dmn_share_page_align(1) : 0;
 }
 
+/* The POD carries D3D11 bind flags whichever API made the resource, so a
+ * consumer of either API is created with the views the producer allowed. */
+UINT d12_flags_to_bind(D3D12_RESOURCE_FLAGS f) {
+    UINT bind = 0;
+    if (!(f & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE))
+        bind |= D3D11_BIND_SHADER_RESOURCE;
+    if (f & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)
+        bind |= D3D11_BIND_RENDER_TARGET;
+    if (f & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)
+        bind |= D3D11_BIND_DEPTH_STENCIL;
+    if (f & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
+        bind |= D3D11_BIND_UNORDERED_ACCESS;
+    return bind;
+}
+
+D3D12_RESOURCE_FLAGS bind_to_d12_flags(UINT bind) {
+    UINT f = 0;
+    if (bind & D3D11_BIND_RENDER_TARGET)
+        f |= D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    if (bind & D3D11_BIND_DEPTH_STENCIL)
+        f |= D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    if (bind & D3D11_BIND_UNORDERED_ACCESS)
+        f |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    /* DENY_SHADER_RESOURCE is only legal alongside ALLOW_DEPTH_STENCIL. */
+    if (!(bind & D3D11_BIND_SHADER_RESOURCE) && (bind & D3D11_BIND_DEPTH_STENCIL))
+        f |= D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;
+    return (D3D12_RESOURCE_FLAGS)f;
+}
+
+/* A shared surface is backed by one linear 2D Metal texture over shared
+ * memory, which has one mip, one slice and one sample.  That is also the
+ * shape D3D11 guarantees to share without ExtendedResourceSharing (which the
+ * CheckFeatureSupport hook therefore clears).  Anything else is refused
+ * before it is armed: a substitute of the wrong shape leaves D3DMetal
+ * addressing mips, slices or samples the texture does not have.  A MipLevels
+ * of 0 asks for the full chain. */
+bool share_shape_ok(UINT mips, UINT array, UINT samples, const char* what) {
+    if (mips == 1 && array <= 1 && samples <= 1)
+        return true;
+    DMN_ERROR("hooks: %s: a shared texture is a single linear 2D surface; "
+              "mips=%u array=%u samples=%u cannot be shared", what, mips,
+              array, samples);
+    return false;
+}
+
 /* Patch the per-class fence methods and attach the eviction sentinel. Shared
  * producer fences and imports get identical treatment: slot-merged reads,
  * re-export, and (D3D12) CPU-signal mirroring. */
@@ -991,41 +1034,46 @@ void patch_shared_resource_exports(IUnknown* res) {
 
 /* Record a shared texture (producer, or consumer re-registration for
  * re-export). `init_kmtx` distinguishes who initializes the mutex page. */
-void record_texture_pod(IUnknown* tex, const dmn_shared_texture_handle& pod,
+void record_texture_pod(IUnknown* tex, const dxn_shared_texture& pod,
                         bool init_kmtx) {
     void* id = dmn_com_identity(tex);
-    dmn_shared_texture_handle rec = pod;
+    dxn_shared_texture rec = pod;
     rec.fd = register_owned_fd(id, pod.fd);
     {
         std::lock_guard<std::mutex> lk(g_reg_mtx);
         g_tex_reg[id] = rec;
     }
     patch_shared_resource_exports(tex);
-    if (wants_kmtx(rec.misc_flags))
+    if (wants_kmtx(rec.meta.misc_flags))
         dmn_kmtx_register(id, rec.fd, dmn_share_page_align((size_t)rec.size),
                           init_kmtx);
     attach_evict_sentinel(tex, id, EV_TEX);
     DMN_INFO("hooks: recorded shared texture identity=%p fd=%d %ux%u stride=%llu",
-             id, rec.fd, rec.width, rec.height, (unsigned long long)rec.stride);
+             id, rec.fd, rec.meta.width, rec.meta.height, (unsigned long long)rec.planes[0].pitch);
 }
 
 void record_texture(IUnknown* tex, const D3D11_TEXTURE2D_DESC& d,
                     const DmnShareArm& arm, uint64_t offset = 0) {
-    dmn_shared_texture_handle pod{};
-    pod.magic = DMN_SHARED_TEXTURE_MAGIC;
-    pod.version = DMN_SHARED_HANDLE_VERSION;
-    pod.offset = offset;
+    dxn_shared_texture pod{};
+    pod.magic = DXN_SHARED_TEXTURE_MAGIC;
+    pod.version = DXN_SHARED_VERSION;
+    pod.struct_size = sizeof(pod);
+    pod.planes[0].offset = offset;
     pod.fd = arm.out_fd;
-    pod.width = d.Width;
-    pod.height = d.Height;
-    pod.dxgi_format = d.Format;
-    pod.mip_levels = d.MipLevels ? d.MipLevels : 1;
-    pod.array_size = d.ArraySize ? d.ArraySize : 1;
-    pod.sample_count = d.SampleDesc.Count ? d.SampleDesc.Count : 1;
-    pod.bind_flags = d.BindFlags;
-    pod.misc_flags = d.MiscFlags;
-    pod.cpu_access = d.CPUAccessFlags;
-    pod.stride = arm.out_stride;
+    pod.meta.width = d.Width;
+    pod.meta.height = d.Height;
+    pod.meta.dxgi_format = d.Format;
+    pod.meta.mip_levels = d.MipLevels ? d.MipLevels : 1;
+    pod.meta.array_size = d.ArraySize ? d.ArraySize : 1;
+    pod.meta.sample_count = d.SampleDesc.Count ? d.SampleDesc.Count : 1;
+    pod.meta.sample_quality = d.SampleDesc.Quality;
+    pod.meta.usage = d.Usage;
+    pod.meta.bind_flags = d.BindFlags;
+    pod.meta.misc_flags = d.MiscFlags;
+    pod.meta.cpu_access_flags = d.CPUAccessFlags;
+    /* One linear plane of shared memory. */
+    pod.plane_count = 1;
+    pod.planes[0].pitch = arm.out_stride;
     pod.size = arm.out_size;
     record_texture_pod(tex, pod, /*init_kmtx=*/true);
 }
@@ -1035,7 +1083,7 @@ void record_texture(IUnknown* tex, const D3D11_TEXTURE2D_DESC& d,
  * the eviction sentinel. Producer captures and consumer imports, both APIs.
  * The export patch is a no-op for D3D12 buffers, which have no IDXGIResource
  * and export device-side. */
-void register_buffer_pod(IUnknown* res, dmn_shared_buffer_handle pod) {
+void register_buffer_pod(IUnknown* res, dxn_shared_buffer pod) {
     void* id = dmn_com_identity(res);
     pod.fd = register_owned_fd(id, pod.fd);
     {
@@ -1050,14 +1098,15 @@ void register_buffer_pod(IUnknown* res, dmn_shared_buffer_handle pod) {
 
 void record_buffer(IUnknown* res, uint64_t size, uint32_t bind, uint32_t misc,
                    uint32_t cpu, const DmnShareArm& arm, uint64_t offset = 0) {
-    dmn_shared_buffer_handle pod{};
-    pod.magic = DMN_SHARED_BUFFER_MAGIC;
-    pod.version = DMN_SHARED_HANDLE_VERSION;
+    dxn_shared_buffer pod{};
+    pod.magic = DXN_SHARED_BUFFER_MAGIC;
+    pod.version = DXN_SHARED_VERSION;
+    pod.struct_size = sizeof(pod);
     pod.fd = arm.out_fd;
     pod.size = arm.out_size ? arm.out_size : size;
     pod.bind_flags = bind;
     pod.misc_flags = misc;
-    pod.cpu_access = cpu;
+    pod.cpu_access_flags = cpu;
     pod.offset = offset;
     register_buffer_pod(res, pod);
 }
@@ -1065,12 +1114,24 @@ void record_buffer(IUnknown* res, uint64_t size, uint32_t bind, uint32_t misc,
 /* A handle from a peer built against another POD layout must not be parsed:
  * the fields past the header would be read from wherever that peer's struct
  * ends. */
-bool pod_version_ok(uint32_t version, const char* what) {
-    if (version == DMN_SHARED_HANDLE_VERSION)
+/* The caller has dispatched on the magic; the version and size must match
+ * this build's directx-native exactly. */
+template <class Pod>
+bool pod_version_ok(const Pod* pod, const char* what) {
+    if (pod->version == DXN_SHARED_VERSION && pod->struct_size == sizeof(Pod))
         return true;
-    DMN_ERROR("hooks: %s handle has POD version %u, this build speaks %u; "
-              "refusing to import it", what, version,
-              (unsigned)DMN_SHARED_HANDLE_VERSION);
+    DMN_ERROR("hooks: %s handle has descriptor version %u size %u, this build "
+              "speaks %u size %zu; refusing to import it", what, pod->version,
+              pod->struct_size, (unsigned)DXN_SHARED_VERSION, sizeof(Pod));
+    return false;
+}
+
+/* A shm-backed texture is exactly one linear plane. */
+bool texture_planes_ok(const dxn_shared_texture* pod) {
+    if (pod->plane_count == 1)
+        return true;
+    DMN_ERROR("hooks: texture handle has %u planes; only single-plane shm "
+              "textures can be imported", pod->plane_count);
     return false;
 }
 
@@ -1082,7 +1143,7 @@ HRESULT return_texture_pod(IUnknown* res, HANDLE* out, bool nt) {
     if (!out)
         return E_INVALIDARG;
     void* id = dmn_com_identity(res);
-    dmn_shared_texture_handle pod;
+    dxn_shared_texture pod;
     {
         std::lock_guard<std::mutex> lk(g_reg_mtx);
         auto it = g_tex_reg.find(id);
@@ -1102,7 +1163,7 @@ HRESULT return_buffer_pod(IUnknown* res, HANDLE* out, bool nt) {
     if (!out)
         return E_INVALIDARG;
     void* id = dmn_com_identity(res);
-    dmn_shared_buffer_handle pod;
+    dxn_shared_buffer pod;
     {
         std::lock_guard<std::mutex> lk(g_reg_mtx);
         auto it = g_buf_reg.find(id);
@@ -1122,7 +1183,7 @@ HRESULT return_buffer_pod(IUnknown* res, HANDLE* out, bool nt) {
 HRESULT return_fence_pod(IUnknown* fenceObj, HANDLE* out) {
     if (!out)
         return E_INVALIDARG;
-    dmn_shared_fence_handle pod;
+    dxn_shared_fence pod;
     if (!dmn_fd3d_export(fenceObj, &pod))
         return E_FAIL; /* not one of ours */
     HRESULT hr = vend_pod_owned(pod, out);
@@ -1160,24 +1221,41 @@ HRESULT fail_unshared(const char* what, void** out) {
     return E_FAIL;
 }
 
+/* Record a successfully created resource that carries a SHARED flag but has
+ * no shared backing (see g_unshared). */
+void register_unshared(void** out) {
+    if (!out || !*out)
+        return;
+    auto* res = reinterpret_cast<IUnknown*>(*out);
+    void* id = dmn_com_identity(res);
+    {
+        std::lock_guard<std::mutex> lk(g_reg_mtx);
+        g_unshared.insert(id);
+    }
+    attach_evict_sentinel(res, id, EV_UNSHARED);
+}
+
 /* == Import (consumer reconstruction) ===================================== */
-HRESULT import_texture_d3d11(ID3D11Device* dev, const dmn_shared_texture_handle* pod,
+HRESULT import_texture_d3d11(ID3D11Device* dev, const dxn_shared_texture* pod,
                              REFIID iid, void** out) {
-    if (!pod_version_ok(pod->version, "texture"))
+    if (!pod_version_ok(pod, "texture") || !texture_planes_ok(pod) ||
+        !share_shape_ok(pod->meta.mip_levels ? pod->meta.mip_levels : 1,
+                        pod->meta.array_size, pod->meta.sample_count,
+                        "D3D11 texture import"))
         return E_INVALIDARG;
     D3D11_TEXTURE2D_DESC td{};
-    td.Width = pod->width;
-    td.Height = pod->height;
-    td.MipLevels = pod->mip_levels ? pod->mip_levels : 1;
-    td.ArraySize = pod->array_size ? pod->array_size : 1;
-    td.Format = (DXGI_FORMAT)pod->dxgi_format;
-    td.SampleDesc.Count = pod->sample_count ? pod->sample_count : 1;
+    td.Width = pod->meta.width;
+    td.Height = pod->meta.height;
+    td.MipLevels = pod->meta.mip_levels ? pod->meta.mip_levels : 1;
+    td.ArraySize = pod->meta.array_size ? pod->meta.array_size : 1;
+    td.Format = (DXGI_FORMAT)pod->meta.dxgi_format;
+    td.SampleDesc.Count = pod->meta.sample_count ? pod->meta.sample_count : 1;
     td.Usage = D3D11_USAGE_DEFAULT;
-    td.BindFlags = pod->bind_flags
-                       ? pod->bind_flags
+    td.BindFlags = pod->meta.bind_flags
+                       ? pod->meta.bind_flags
                        : (D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET);
-    td.CPUAccessFlags = pod->cpu_access;
-    td.MiscFlags = pod->misc_flags;
+    td.CPUAccessFlags = pod->meta.cpu_access_flags;
+    td.MiscFlags = pod->meta.misc_flags;
 
     /* Initial data, pointing at the sentinel. Creating the texture with none
      * leaves D3DMetal treating it as undefined, and the first render pass that
@@ -1192,13 +1270,13 @@ HRESULT import_texture_d3d11(ID3D11Device* dev, const dmn_shared_texture_handle*
         init.resize(subresources);
         for (auto& s : init) {
             s.pSysMem = sentinel;
-            s.SysMemPitch = (UINT)pod->stride;
+            s.SysMemPitch = (UINT)pod->planes[0].pitch;
             s.SysMemSlicePitch = (UINT)pod->size;
         }
     }
 
     ID3D11Texture2D* tex = nullptr;
-    dmn_share_arm_consumer(pod->fd, pod->stride, pod->size, pod->offset);
+    dmn_share_arm_consumer(pod->fd, pod->planes[0].pitch, pod->size, pod->planes[0].offset);
     HRESULT hr = dev->CreateTexture2D(&td, init.empty() ? nullptr : init.data(),
                                       &tex);
     DmnShareArm arm{};
@@ -1225,16 +1303,16 @@ HRESULT import_texture_d3d11(ID3D11Device* dev, const dmn_shared_texture_handle*
     return hr;
 }
 
-HRESULT import_buffer_d3d11(ID3D11Device* dev, const dmn_shared_buffer_handle* pod,
+HRESULT import_buffer_d3d11(ID3D11Device* dev, const dxn_shared_buffer* pod,
                             REFIID iid, void** out) {
-    if (!pod_version_ok(pod->version, "buffer"))
+    if (!pod_version_ok(pod, "buffer"))
         return E_INVALIDARG;
     D3D11_BUFFER_DESC bd{};
     bd.ByteWidth = (UINT)pod->size;
     bd.Usage = D3D11_USAGE_DEFAULT;
     bd.BindFlags = pod->bind_flags ? pod->bind_flags
                                    : D3D11_BIND_UNORDERED_ACCESS;
-    bd.CPUAccessFlags = pod->cpu_access;
+    bd.CPUAccessFlags = pod->cpu_access_flags;
     bd.MiscFlags = pod->misc_flags;
 
     ID3D11Buffer* buf = nullptr;
@@ -1268,25 +1346,28 @@ HRESULT import_buffer_d3d11(ID3D11Device* dev, const dmn_shared_buffer_handle* p
     return hr;
 }
 
-HRESULT import_texture_d3d12(ID3D12Device* dev, const dmn_shared_texture_handle* pod,
+HRESULT import_texture_d3d12(ID3D12Device* dev, const dxn_shared_texture* pod,
                              REFIID riid, void** out) {
-    if (!pod_version_ok(pod->version, "texture"))
+    if (!pod_version_ok(pod, "texture") || !texture_planes_ok(pod) ||
+        !share_shape_ok(pod->meta.mip_levels ? pod->meta.mip_levels : 1,
+                        pod->meta.array_size, pod->meta.sample_count,
+                        "D3D12 texture import"))
         return E_INVALIDARG;
     D3D12_RESOURCE_DESC rd{};
     rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    rd.Width = pod->width;
-    rd.Height = pod->height;
-    rd.DepthOrArraySize = (UINT16)(pod->array_size ? pod->array_size : 1);
-    rd.MipLevels = (UINT16)(pod->mip_levels ? pod->mip_levels : 1);
-    rd.Format = (DXGI_FORMAT)pod->dxgi_format;
-    rd.SampleDesc.Count = pod->sample_count ? pod->sample_count : 1;
+    rd.Width = pod->meta.width;
+    rd.Height = pod->meta.height;
+    rd.DepthOrArraySize = (UINT16)(pod->meta.array_size ? pod->meta.array_size : 1);
+    rd.MipLevels = (UINT16)(pod->meta.mip_levels ? pod->meta.mip_levels : 1);
+    rd.Format = (DXGI_FORMAT)pod->meta.dxgi_format;
+    rd.SampleDesc.Count = pod->meta.sample_count ? pod->meta.sample_count : 1;
     rd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    rd.Flags = bind_to_d12_flags(pod->meta.bind_flags);
 
     D3D12_HEAP_PROPERTIES hp{};
     hp.Type = D3D12_HEAP_TYPE_DEFAULT;
 
-    dmn_share_arm_consumer(pod->fd, pod->stride, pod->size, pod->offset);
+    dmn_share_arm_consumer(pod->fd, pod->planes[0].pitch, pod->size, pod->planes[0].offset);
     HRESULT hr = dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
                                               D3D12_RESOURCE_STATE_COMMON,
                                               nullptr, riid, out);
@@ -1298,7 +1379,7 @@ HRESULT import_texture_d3d12(ID3D12Device* dev, const dmn_shared_texture_handle*
         /* Register for re-export via ID3D12Device::CreateSharedHandle. */
         auto* res = reinterpret_cast<IUnknown*>(*out);
         void* id = dmn_com_identity(res);
-        dmn_shared_texture_handle rec = *pod;
+        dxn_shared_texture rec = *pod;
         rec.fd = register_owned_fd(id, pod->fd);
         {
             std::lock_guard<std::mutex> lk(g_reg_mtx);
@@ -1309,9 +1390,9 @@ HRESULT import_texture_d3d12(ID3D12Device* dev, const dmn_shared_texture_handle*
     return hr;
 }
 
-HRESULT import_buffer_d3d12(ID3D12Device* dev, const dmn_shared_buffer_handle* pod,
+HRESULT import_buffer_d3d12(ID3D12Device* dev, const dxn_shared_buffer* pod,
                             REFIID riid, void** out) {
-    if (!pod_version_ok(pod->version, "buffer"))
+    if (!pod_version_ok(pod, "buffer"))
         return E_INVALIDARG;
     D3D12_RESOURCE_DESC rd{};
     rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
@@ -1350,9 +1431,9 @@ HRESULT import_buffer_d3d12(ID3D12Device* dev, const dmn_shared_buffer_handle* p
  * The framework is never involved, and placements on the opened heap window
  * the same shm object as the exporter's, so cross-process placements at one
  * offset alias exactly like local ones. */
-HRESULT import_heap_d3d12(ID3D12Device* dev, const dmn_shared_buffer_handle* pod,
+HRESULT import_heap_d3d12(ID3D12Device* dev, const dxn_shared_buffer* pod,
                           REFIID riid, void** out) {
-    if (!pod_version_ok(pod->version, "heap"))
+    if (!pod_version_ok(pod, "heap"))
         return E_INVALIDARG;
     if (!pod->size || pod->size > (1ull << 32) ||
         (pod->offset & (dmn_share_page_align(1) - 1))) {
@@ -1393,16 +1474,40 @@ HRESULT import_heap_d3d12(ID3D12Device* dev, const dmn_shared_buffer_handle* pod
 bool open_shared_d3d11(ID3D11Device* dev, HANDLE handle, REFIID iid, void** out,
                        HRESULT* out_hr) {
     uint32_t magic = *reinterpret_cast<uint32_t*>(handle);
-    if (magic == DMN_SHARED_BUFFER_MAGIC) {
+    if (magic == DXN_SHARED_BUFFER_MAGIC) {
         *out_hr = import_buffer_d3d11(
-            dev, reinterpret_cast<dmn_shared_buffer_handle*>(handle), iid, out);
+            dev, reinterpret_cast<dxn_shared_buffer*>(handle), iid, out);
         return true;
     }
-    if (magic == DMN_SHARED_TEXTURE_MAGIC) {
+    if (magic == DXN_SHARED_TEXTURE_MAGIC) {
         *out_hr = import_texture_d3d11(
-            dev, reinterpret_cast<dmn_shared_texture_handle*>(handle), iid, out);
+            dev, reinterpret_cast<dxn_shared_texture*>(handle), iid, out);
         return true;
     }
+    return false;
+}
+
+/* Whether D3DMetal itself supports textures of `format`: its own
+ * CheckFormatSupport answers 0 for a format it cannot make. */
+static bool d3dmetal_has_format(ID3D11Device* dev, DXGI_FORMAT format) {
+    auto orig = DMN_ORIG(d3d11_CheckFormatSupport, dev);
+    UINT support = 0;
+    return orig && SUCCEEDED(orig(dev, format, &support)) && support;
+}
+
+/* A texture in a format Metal has no pixel format for (the planar and packed
+ * video formats, P8, R1_UNORM) cannot exist here; D3DMetal's D3D12 creates
+ * abort on such a format inside Metal validation (dmn_desc_format_ok), and its
+ * D3D11 ones take the same descriptor path.  Refuse it the way a driver
+ * refuses an unsupported format.  The format table decides, so that whether
+ * a create is attempted never depends on what a given D3DMetal version
+ * reports about itself. */
+static bool d3d11_format_ok(DXGI_FORMAT format) {
+    uint32_t support = 0;
+    if (dmn_format_support((uint32_t)format, &support))
+        return true;
+    DMN_WARN("refusing a D3D11 texture in DXGI format %d, which has no Metal "
+             "pixel format", (int)format);
     return false;
 }
 
@@ -1413,10 +1518,15 @@ HRESULT STDMETHODCALLTYPE hook_d3d11_CreateTexture2D(
     auto orig = DMN_ORIG(d3d11_CreateTexture2D, This);
     if (!orig)
         return E_FAIL;
+    if (desc && !d3d11_format_ok(desc->Format))
+        return E_INVALIDARG;
     /* is_armed: a consumer reconstruct is mid-flight; pass straight to the
      * swizzle instead of re-detecting a producer create. */
     if (!desc || dmn_share_is_armed() || !is_shared_misc(desc->MiscFlags))
         return orig(This, desc, init, out);
+    if (!share_shape_ok(desc->MipLevels, desc->ArraySize, desc->SampleDesc.Count,
+                        "CreateTexture2D MISC_SHARED"))
+        return E_INVALIDARG;
 
     DMN_INFO("hooks: CreateTexture2D MISC_SHARED %ux%u fmt=%u", desc->Width,
              desc->Height, desc->Format);
@@ -1444,8 +1554,13 @@ HRESULT STDMETHODCALLTYPE hook_d3d11_CreateTexture2D1(
     auto orig = DMN_ORIG(d3d11_CreateTexture2D1, This);
     if (!orig)
         return E_FAIL;
+    if (desc && !d3d11_format_ok(desc->Format))
+        return E_INVALIDARG;
     if (!desc || dmn_share_is_armed() || !is_shared_misc(desc->MiscFlags))
         return orig(This, desc, init, out);
+    if (!share_shape_ok(desc->MipLevels, desc->ArraySize, desc->SampleDesc.Count,
+                        "CreateTexture2D1 MISC_SHARED"))
+        return E_INVALIDARG;
 
     DMN_INFO("hooks: CreateTexture2D1 MISC_SHARED %ux%u fmt=%u", desc->Width,
              desc->Height, desc->Format);
@@ -1686,17 +1801,21 @@ HRESULT STDMETHODCALLTYPE hook_d3d11_CreateUnorderedAccessView1(
     return hr;
 }
 
-/* 1D/3D shared textures have no backing implementation: warn loudly instead
- * of letting the app discover a silently unshared resource at export time. */
+/* D3D11 shares only 2D textures (D3D11_RESOURCE_MISC_SHARED: "The only
+ * resources that can be shared are 2D non-mipmapped textures"). */
 HRESULT STDMETHODCALLTYPE hook_d3d11_CreateTexture1D(
         ID3D11Device* This, const D3D11_TEXTURE1D_DESC* desc,
         const D3D11_SUBRESOURCE_DATA* init, ID3D11Texture1D** out) {
     auto orig = DMN_ORIG(d3d11_CreateTexture1D, This);
     if (!orig)
         return E_FAIL;
-    if (desc && is_shared_misc(desc->MiscFlags))
-        DMN_WARN("hooks: CreateTexture1D with a SHARED misc flag is not "
-                 "supported; the texture is created UNSHARED");
+    if (desc && !d3d11_format_ok(desc->Format))
+        return E_INVALIDARG;
+    if (desc && is_shared_misc(desc->MiscFlags)) {
+        DMN_ERROR("hooks: CreateTexture1D with a SHARED misc flag: only 2D "
+                  "textures can be shared");
+        return E_INVALIDARG;
+    }
     return orig(This, desc, init, out);
 }
 
@@ -1706,9 +1825,13 @@ HRESULT STDMETHODCALLTYPE hook_d3d11_CreateTexture3D(
     auto orig = DMN_ORIG(d3d11_CreateTexture3D, This);
     if (!orig)
         return E_FAIL;
-    if (desc && is_shared_misc(desc->MiscFlags))
-        DMN_WARN("hooks: CreateTexture3D with a SHARED misc flag is not "
-                 "supported; the texture is created UNSHARED");
+    if (desc && !d3d11_format_ok(desc->Format))
+        return E_INVALIDARG;
+    if (desc && is_shared_misc(desc->MiscFlags)) {
+        DMN_ERROR("hooks: CreateTexture3D with a SHARED misc flag: only 2D "
+                  "textures can be shared");
+        return E_INVALIDARG;
+    }
     return orig(This, desc, init, out);
 }
 
@@ -1744,28 +1867,21 @@ HRESULT STDMETHODCALLTYPE hook_d3d11_CreateBuffer(
  * and 0 otherwise — those are the only two values it returns, always with
  * S_OK. We replace the answer outright rather than filtering one; there is
  * nothing in its reply worth preserving. dmn_formats.mm has the tables.
- * A format Metal cannot represent (NV12, P8, R1_UNORM, ...) is E_FAIL, MSDN's
- * answer for a format the device does not support. */
+ * A format Metal cannot represent (NV12, P8, R1_UNORM, ...), or that D3DMetal
+ * cannot make, is E_FAIL, MSDN's answer for a format the device does not
+ * support. */
 HRESULT STDMETHODCALLTYPE hook_d3d11_CheckFormatSupport(
         ID3D11Device* This, DXGI_FORMAT format, UINT* out) {
-    (void)This;
     if (!out)
         return E_INVALIDARG;
     uint32_t support = 0;
-    if (!dmn_format_support((uint32_t)format, &support)) {
+    if (!dmn_format_support((uint32_t)format, &support) ||
+        (format != DXGI_FORMAT_UNKNOWN && !d3dmetal_has_format(This, format))) {
         *out = 0;
         return E_FAIL;
     }
     *out = support;
     return S_OK;
-}
-
-/* Whether D3DMetal itself supports textures of `format`: its own
- * CheckFormatSupport answers 0 for a format it cannot make. */
-static bool d3dmetal_has_format(ID3D11Device* dev, DXGI_FORMAT format) {
-    auto orig = DMN_ORIG(d3d11_CheckFormatSupport, dev);
-    UINT support = 0;
-    return orig && SUCCEEDED(orig(dev, format, &support)) && support;
 }
 
 /* D3DMetal answers quality levels for formats it does not support and for
@@ -1805,8 +1921,8 @@ HRESULT STDMETHODCALLTYPE hook_d3d11_CheckMultisampleQualityLevels1(
 }
 
 /* FORMAT_SUPPORT and FORMAT_SUPPORT2 must agree with CheckFormatSupport, so
- * they come from the same tables. Every other feature is D3DMetal's to answer
- * — forward it untouched. */
+ * they come from the same tables. Every other feature is D3DMetal's to answer,
+ * less what the sharing layer cannot back. */
 HRESULT STDMETHODCALLTYPE hook_d3d11_CheckFeatureSupport(
         ID3D11Device* This, D3D11_FEATURE feature, void* data, UINT size) {
     if (feature == D3D11_FEATURE_FORMAT_SUPPORT) {
@@ -1829,7 +1945,14 @@ HRESULT STDMETHODCALLTYPE hook_d3d11_CheckFeatureSupport(
         return S_OK;
     }
     auto orig = DMN_ORIG(d3d11_CheckFeatureSupport, This);
-    return orig ? orig(This, feature, data, size) : E_FAIL;
+    HRESULT hr = orig ? orig(This, feature, data, size) : E_FAIL;
+    /* Extended sharing (mips, arrays, more formats) is what share_shape_ok
+     * refuses; only the baseline D3D11.1 shared shape can be honoured. */
+    if (SUCCEEDED(hr) && feature == D3D11_FEATURE_D3D11_OPTIONS && data &&
+        size == sizeof(D3D11_FEATURE_DATA_D3D11_OPTIONS))
+        static_cast<D3D11_FEATURE_DATA_D3D11_OPTIONS*>(data)
+            ->ExtendedResourceSharing = FALSE;
+    return hr;
 }
 
 /* == D3D11 consumer thunks ================================================= */
@@ -1916,10 +2039,10 @@ HRESULT STDMETHODCALLTYPE hook_d3d11_CreateFence(
 HRESULT STDMETHODCALLTYPE hook_d3d11_OpenSharedFence(
         ID3D11Device5* This, HANDLE handle, REFIID iid, void** out) {
     if (handle && out &&
-        *reinterpret_cast<uint32_t*>(handle) == DMN_SHARED_FENCE_MAGIC) {
+        *reinterpret_cast<uint32_t*>(handle) == DXN_SHARED_FENCE_MAGIC) {
         ID3D11Fence* f = nullptr;
         HRESULT hr = dmn_fd3d_import_d3d11(
-            This, reinterpret_cast<dmn_shared_fence_handle*>(handle), &f);
+            This, reinterpret_cast<dxn_shared_fence*>(handle), &f);
         if (FAILED(hr) || !f)
             return hr;
         track_fence_d3d11(f); /* a consumer-only process patches only here */
@@ -2036,6 +2159,9 @@ D3D11_TEXTURE2D_DESC d12_desc_to_11(const DescT& desc) {
     d.ArraySize = desc.DepthOrArraySize ? desc.DepthOrArraySize : 1;
     d.Format = desc.Format;
     d.SampleDesc.Count = desc.SampleDesc.Count ? desc.SampleDesc.Count : 1;
+    d.Usage = D3D11_USAGE_DEFAULT;
+    d.BindFlags = d12_flags_to_bind(desc.Flags);
+    d.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
     return d;
 }
 
@@ -2057,11 +2183,15 @@ HRESULT d12_create_shared(const DescT* desc, void** out, OrigCall&& call) {
         if (!captured)
             return fail_unshared("D3D12 SHARED buffer create", out);
         record_buffer(reinterpret_cast<IUnknown*>(*out), desc->Width,
-                      0, 0, 0, arm);
+                      d12_flags_to_bind(desc->Flags), D3D11_RESOURCE_MISC_SHARED, 0,
+                      arm);
         arm_fd_close(arm);
         return hr;
     }
     if (desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
+        if (!share_shape_ok(desc->MipLevels, desc->DepthOrArraySize,
+                            desc->SampleDesc.Count, "D3D12 SHARED texture create"))
+            return E_INVALIDARG;
         DMN_INFO("hooks: D3D12 SHARED texture create %llux%u fmt=%u",
                  (unsigned long long)desc->Width, desc->Height, desc->Format);
         dmn_share_arm_producer(0);
@@ -2079,16 +2209,21 @@ HRESULT d12_create_shared(const DescT* desc, void** out, OrigCall&& call) {
         arm_fd_close(arm);
         return hr;
     }
-    DMN_WARN("hooks: D3D12 SHARED create with unsupported dimension %d passes "
-             "through UNSHARED", (int)desc->Dimension);
-    return call();
+    DMN_WARN("hooks: D3D12 SHARED create with dimension %d has no shared "
+             "backing; it is created UNSHARED and cannot be exported",
+             (int)desc->Dimension);
+    HRESULT hr = call();
+    if (SUCCEEDED(hr))
+        register_unshared(out);
+    return hr;
 }
 
 /* Heap properties for a placed->committed translation.
  *
- * dmn_open_existing_heap_from_fd clamps an imported heap's type to UPLOAD, but
- * D3D12 forbids ALLOW_UNORDERED_ACCESS and the render-target/depth-stencil
- * flags on UPLOAD and READBACK heaps, so a placement carrying one of them
+ * An imported heap is typically UPLOAD or READBACK (the import keeps the
+ * caller's type, defaulting to UPLOAD), but D3D12 forbids
+ * ALLOW_UNORDERED_ACCESS and the render-target/depth-stencil flags on UPLOAD
+ * and READBACK heaps, so a placement carrying one of them
  * cannot be committed against those properties. Promote to DEFAULT: the Metal
  * allocation is substituted with a window into the heap's shm object either
  * way, so these properties only have to satisfy the framework's validation.
@@ -2169,7 +2304,9 @@ HRESULT d12_place_on_synth(DmnSynthHeap* sh, UINT64 offset, const DescT* desc,
          * caller, who already has its own handle to them. */
         if (!sh->imported)
             record_buffer(reinterpret_cast<IUnknown*>(*out), desc->Width,
-                          0, 0, 0, arm, sh->fd_off + offset);
+                          d12_flags_to_bind(desc->Flags),
+                          D3D11_RESOURCE_MISC_SHARED, 0, arm,
+                          sh->fd_off + offset);
         return hr;
     }
 
@@ -2181,6 +2318,9 @@ HRESULT d12_place_on_synth(DmnSynthHeap* sh, UINT64 offset, const DescT* desc,
     }
 
     if (desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
+        if (!share_shape_ok(desc->MipLevels, desc->DepthOrArraySize,
+                            desc->SampleDesc.Count, "texture placed in a SHARED heap"))
+            return E_INVALIDARG;
         DMN_INFO("hooks: placed texture on shared heap offset=%llu %llux%u "
                  "fmt=%u", (unsigned long long)offset,
                  (unsigned long long)desc->Width, desc->Height, desc->Format);
@@ -2202,15 +2342,8 @@ HRESULT d12_place_on_synth(DmnSynthHeap* sh, UINT64 offset, const DescT* desc,
              "window backing; it is created UNSHARED (does not alias the heap, "
              "cannot be exported)", (int)desc->Dimension);
     HRESULT hr = commit(); /* unarmed: a plain private committed resource */
-    if (SUCCEEDED(hr) && out && *out) {
-        auto* res = reinterpret_cast<IUnknown*>(*out);
-        void* id = dmn_com_identity(res);
-        {
-            std::lock_guard<std::mutex> lk(g_reg_mtx);
-            g_unshared_placed.insert(id);
-        }
-        attach_evict_sentinel(res, id, EV_UNSHARED_PLACED);
-    }
+    if (SUCCEEDED(hr))
+        register_unshared(out);
     return hr;
 }
 
@@ -2834,7 +2967,9 @@ void STDMETHODCALLTYPE hook_d3d12_GetResourceTiling(
             packed->NumStandardMips = (UINT8)t.standard_mips;
             packed->NumPackedMips = (UINT8)t.packed_mips;
             packed->NumTilesForPackedMips = t.packed_tiles;
-            packed->StartTileIndexInOverallResource = t.packed_start_tile;
+            /* D3D12_PACKED_MIP_INFO: 0 when nothing is packed. */
+            packed->StartTileIndexInOverallResource =
+                t.packed_mips ? t.packed_start_tile : 0;
         }
         if (shape) { shape->WidthInTexels = t.tile_w; shape->HeightInTexels = t.tile_h; shape->DepthInTexels = 1; }
         for (uint32_t i = 0; subs && i < n; i++) {
@@ -2936,6 +3071,13 @@ HRESULT STDMETHODCALLTYPE hook_d3d12_CheckFeatureSupport(
  * sparse heap refuses: buffers, 3D, MSAA) the committed create stands, fully
  * backed -- and fully resident, see dmn_sparse.h.
  *
+ * A texture with UNORDERED_ACCESS takes the committed create too: Metal does
+ * not support MTLTextureUsageShaderWrite on a texture in a MTLHeapTypeSparse
+ * heap (the API validation layer says so on AGX G16), and every shader store
+ * or atomic into one is silently dropped (reads back zero; sparse-uav-test).
+ * Subnautica 2 writes reserved textures through UAVs, and rendered garbage
+ * and hung or faulted the GPU on the data its later passes consumed.
+ *
  * The framework object is created PLACED at offset 0 of a dummy heap rather
  * than committed.  Measured (DMN_ALLOC_TRACE): a committed create -- with or
  * without HEAP_FLAG_SHARED -- makes D3DMetal reserve the texture's full size
@@ -2959,7 +3101,8 @@ HRESULT d12_create_reserved(ID3D12Device* This, const D3D12_RESOURCE_DESC* desc,
                             Committed&& create_committed) {
     const bool sparse = dmn_sparse_enabled() &&
                         desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
-                        desc->SampleDesc.Count <= 1;
+                        desc->SampleDesc.Count <= 1 &&
+                        !(desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
     static ID3D12Device* dummy_dev = nullptr;
     static ID3D12Heap* dummy_heap = nullptr;
     static UINT64 dummy_bytes = 0;
@@ -2970,6 +3113,8 @@ HRESULT d12_create_reserved(ID3D12Device* This, const D3D12_RESOURCE_DESC* desc,
         D3D12_RESOURCE_DESC cd = *desc;
         cd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
         D3D12_RESOURCE_ALLOCATION_INFO ai = This->GetResourceAllocationInfo(0, 1, &cd);
+        if (ai.SizeInBytes == UINT64_MAX)
+            return E_INVALIDARG;
         UINT64 need = ai.SizeInBytes ? ai.SizeInBytes : (64ull << 20);
         need = (need + 0xFFFFFull) & ~0xFFFFFull; /* 1 MiB granularity */
         std::lock_guard<std::mutex> lk(dummy_mtx);
@@ -3085,6 +3230,8 @@ HRESULT STDMETHODCALLTYPE hook_d3d12_CreateReservedResource1(
         ID3D12Device4* This, const D3D12_RESOURCE_DESC* desc,
         D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE* clear,
         DMN_ID3D12ProtectedResourceSession* session, REFIID riid, void** out) {
+    if (!dmn_desc_format_ok(This, desc))
+        return E_INVALIDARG;
     auto orig = DMN_ORIG(d3d12_CreateReservedResource1, This);
     if (!desc || !out || session)
         return orig ? orig(This, desc, state, clear, session, riid, out) : E_FAIL;
@@ -3114,6 +3261,8 @@ HRESULT STDMETHODCALLTYPE hook_d3d12_CreateReservedResource2(
         DMN_D3D12_BARRIER_LAYOUT layout, const D3D12_CLEAR_VALUE* clear,
         DMN_ID3D12ProtectedResourceSession* session, UINT32 num_castable,
         const DXGI_FORMAT* castable, REFIID riid, void** out) {
+    if (!dmn_desc_format_ok(This, desc))
+        return E_INVALIDARG;
     auto orig = DMN_ORIG(d3d12_CreateReservedResource2, This);
     if (!desc || !out || session)
         return orig ? orig(This, desc, layout, clear, session, num_castable, castable, riid, out)
@@ -3210,20 +3359,10 @@ struct DmnNormalizedStage {
     }
 };
 
-/* == DXIL input-layout placeholder resolution ============================= */
-
-/* The guest UMD cannot read semantic names out of a bare DXIL program part
- * (they live in bitcode metadata, not ISG1), so for DXIL vertex shaders it
- * sends register-tagged placeholders ("NPTA<reg>") in the input layout.
- * D3DMetal matches layout elements to the VS BY NAME against the module
- * metadata and silently produces a no-op PSO on mismatch, so resolve the
- * placeholders here via DXC reflection.  Elements whose register the VS
- * does not consume are dropped -- same policy as the guest's DXBC path. */
+/* == DXIL graphics pipeline normalization ================================= */
 struct DmnNormalizedGraphicsDesc {
     D3D12_GRAPHICS_PIPELINE_STATE_DESC normalized;
     DmnNormalizedStage stages[5];
-    dmn_dxil_semantic semantics[64];
-    D3D12_INPUT_ELEMENT_DESC elements[64];
 
     const D3D12_GRAPHICS_PIPELINE_STATE_DESC* apply(
             const D3D12_GRAPHICS_PIPELINE_STATE_DESC* input) {
@@ -3236,69 +3375,15 @@ struct DmnNormalizedGraphicsDesc {
         bool changed = false;
         for (size_t i = 0; i < 5; i++)
             changed = stages[i].apply(shaders[i]) || changed;
-        if (changed) {
-            normalized = *input;
-            normalized.VS = shaders[0];
-            normalized.PS = shaders[1];
-            normalized.DS = shaders[2];
-            normalized.HS = shaders[3];
-            normalized.GS = shaders[4];
-        }
-        const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc =
-            changed ? &normalized : input;
-        if (!desc->InputLayout.NumElements ||
-            desc->InputLayout.NumElements > 64 ||
-            !desc->InputLayout.pInputElementDescs ||
-            !desc->VS.pShaderBytecode)
-            return desc;
-
-        bool placeholders = false;
-        for (UINT i = 0; i < desc->InputLayout.NumElements; i++) {
-            const char* name =
-                desc->InputLayout.pInputElementDescs[i].SemanticName;
-            if (name && !strncmp(name, "NPTA", 4)) {
-                placeholders = true;
-                break;
-            }
-        }
-        if (!placeholders)
-            return desc;
-
-        int nSem = dmn_dxil_input_semantics(desc->VS.pShaderBytecode,
-                                            desc->VS.BytecodeLength,
-                                            semantics, 64);
-        if (nSem <= 0) {
-            DMN_WARN("pso: NPTA placeholders but VS reflection failed -- "
-                     "pipeline will not bind vertex inputs");
-            return desc;
-        }
-
-        UINT n = 0;
-        for (UINT i = 0; i < desc->InputLayout.NumElements; i++) {
-            D3D12_INPUT_ELEMENT_DESC e = desc->InputLayout.pInputElementDescs[i];
-            const char* name = e.SemanticName;
-            if (name && !strncmp(name, "NPTA", 4)) {
-                unsigned reg = (unsigned)strtoul(name + 4, nullptr, 10);
-                const dmn_dxil_semantic* hit = nullptr;
-                for (int s = 0; s < nSem; s++)
-                    if (semantics[s].reg == reg) {
-                        hit = &semantics[s];
-                        break;
-                    }
-                if (!hit)
-                    continue;
-                e.SemanticName = hit->name;
-                e.SemanticIndex = hit->index;
-            }
-            elements[n++] = e;
-        }
         if (!changed)
-            normalized = *input;
-        normalized.InputLayout.pInputElementDescs = elements;
-        normalized.InputLayout.NumElements = n;
-        DMN_INFO("pso: resolved %u NPTA input-layout elements via VS reflection "
-                 "(%d signature rows, %u kept)",
-                 desc->InputLayout.NumElements, nSem, n);
+            return input;
+
+        normalized = *input;
+        normalized.VS = shaders[0];
+        normalized.PS = shaders[1];
+        normalized.DS = shaders[2];
+        normalized.HS = shaders[3];
+        normalized.GS = shaders[4];
         return &normalized;
     }
 };
@@ -3576,7 +3661,6 @@ static const D3D12_COMPUTE_PIPELINE_STATE_DESC* dmn_normalize_compute_desc(
     normalized->CS = shader;
     return normalized;
 }
-
 HRESULT STDMETHODCALLTYPE hook_d3d12_CreateGraphicsPipelineState(
         ID3D12Device* This, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc,
         REFIID riid, void** out) {
@@ -3736,9 +3820,10 @@ HRESULT STDMETHODCALLTYPE hook_d3d12_CreateSharedHandle(
     if (DmnSynthHeap* sh = as_synth_heap(reinterpret_cast<ID3D12Heap*>(object))) {
         if (!out)
             return E_INVALIDARG;
-        dmn_shared_buffer_handle pod{};
-        pod.magic = DMN_SHARED_BUFFER_MAGIC;
-        pod.version = DMN_SHARED_HANDLE_VERSION;
+        dxn_shared_buffer pod{};
+        pod.magic = DXN_SHARED_BUFFER_MAGIC;
+        pod.version = DXN_SHARED_VERSION;
+        pod.struct_size = sizeof(pod);
         pod.fd = sh->fd; /* vend_pod_owned dups it */
         pod.size = sh->size;
         pod.offset = sh->fd_off;
@@ -3756,20 +3841,19 @@ HRESULT STDMETHODCALLTYPE hook_d3d12_CreateSharedHandle(
             return S_OK;
         if (SUCCEEDED(return_buffer_pod(unk, out, /*nt=*/true)))
             return S_OK;
-        /* A 1D/3D resource placed in a SHARED heap has no shared backing (see
-         * d12_place_on_synth). A handle for it would point a peer at memory
-         * that is not the resource's — fail here, where the app can see it,
-         * instead of at first use of a blank surface. */
+        /* A SHARED 1D/3D resource has no shared backing (see g_unshared).
+         * Fail here, where the app can see it, instead of at first use of a
+         * blank surface. */
         void* id = dmn_com_identity(unk);
         bool unshared;
         {
             std::lock_guard<std::mutex> lk(g_reg_mtx);
-            unshared = g_unshared_placed.count(id) != 0;
+            unshared = g_unshared.count(id) != 0;
         }
         if (unshared) {
-            DMN_ERROR("hooks: CreateSharedHandle on a 1D/3D resource placed in "
-                      "a SHARED heap — no shared backing exists for that "
-                      "dimension, refusing to vend a handle");
+            DMN_ERROR("hooks: CreateSharedHandle on a SHARED 1D/3D resource — "
+                      "no shared backing exists for that dimension, refusing "
+                      "to vend a handle");
             *out = nullptr;
             return E_INVALIDARG;
         }
@@ -3784,10 +3868,10 @@ HRESULT STDMETHODCALLTYPE hook_d3d12_OpenSharedHandle(
         ID3D12Device* This, HANDLE handle, REFIID riid, void** out) {
     if (handle && out) {
         uint32_t magic = *reinterpret_cast<uint32_t*>(handle);
-        if (magic == DMN_SHARED_FENCE_MAGIC) {
+        if (magic == DXN_SHARED_FENCE_MAGIC) {
             ID3D12Fence* f = nullptr;
             HRESULT hr = dmn_fd3d_import_d3d12(
-                This, reinterpret_cast<dmn_shared_fence_handle*>(handle), &f);
+                This, reinterpret_cast<dxn_shared_fence*>(handle), &f);
             if (FAILED(hr) || !f)
                 return hr;
             track_fence_d3d12(f); /* a consumer-only process patches only here */
@@ -3795,11 +3879,11 @@ HRESULT STDMETHODCALLTYPE hook_d3d12_OpenSharedHandle(
             f->Release();
             return hr;
         }
-        if (magic == DMN_SHARED_TEXTURE_MAGIC)
+        if (magic == DXN_SHARED_TEXTURE_MAGIC)
             return import_texture_d3d12(
-                This, reinterpret_cast<dmn_shared_texture_handle*>(handle), riid, out);
-        if (magic == DMN_SHARED_BUFFER_MAGIC) {
-            auto* pod = reinterpret_cast<dmn_shared_buffer_handle*>(handle);
+                This, reinterpret_cast<dxn_shared_texture*>(handle), riid, out);
+        if (magic == DXN_SHARED_BUFFER_MAGIC) {
+            auto* pod = reinterpret_cast<dxn_shared_buffer*>(handle);
             /* The riid says what the handle referred to: a heap handle is
              * opened as a (synthetic) heap, anything else as a buffer. */
             if (dmn_iid_eq(riid, __uuidof(ID3D12Heap)))
@@ -3961,7 +4045,7 @@ HRESULT dmn_hooks_f12_seoc_orig(ID3D12Fence* fence, UINT64 value, HANDLE ev) {
     return orig ? orig(fence, value, ev) : fence->SetEventOnCompletion(value, ev);
 }
 
-bool dmn_res_lookup_buffer_pod(IUnknown* res, dmn_shared_buffer_handle* out) {
+bool dmn_res_lookup_buffer_pod(IUnknown* res, dxn_shared_buffer* out) {
     void* id = dmn_com_identity(res);
     std::lock_guard<std::mutex> lk(g_reg_mtx);
     auto it = g_buf_reg.find(id);

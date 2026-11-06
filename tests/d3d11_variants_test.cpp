@@ -61,9 +61,9 @@ int main() {
     HANDLE h = nullptr;
     CK(tex->QueryInterface(__uuidof(IDXGIResource), (void**)&res), "IDXGIResource");
     CK(res->GetSharedHandle(&h), "GetSharedHandle");
-    auto* pod = (dmn_shared_texture_handle*)h;
-    EXPECT(pod->magic == DMN_SHARED_TEXTURE_MAGIC, "bad POD magic");
-    EXPECT(pod->width == kW && pod->height == kH, "POD dims mismatch");
+    auto* pod = (dxn_shared_texture*)h;
+    EXPECT(pod->magic == DXN_SHARED_TEXTURE_MAGIC, "bad POD magic");
+    EXPECT(pod->meta.width == kW && pod->meta.height == kH, "POD dims mismatch");
 
     /* 2) OpenSharedResource1 consumer. */
     Com<ID3D11Texture2D> opened;
