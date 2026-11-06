@@ -59,13 +59,49 @@ typedef UINT DMN_D3D12_BARRIER_LAYOUT;
 /* ID3D12ProtectedResourceSession is only ever forwarded. */
 typedef IUnknown DMN_ID3D12ProtectedResourceSession;
 
+/* Pipeline-state streams are not declared by the vendored d3d12.h. */
+typedef struct D3D12_PIPELINE_STATE_STREAM_DESC {
+    SIZE_T SizeInBytes;
+    void *pPipelineStateSubobjectStream;
+} D3D12_PIPELINE_STATE_STREAM_DESC;
+
+MIDL_INTERFACE("c64226a8-9201-46af-b4cc-53fb9ff7414f")
+ID3D12PipelineLibrary : public ID3D12DeviceChild
+{
+    virtual HRESULT STDMETHODCALLTYPE StorePipeline(
+        LPCWSTR name, ID3D12PipelineState *pipeline) = 0;
+    virtual HRESULT STDMETHODCALLTYPE LoadGraphicsPipeline(
+        LPCWSTR name, const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc,
+        REFIID iid, void **pipeline_state) = 0;
+    virtual HRESULT STDMETHODCALLTYPE LoadComputePipeline(
+        LPCWSTR name, const D3D12_COMPUTE_PIPELINE_STATE_DESC *desc,
+        REFIID iid, void **pipeline_state) = 0;
+    virtual SIZE_T STDMETHODCALLTYPE GetSerializedSize(void) = 0;
+    virtual HRESULT STDMETHODCALLTYPE Serialize(void *data, SIZE_T data_size) = 0;
+};
+#ifdef __CRT_UUID_DECL
+__CRT_UUID_DECL(ID3D12PipelineLibrary, 0xc64226a8, 0x9201, 0x46af, 0xb4,0xcc, 0x53,0xfb,0x9f,0xf7,0x41,0x4f)
+#endif
+
+MIDL_INTERFACE("80eabf42-2568-4e5e-bd82-c37f86961dc3")
+ID3D12PipelineLibrary1 : public ID3D12PipelineLibrary
+{
+    virtual HRESULT STDMETHODCALLTYPE LoadPipeline(
+        LPCWSTR name, const D3D12_PIPELINE_STATE_STREAM_DESC *desc,
+        REFIID iid, void **pipeline_state) = 0;
+};
+#ifdef __CRT_UUID_DECL
+__CRT_UUID_DECL(ID3D12PipelineLibrary1, 0x80eabf42, 0x2568, 0x4e5e, 0xbd,0x82, 0xc3,0x7f,0x86,0x96,0x1d,0xc3)
+#endif
+
 /* == ID3D12Device2..10 ===================================================== */
 
 MIDL_INTERFACE("30baa41e-b15b-475c-a0bb-1af5c5b64328")
 ID3D12Device2 : public ID3D12Device1
 {
     virtual HRESULT STDMETHODCALLTYPE CreatePipelineState(
-        const void *desc, REFIID iid, void **state) = 0;
+        const D3D12_PIPELINE_STATE_STREAM_DESC *desc,
+        REFIID iid, void **state) = 0;
 };
 #ifdef __CRT_UUID_DECL
 __CRT_UUID_DECL(ID3D12Device2, 0x30baa41e, 0xb15b, 0x475c, 0xa0,0xbb, 0x1a,0xf5,0xc5,0xb6,0x43,0x28)

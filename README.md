@@ -50,6 +50,15 @@ your app ──> libd3dmetal-native.dylib ──> D3DMetal.framework ──> Met
   a virtual-texturing app pays RAM for the tiles it maps, not for the
   textures' virtual size. `GetResourceTiling`, `CopyTiles`, and packed mips
   follow the D3D12 tile model.
+- **DXIL quad votes**: `QuadAny` and `QuadAll` are lowered through the
+  framework's DXC optimizer to equivalent quad reads before pipeline
+  compilation, including pipeline streams and library loads. Shader-model
+  and DXIL versions remain unchanged; no per-game shader replacements are
+  needed.
+- **In-driver DXIL subroutines**: internal functions left by D3D12's
+  in-driver DXBC conversion are inlined for shader kinds 0 through 5 only in
+  one-DXIL-part, zero-digest containers. The normalizer covers direct, stream,
+  and pipeline-library creates and loads.
 - **Registry pre-seeding** (`dmn_registry_set_*`) and per-value environment
   overrides for the settings D3DMetal reads.
 - **Executable-path override** (`dmn_set_executable_path`) so D3DMetal's

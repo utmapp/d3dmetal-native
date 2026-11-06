@@ -762,6 +762,16 @@ HRESULT STDMETHODCALLTYPE hook_d3d12_CreateGraphicsPipelineState(ID3D12Device*,
     const D3D12_GRAPHICS_PIPELINE_STATE_DESC*, REFIID, void**);
 HRESULT STDMETHODCALLTYPE hook_d3d12_CreateComputePipelineState(ID3D12Device*,
     const D3D12_COMPUTE_PIPELINE_STATE_DESC*, REFIID, void**);
+HRESULT STDMETHODCALLTYPE hook_d3d12_CreatePipelineLibrary(ID3D12Device1*,
+    const void*, SIZE_T, REFIID, void**);
+HRESULT STDMETHODCALLTYPE hook_d3d12_CreatePipelineState(ID3D12Device2*,
+    const D3D12_PIPELINE_STATE_STREAM_DESC*, REFIID, void**);
+HRESULT STDMETHODCALLTYPE hook_d3d12_LoadGraphicsPipeline(ID3D12PipelineLibrary*,
+    LPCWSTR, const D3D12_GRAPHICS_PIPELINE_STATE_DESC*, REFIID, void**);
+HRESULT STDMETHODCALLTYPE hook_d3d12_LoadComputePipeline(ID3D12PipelineLibrary*,
+    LPCWSTR, const D3D12_COMPUTE_PIPELINE_STATE_DESC*, REFIID, void**);
+HRESULT STDMETHODCALLTYPE hook_d3d12_LoadPipeline(ID3D12PipelineLibrary1*,
+    LPCWSTR, const D3D12_PIPELINE_STATE_STREAM_DESC*, REFIID, void**);
 HRESULT STDMETHODCALLTYPE hook_d3d12_CreateCommandQueue1(ID3D12Device9*,
     const D3D12_COMMAND_QUEUE_DESC*, REFIID, REFIID, void**);
 HRESULT STDMETHODCALLTYPE hook_d3d12_SetEventOnMultipleFenceCompletion(ID3D12Device1*,
@@ -851,6 +861,11 @@ DMN_HOOK_STATE(d3d12_CreateCommandList1);
 DMN_HOOK_STATE(d3d12_CreateCommandQueue1);
 DMN_HOOK_STATE(d3d12_CreateGraphicsPipelineState);
 DMN_HOOK_STATE(d3d12_CreateComputePipelineState);
+DMN_HOOK_STATE(d3d12_CreatePipelineLibrary);
+DMN_HOOK_STATE(d3d12_CreatePipelineState);
+DMN_HOOK_STATE(d3d12_LoadGraphicsPipeline);
+DMN_HOOK_STATE(d3d12_LoadComputePipeline);
+DMN_HOOK_STATE(d3d12_LoadPipeline);
 DMN_HOOK_STATE(d3d12_SetEventOnMultipleFenceCompletion);
 DMN_HOOK_STATE(queue_Signal);
 DMN_HOOK_STATE(queue_Wait);
@@ -3326,18 +3341,17 @@ void patch_d3d12_queue(IUnknown* obj) {
     }
 }
 
-/* == DXIL subroutine inlining ============================================= */
+/* == DXIL pipeline normalization ========================================== */
 
-/* A shader stage's bytecode after dmn_dxil_inline_subroutines, owned for
- * the duration of one pipeline create. */
+/* Owns a replacement bytecode only when the generic normalizer changes it. */
 struct DmnNormalizedStage {
     void* code = nullptr;
     ~DmnNormalizedStage() { free(code); }
     bool apply(D3D12_SHADER_BYTECODE& bc) {
         size_t n = 0;
         if (!bc.pShaderBytecode ||
-            !dmn_dxil_inline_subroutines(bc.pShaderBytecode, bc.BytecodeLength,
-                                         &code, &n))
+            !dmn_dxil_normalize(bc.pShaderBytecode, bc.BytecodeLength,
+                                &code, &n))
             return false;
         bc.pShaderBytecode = code;
         bc.BytecodeLength = n;
@@ -3345,29 +3359,316 @@ struct DmnNormalizedStage {
     }
 };
 
-/* In-driver-converted DXIL reaches D3DMetal with its subroutines inlined
- * (see dmn_dxil_inline_subroutines).  The runtime converts DXBC of every
- * stage that way -- D3D12 titles shipping FXC bytecode, D3D11On12,
- * D3D9On12 -- so every stage of both pipeline kinds goes through it. */
+/* == DXIL graphics pipeline normalization ================================= */
+struct DmnNormalizedGraphicsDesc {
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC normalized;
+    DmnNormalizedStage stages[5];
+
+    const D3D12_GRAPHICS_PIPELINE_STATE_DESC* apply(
+            const D3D12_GRAPHICS_PIPELINE_STATE_DESC* input) {
+        if (!input)
+            return input;
+
+        D3D12_SHADER_BYTECODE shaders[5] = {
+            input->VS, input->PS, input->DS, input->HS, input->GS
+        };
+        bool changed = false;
+        for (size_t i = 0; i < 5; i++)
+            changed = stages[i].apply(shaders[i]) || changed;
+        if (!changed)
+            return input;
+
+        normalized = *input;
+        normalized.VS = shaders[0];
+        normalized.PS = shaders[1];
+        normalized.DS = shaders[2];
+        normalized.HS = shaders[3];
+        normalized.GS = shaders[4];
+        return &normalized;
+    }
+};
+
+/* The stream enum is not in the vendored d3d12.h.  These values and the
+ * payload alignment convention match the guest protocol's packed stream. */
+enum DmnPipelineStreamType {
+    DMN_STREAM_ROOT_SIGNATURE = 0,
+    DMN_STREAM_VS = 1,
+    DMN_STREAM_PS = 2,
+    DMN_STREAM_DS = 3,
+    DMN_STREAM_HS = 4,
+    DMN_STREAM_GS = 5,
+    DMN_STREAM_CS = 6,
+    DMN_STREAM_STREAM_OUTPUT = 7,
+    DMN_STREAM_BLEND = 8,
+    DMN_STREAM_SAMPLE_MASK = 9,
+    DMN_STREAM_RASTERIZER = 10,
+    DMN_STREAM_DEPTH_STENCIL = 11,
+    DMN_STREAM_INPUT_LAYOUT = 12,
+    DMN_STREAM_IB_STRIP_CUT_VALUE = 13,
+    DMN_STREAM_PRIMITIVE_TOPOLOGY = 14,
+    DMN_STREAM_RENDER_TARGET_FORMATS = 15,
+    DMN_STREAM_DEPTH_STENCIL_FORMAT = 16,
+    DMN_STREAM_SAMPLE_DESC = 17,
+    DMN_STREAM_NODE_MASK = 18,
+    DMN_STREAM_CACHED_PSO = 19,
+    DMN_STREAM_FLAGS = 20,
+    DMN_STREAM_DEPTH_STENCIL1 = 21,
+    DMN_STREAM_VIEW_INSTANCING = 22,
+    DMN_STREAM_AS = 24,
+    DMN_STREAM_MS = 25,
+    DMN_STREAM_DEPTH_STENCIL2 = 26,
+    DMN_STREAM_RASTERIZER1 = 27,
+    DMN_STREAM_RASTERIZER2 = 28
+};
+
+/* These newer stream payloads are absent from the vendored headers. */
+struct DmnDepthStencilOpDesc1 {
+    D3D12_STENCIL_OP StencilFailOp;
+    D3D12_STENCIL_OP StencilDepthFailOp;
+    D3D12_STENCIL_OP StencilPassOp;
+    D3D12_COMPARISON_FUNC StencilFunc;
+    UINT8 StencilReadMask;
+    UINT8 StencilWriteMask;
+};
+struct DmnDepthStencilDesc1 {
+    WINBOOL DepthEnable;
+    D3D12_DEPTH_WRITE_MASK DepthWriteMask;
+    D3D12_COMPARISON_FUNC DepthFunc;
+    WINBOOL StencilEnable;
+    UINT8 StencilReadMask;
+    UINT8 StencilWriteMask;
+    D3D12_DEPTH_STENCILOP_DESC FrontFace;
+    D3D12_DEPTH_STENCILOP_DESC BackFace;
+    WINBOOL DepthBoundsTestEnable;
+};
+struct DmnViewInstancingDesc {
+    UINT ViewInstanceCount;
+    const void* pViewInstanceLocations;
+    UINT Flags;
+};
+struct DmnDepthStencilDesc2 {
+    WINBOOL DepthEnable;
+    D3D12_DEPTH_WRITE_MASK DepthWriteMask;
+    D3D12_COMPARISON_FUNC DepthFunc;
+    WINBOOL StencilEnable;
+    DmnDepthStencilOpDesc1 FrontFace;
+    DmnDepthStencilOpDesc1 BackFace;
+    WINBOOL DepthBoundsTestEnable;
+};
+struct DmnRasterizerDesc1 {
+    D3D12_FILL_MODE FillMode;
+    D3D12_CULL_MODE CullMode;
+    WINBOOL FrontCounterClockwise;
+    FLOAT DepthBias;
+    FLOAT DepthBiasClamp;
+    FLOAT SlopeScaledDepthBias;
+    WINBOOL DepthClipEnable;
+    WINBOOL MultisampleEnable;
+    WINBOOL AntialiasedLineEnable;
+    UINT ForcedSampleCount;
+    D3D12_CONSERVATIVE_RASTERIZATION_MODE ConservativeRaster;
+};
+struct DmnRasterizerDesc2 {
+    D3D12_FILL_MODE FillMode;
+    D3D12_CULL_MODE CullMode;
+    WINBOOL FrontCounterClockwise;
+    FLOAT DepthBias;
+    FLOAT DepthBiasClamp;
+    FLOAT SlopeScaledDepthBias;
+    WINBOOL DepthClipEnable;
+    UINT LineRasterizationMode;
+    UINT ForcedSampleCount;
+    D3D12_CONSERVATIVE_RASTERIZATION_MODE ConservativeRaster;
+};
+struct DmnRTFormatArray {
+    DXGI_FORMAT RTFormats[8];
+    UINT NumRenderTargets;
+};
+
+static bool dmn_pipeline_stream_layout(UINT type, size_t* size,
+                                       size_t* alignment) {
+#define DMN_STREAM_LAYOUT(T) \
+    do { *size = sizeof(T); *alignment = alignof(T); return true; } while (0)
+    switch (type) {
+    case DMN_STREAM_ROOT_SIGNATURE:
+        DMN_STREAM_LAYOUT(ID3D12RootSignature*);
+    case DMN_STREAM_VS:
+    case DMN_STREAM_PS:
+    case DMN_STREAM_DS:
+    case DMN_STREAM_HS:
+    case DMN_STREAM_GS:
+    case DMN_STREAM_CS:
+    case DMN_STREAM_AS:
+    case DMN_STREAM_MS:
+        DMN_STREAM_LAYOUT(D3D12_SHADER_BYTECODE);
+    case DMN_STREAM_STREAM_OUTPUT:
+        DMN_STREAM_LAYOUT(D3D12_STREAM_OUTPUT_DESC);
+    case DMN_STREAM_BLEND:
+        DMN_STREAM_LAYOUT(D3D12_BLEND_DESC);
+    case DMN_STREAM_SAMPLE_MASK:
+    case DMN_STREAM_NODE_MASK:
+        DMN_STREAM_LAYOUT(UINT);
+    case DMN_STREAM_RASTERIZER:
+        DMN_STREAM_LAYOUT(D3D12_RASTERIZER_DESC);
+    case DMN_STREAM_DEPTH_STENCIL:
+        DMN_STREAM_LAYOUT(D3D12_DEPTH_STENCIL_DESC);
+    case DMN_STREAM_INPUT_LAYOUT:
+        DMN_STREAM_LAYOUT(D3D12_INPUT_LAYOUT_DESC);
+    case DMN_STREAM_IB_STRIP_CUT_VALUE:
+        DMN_STREAM_LAYOUT(D3D12_INDEX_BUFFER_STRIP_CUT_VALUE);
+    case DMN_STREAM_PRIMITIVE_TOPOLOGY:
+        DMN_STREAM_LAYOUT(D3D12_PRIMITIVE_TOPOLOGY_TYPE);
+    case DMN_STREAM_RENDER_TARGET_FORMATS:
+        DMN_STREAM_LAYOUT(DmnRTFormatArray);
+    case DMN_STREAM_DEPTH_STENCIL_FORMAT:
+        DMN_STREAM_LAYOUT(DXGI_FORMAT);
+    case DMN_STREAM_SAMPLE_DESC:
+        DMN_STREAM_LAYOUT(DXGI_SAMPLE_DESC);
+    case DMN_STREAM_CACHED_PSO:
+        DMN_STREAM_LAYOUT(D3D12_CACHED_PIPELINE_STATE);
+    case DMN_STREAM_FLAGS:
+        DMN_STREAM_LAYOUT(D3D12_PIPELINE_STATE_FLAGS);
+    case DMN_STREAM_DEPTH_STENCIL1:
+        DMN_STREAM_LAYOUT(DmnDepthStencilDesc1);
+    case DMN_STREAM_VIEW_INSTANCING:
+        DMN_STREAM_LAYOUT(DmnViewInstancingDesc);
+    case DMN_STREAM_DEPTH_STENCIL2:
+        DMN_STREAM_LAYOUT(DmnDepthStencilDesc2);
+    case DMN_STREAM_RASTERIZER1:
+        DMN_STREAM_LAYOUT(DmnRasterizerDesc1);
+    case DMN_STREAM_RASTERIZER2:
+        DMN_STREAM_LAYOUT(DmnRasterizerDesc2);
+    default:
+        return false;
+    }
+#undef DMN_STREAM_LAYOUT
+}
+
+static int dmn_pipeline_stream_shader_slot(UINT type) {
+    switch (type) {
+    case DMN_STREAM_VS: return 0;
+    case DMN_STREAM_PS: return 1;
+    case DMN_STREAM_DS: return 2;
+    case DMN_STREAM_HS: return 3;
+    case DMN_STREAM_GS: return 4;
+    case DMN_STREAM_CS: return 5;
+    case DMN_STREAM_AS: return 6;
+    case DMN_STREAM_MS: return 7;
+    default: return -1;
+    }
+}
+
+static bool dmn_pipeline_stream_align(size_t value, size_t alignment,
+                                      size_t* result) {
+    const size_t mask = alignment - 1;
+    if (!alignment || (alignment & mask) ||
+        value > static_cast<size_t>(-1) - mask)
+        return false;
+    *result = (value + mask) & ~mask;
+    return true;
+}
+
+/* Walk known subobjects before normalizing anything.  Thus an unsupported
+ * future type always takes the exact pass-through path, even if an earlier
+ * shader in the stream would have changed. */
+struct DmnNormalizedPipelineStream {
+    struct Stage {
+        DmnNormalizedStage normalized;
+        D3D12_SHADER_BYTECODE bytecode{};
+        size_t offset = 0;
+        bool present = false;
+        bool changed = false;
+    } stages[8];
+    D3D12_PIPELINE_STATE_STREAM_DESC normalized{};
+    void* storage = nullptr;
+    ~DmnNormalizedPipelineStream() { free(storage); }
+
+    const D3D12_PIPELINE_STATE_STREAM_DESC* apply(
+            const D3D12_PIPELINE_STATE_STREAM_DESC* input) {
+        if (!input || !input->pPipelineStateSubobjectStream ||
+            !input->SizeInBytes)
+            return input;
+        const auto* base = static_cast<const unsigned char*>(
+            input->pPipelineStateSubobjectStream);
+        size_t offset = 0;
+        while (offset < input->SizeInBytes) {
+            size_t at = 0;
+            if (!dmn_pipeline_stream_align(offset, sizeof(void*), &at))
+                return input;
+            if (at >= input->SizeInBytes)
+                break;
+            if (input->SizeInBytes - at < sizeof(UINT))
+                return input;
+            UINT type;
+            memcpy(&type, base + at, sizeof(type));
+            size_t payload_size = 0;
+            size_t payload_alignment = 0;
+            if (!dmn_pipeline_stream_layout(type, &payload_size,
+                                            &payload_alignment))
+                return input;
+            size_t payload = 0;
+            if (!dmn_pipeline_stream_align(at + sizeof(type),
+                                           payload_alignment, &payload) ||
+                payload > input->SizeInBytes ||
+                input->SizeInBytes - payload < payload_size)
+                return input;
+            const int slot = dmn_pipeline_stream_shader_slot(type);
+            if (slot >= 0) {
+                Stage& stage = stages[slot];
+                if (stage.present)
+                    return input;
+                stage.present = true;
+                stage.offset = payload;
+                memcpy(&stage.bytecode, base + payload,
+                       sizeof(stage.bytecode));
+            }
+            offset = payload + payload_size;
+        }
+
+        bool changed = false;
+        for (Stage& stage : stages) {
+            if (!stage.present)
+                continue;
+            stage.changed = stage.normalized.apply(stage.bytecode);
+            changed = stage.changed || changed;
+        }
+        if (!changed)
+            return input;
+        storage = malloc(input->SizeInBytes);
+        if (!storage)
+            return input;
+        memcpy(storage, base, input->SizeInBytes);
+        for (const Stage& stage : stages)
+            if (stage.changed)
+                memcpy(static_cast<unsigned char*>(storage) + stage.offset,
+                       &stage.bytecode, sizeof(stage.bytecode));
+        normalized = *input;
+        normalized.pPipelineStateSubobjectStream = storage;
+        return &normalized;
+    }
+};
+
+static const D3D12_COMPUTE_PIPELINE_STATE_DESC* dmn_normalize_compute_desc(
+        const D3D12_COMPUTE_PIPELINE_STATE_DESC* input,
+        D3D12_COMPUTE_PIPELINE_STATE_DESC* normalized,
+        DmnNormalizedStage* stage) {
+    if (!input)
+        return input;
+    D3D12_SHADER_BYTECODE shader = input->CS;
+    if (!stage->apply(shader))
+        return input;
+    *normalized = *input;
+    normalized->CS = shader;
+    return normalized;
+}
 HRESULT STDMETHODCALLTYPE hook_d3d12_CreateGraphicsPipelineState(
         ID3D12Device* This, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc,
         REFIID riid, void** out) {
     auto orig = DMN_ORIG(d3d12_CreateGraphicsPipelineState, This);
     if (!orig)
         return E_FAIL;
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC norm;
-    DmnNormalizedStage stages[5];
-    if (desc) {
-        norm = *desc;
-        bool changed = false;
-        D3D12_SHADER_BYTECODE* bcs[5] = {&norm.VS, &norm.PS, &norm.DS,
-                                         &norm.HS, &norm.GS};
-        for (int i = 0; i < 5; i++)
-            changed = stages[i].apply(*bcs[i]) || changed;
-        if (changed)
-            desc = &norm;
-    }
-    return orig(This, desc, riid, out);
+    DmnNormalizedGraphicsDesc normalized;
+    return orig(This, normalized.apply(desc), riid, out);
 }
 
 HRESULT STDMETHODCALLTYPE hook_d3d12_CreateComputePipelineState(
@@ -3376,14 +3677,92 @@ HRESULT STDMETHODCALLTYPE hook_d3d12_CreateComputePipelineState(
     auto orig = DMN_ORIG(d3d12_CreateComputePipelineState, This);
     if (!orig)
         return E_FAIL;
-    D3D12_COMPUTE_PIPELINE_STATE_DESC norm;
-    DmnNormalizedStage cs;
-    if (desc) {
-        norm = *desc;
-        if (cs.apply(norm.CS))
-            desc = &norm;
-    }
+    D3D12_COMPUTE_PIPELINE_STATE_DESC normalized;
+    DmnNormalizedStage stage;
+    desc = dmn_normalize_compute_desc(desc, &normalized, &stage);
     return orig(This, desc, riid, out);
+}
+
+HRESULT STDMETHODCALLTYPE hook_d3d12_CreatePipelineState(
+        ID3D12Device2* This, const D3D12_PIPELINE_STATE_STREAM_DESC* desc,
+        REFIID riid, void** out) {
+    auto orig = DMN_ORIG(d3d12_CreatePipelineState, This);
+    if (!orig)
+        return E_FAIL;
+    DmnNormalizedPipelineStream normalized;
+    return orig(This, normalized.apply(desc), riid, out);
+}
+
+void patch_d3d12_pipeline_library(IUnknown* obj) {
+    ID3D12PipelineLibrary* library = nullptr;
+    if (SUCCEEDED(obj->QueryInterface(__uuidof(ID3D12PipelineLibrary),
+                                      reinterpret_cast<void**>(&library))) &&
+        library) {
+        DMN_PATCH(library, ID3D12PipelineLibrary, LoadGraphicsPipeline,
+                  d3d12_LoadGraphicsPipeline);
+        DMN_PATCH(library, ID3D12PipelineLibrary, LoadComputePipeline,
+                  d3d12_LoadComputePipeline);
+        library->Release();
+    }
+    ID3D12PipelineLibrary1* library1 = nullptr;
+    if (SUCCEEDED(obj->QueryInterface(__uuidof(ID3D12PipelineLibrary1),
+                                      reinterpret_cast<void**>(&library1))) &&
+        library1) {
+        DMN_PATCH(library1, ID3D12PipelineLibrary1, LoadGraphicsPipeline,
+                  d3d12_LoadGraphicsPipeline);
+        DMN_PATCH(library1, ID3D12PipelineLibrary1, LoadComputePipeline,
+                  d3d12_LoadComputePipeline);
+        DMN_PATCH(library1, ID3D12PipelineLibrary1, LoadPipeline,
+                  d3d12_LoadPipeline);
+        library1->Release();
+    }
+}
+
+HRESULT STDMETHODCALLTYPE hook_d3d12_CreatePipelineLibrary(
+        ID3D12Device1* This, const void* blob, SIZE_T blob_size,
+        REFIID riid, void** out) {
+    auto orig = DMN_ORIG(d3d12_CreatePipelineLibrary, This);
+    if (!orig)
+        return E_FAIL;
+    HRESULT hr = orig(This, blob, blob_size, riid, out);
+    if (SUCCEEDED(hr) && out && *out)
+        patch_d3d12_pipeline_library(reinterpret_cast<IUnknown*>(*out));
+    return hr;
+}
+
+HRESULT STDMETHODCALLTYPE hook_d3d12_LoadGraphicsPipeline(
+        ID3D12PipelineLibrary* This, LPCWSTR name,
+        const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc,
+        REFIID riid, void** out) {
+    auto orig = DMN_ORIG(d3d12_LoadGraphicsPipeline, This);
+    if (!orig)
+        return E_FAIL;
+    DmnNormalizedGraphicsDesc normalized;
+    return orig(This, name, normalized.apply(desc), riid, out);
+}
+
+HRESULT STDMETHODCALLTYPE hook_d3d12_LoadComputePipeline(
+        ID3D12PipelineLibrary* This, LPCWSTR name,
+        const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc,
+        REFIID riid, void** out) {
+    auto orig = DMN_ORIG(d3d12_LoadComputePipeline, This);
+    if (!orig)
+        return E_FAIL;
+    D3D12_COMPUTE_PIPELINE_STATE_DESC normalized;
+    DmnNormalizedStage stage;
+    desc = dmn_normalize_compute_desc(desc, &normalized, &stage);
+    return orig(This, name, desc, riid, out);
+}
+
+HRESULT STDMETHODCALLTYPE hook_d3d12_LoadPipeline(
+        ID3D12PipelineLibrary1* This, LPCWSTR name,
+        const D3D12_PIPELINE_STATE_STREAM_DESC* desc,
+        REFIID riid, void** out) {
+    auto orig = DMN_ORIG(d3d12_LoadPipeline, This);
+    if (!orig)
+        return E_FAIL;
+    DmnNormalizedPipelineStream normalized;
+    return orig(This, name, normalized.apply(desc), riid, out);
 }
 
 HRESULT STDMETHODCALLTYPE hook_d3d12_CreateCommandQueue(
@@ -3808,11 +4187,20 @@ extern "C" void dmn_hooks_after_d3d12_device(void* device) {
     ID3D12Device1* d1 = nullptr;
     if (SUCCEEDED(dev->QueryInterface(__uuidof(ID3D12Device1),
                                       reinterpret_cast<void**>(&d1))) && d1) {
+        DMN_PATCH(d1, ID3D12Device1, CreatePipelineLibrary,
+                  d3d12_CreatePipelineLibrary);
         DMN_PATCH(d1, ID3D12Device1, SetEventOnMultipleFenceCompletion,
                   d3d12_SetEventOnMultipleFenceCompletion);
         DMN_PATCH(d1, ID3D12Device1, SetResidencyPriority,
                   d3d12_SetResidencyPriority);
         d1->Release();
+    }
+    ID3D12Device2* d2 = nullptr;
+    if (SUCCEEDED(dev->QueryInterface(__uuidof(ID3D12Device2),
+                                      reinterpret_cast<void**>(&d2))) && d2) {
+        DMN_PATCH(d2, ID3D12Device2, CreatePipelineState,
+                  d3d12_CreatePipelineState);
+        d2->Release();
     }
     ID3D12Device3* dv3 = nullptr;
     if (SUCCEEDED(dev->QueryInterface(__uuidof(ID3D12Device3),

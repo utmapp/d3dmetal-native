@@ -5,8 +5,8 @@
  * Shaders as the D3D12 runtime's in-driver DXBC conversion hands them over
  * -- call/label subroutines left as internal functions -- must build and
  * run: Metal Shader Converter crashes the process on a module defining one,
- * so the shim inlines it first (dmn_dxil_inline_subroutines).  Each pixel
- * shader case draws a fullscreen triangle and reads the target back:
+ * so the normalizer inlines it first (dmn_dxil_normalize). Pixel and geometry
+ * shader cases draw a fullscreen triangle and read the target back:
  *
  *   - the captured ps_2_x shader;
  *   - an indexable temp shared with a subroutine, which stays a global;

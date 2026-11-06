@@ -153,6 +153,16 @@ d3d12_native16_test = executable('d3d12-native16-test',
   dependencies: [directx_native_hdr])
 test('d3d12-native16', d3d12_native16_test, env: ['DMN_LOG=info'], timeout: 300)
 
+# QuadAny/QuadAll truth tables and D3D quad-neighbour layout, exercised
+# through compute descriptors, pipeline streams and supported library loads.
+d3d12_quadvote_test = executable('d3d12-quadvote-test',
+  'd3d12_quadvote_test.cpp',
+  include_directories: [test_native_inc, include_directories('../src')],
+  link_with: dmn_lib,
+  dependencies: [directx_native_hdr])
+test('d3d12-quadvote', d3d12_quadvote_test, env: ['DMN_LOG=info'],
+     is_parallel: false, timeout: 300)
+
 # SM 6.6 64-bit integer atomics (typed R32G32_UINT UAV, group shared, raw):
 # host twin of the guest's atomic64.exe, backing SHADER.AtomicInt64On*.
 d3d12_atomic64_test = executable('d3d12-atomic64-test',
